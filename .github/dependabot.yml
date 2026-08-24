@@ -32,3 +32,12 @@ updates:
     groups:
       web:
         patterns: ['*']
+    ignore:
+      # Pinned to the playwright-driver version provided by the Nix devShell;
+      # bumping one side alone breaks browser resolution. Bump both by hand.
+      - dependency-name: '@playwright/test'
+      # Majors (zod 4, vite majors, ...) are API migrations, not routine
+      # updates; take them deliberately, not from a bot, this close to the
+      # hackathon deadline.
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']

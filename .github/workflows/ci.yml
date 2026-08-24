@@ -187,6 +187,10 @@ jobs:
   secrets:
     name: Secret scanning
     runs-on: ubuntu-latest
+    # gitleaks-action's pull-request scan crashes under dependabot's read-only
+    # GITHUB_TOKEN (it cannot list PR commits). Dependabot changes only
+    # manifests, and every push to main is still scanned, so skip the job there.
+    if: github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
