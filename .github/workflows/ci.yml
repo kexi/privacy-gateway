@@ -95,11 +95,13 @@ jobs:
       - name: Install Playwright chromium
         run: pnpm -C web exec playwright install --with-deps chromium
 
-      - name: E2E (Playwright)
-        run: pnpm -C web test:e2e
-
+      # Build before E2E: Node resolves workspace packages from dist/ at runtime
+      # (only tsc reads types from src/), so the Playwright webServer needs it.
       - name: build
         run: pnpm -r build
+
+      - name: E2E (Playwright)
+        run: pnpm -C web test:e2e
 
   just:
     name: Justfile hygiene
