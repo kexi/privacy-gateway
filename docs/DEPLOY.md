@@ -324,34 +324,85 @@ already has, including Google-managed service agents.
 > `run.invoker` grants after the Cloud Run services within a single apply, so there is no
 > first-run window where the grants fail.
 
-### 3.7 Why Direct VPC egress is required
+### 3.7 The private network path
 
-`gemma-serving` uses internal ingress. However, Cloud Run's default egress does not traverse
-a VPC, so **a Cloud Run service calling another Cloud Run service on internal ingress gets a
-403**. The fix is to give the callers Direct VPC egress, which in Terraform is:
+Three of the four services use **internal ingress**: `gemma-serving`, `core-agent` and
+`synthesis-agent`. Only `gateway-agent` accepts traffic from the internet.
+
+The subtlety that makes this work — and that a naive configuration gets wrong — is that the
+callers address each other by their **public `run.app` URLs**. Cloud Run only treats such a
+request as "internal" if it genuinely traversed a VPC network. Per
+[Cloud Run private networking](https://cloud.google.com/run/docs/securing/private-networking),
+requests between Cloud Run services "all require additional configuration before they are
+recognized as 'internal'", and the documented ways to provide it are:
+
+1. route **all** traffic from the caller through the VPC **and** enable Private Google
+   Access on the subnet used by Direct VPC egress;
+2. front the callee with Private Service Connect or an internal Application Load Balancer
+   and reach it by internal IP;
+3. enable Private Google Access and add DNS overrides mapping `run.app` to
+   `private.googleapis.com` / `restricted.googleapis.com`.
+
+This deployment implements **option 1**. In Terraform that is two settings that only work as
+a pair — one on the subnet (`infra/terraform/network.tf`):
+
+```hcl
+resource "google_compute_subnetwork" "fleet" {
+  name                     = "agentic-fleet-us-central1"
+  ip_cidr_range            = "10.60.0.0/24"
+  private_ip_google_access = true # <- without this, internal ingress is unreachable
+}
+```
+
+and one on every caller (`infra/terraform/cloudrun.tf`):
 
 ```hcl
 vpc_access {
-  egress = "PRIVATE_RANGES_ONLY"
+  egress = "ALL_TRAFFIC" # <- not PRIVATE_RANGES_ONLY
   network_interfaces {
     network    = "default"
-    subnetwork = "default"
+    subnetwork = "agentic-fleet-us-central1"
   }
 }
 ```
 
-This is set on **`gateway-agent` and `synthesis-agent`** only. `core-agent` has **no** VPC
-egress at all: it reaches only Vertex AI, which is a public endpoint, so a VPC path would
-buy it nothing.
+> **The bug this replaces.** An earlier version used `egress = "PRIVATE_RANGES_ONLY"` against
+> the `default` subnet. `PRIVATE_RANGES_ONLY` sends only RFC1918 destinations through the
+> VPC, and a public `run.app` address is not an internal address — so that traffic left on
+> the ordinary internet path and Cloud Run answered every Gateway → Gemma call with a `403`.
+> The unit tests never caught it because they mock the Gemma endpoint.
 
-Because it is `PRIVATE_RANGES_ONLY`, external destinations such as Vertex AI and Firestore
-still go out the normal path. The `default` VPC and the `us-central1` `default` subnet
-(10.128.0.0/20) have been confirmed to exist in `all-thinkgs`, so nothing extra needs
-creating (the requirement is `/26` or larger, and `/20` satisfies it).
-`compute.googleapis.com` must be enabled for this reference to resolve (see 3.4).
+All three agent services get this egress, `core-agent` included. Core reaches only Vertex AI,
+which is a public endpoint, but routing it through the VPC means Vertex AI is reached over
+Private Google Access rather than the open internet, which is what the trust-boundary claim
+in `docs/ARCHITECTURE.md` actually asserts.
 
-Why not a Serverless VPC Access connector: the connector VM bills continuously and takes
-minutes to provision. Direct VPC egress achieves the same thing with no extra resources.
+**Why a dedicated subnet** rather than the `default` one: Private Google Access has to be
+enabled on whichever subnet Direct VPC egress attaches to, and turning it on for `default`
+is a project-wide side effect on a resource Terraform does not own. Direct VPC egress also
+consumes addresses from that subnet — roughly 2x the instance count, plus headroom while a
+deploy's revisions overlap — so a separate `/24` means the fleet cannot exhaust addresses
+other workloads depend on. (The documented minimum is `/26`; `/24` is the headroom.)
+
+**Why not option 2** (internal ALB / Private Service Connect): both add a load balancer or a
+service attachment plus forwarding rules, reserved internal IPs and private DNS zones. That
+is materially more billable infrastructure and more failure modes than a four-service demo
+needs, and none of it changes _who_ may invoke a service — IAM (`roles/run.invoker`, see 3.6)
+already decides that. Option 1 needs one subnet.
+
+**Why not option 3** (DNS overrides): it requires a private DNS zone rewriting `*.run.app`
+for the entire network, silently changing resolution for every future workload in the
+project, including ones that legitimately want the public path.
+
+**Why not a Serverless VPC Access connector**: the connector VM bills continuously and takes
+minutes to provision. Direct VPC egress achieves the same thing with no extra resources
+beyond the subnet.
+
+`compute.googleapis.com` must be enabled for the network reference to resolve (see 3.4).
+No Cloud NAT is required: Private Google Access keeps Google-API traffic on Google's internal
+network rather than pushing it out through a NAT.
+
+Verify the path end to end with `just smoke` — it is the only check that actually crosses it.
 
 ### 3.8 Keeping the configuration honest
 
@@ -613,7 +664,7 @@ GATEWAY_URL=$(gcloud run services describe gateway-agent \
   --region=us-central1 --format='value(status.url)')
 
 curl -sS "${GATEWAY_URL}/healthz"
-curl -sS "${GATEWAY_URL}/.well-known/agent.json" | jq .
+curl -sS "${GATEWAY_URL}/.well-known/agent-card.json" | jq .
 ```
 
 ### 8.3 Core / Synthesis (ID token required)
@@ -621,19 +672,34 @@ curl -sS "${GATEWAY_URL}/.well-known/agent.json" | jq .
 Use an **ID token, not an access token**.
 
 ```bash
+just verify-auth
+```
+
+That recipe is the whole check: for each private service it calls `/healthz` twice, once
+anonymously and once with an ID token, and asserts `403` then `200`. Run by hand it is:
+
+```bash
 CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
 
-curl -sS -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
-  "${CORE_URL}/.well-known/agent.json" | jq .
+# The audience must be the callee URL. A token minted for anything else is rejected
+# even when you are an Owner.
+curl -sS -H "Authorization: Bearer $(gcloud auth print-identity-token --audiences="${CORE_URL}")" \
+  "${CORE_URL}/.well-known/agent-card.json" | jq .
 
 # Proof that auth is actually enforced (403 is the correct answer)
-curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-known/agent.json"
+curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-known/agent-card.json"
 ```
 
 > `gcloud auth print-identity-token` returns **your own** ID token. It works because you are
 > an Owner. Service-to-service calls use each SA's own ID token (see section 4).
 
 `just agent-card core-agent` does the token dance for you.
+
+Since `core-agent` and `synthesis-agent` now also use **internal ingress**, a call from a
+laptop is refused at the network layer before IAM is consulted. `just verify-auth` accounts
+for that; when running the raw `curl` from outside the VPC, a `403` on both lines is the
+correct result, and the `200` half of the proof has to come from inside the fleet — which is
+exactly what `just smoke` exercises.
 
 ### 8.4 Gemma (internal ingress, unreachable from outside)
 
@@ -658,14 +724,25 @@ gcloud firestore fields ttls list --collection-group=token_vault --database='(de
 ### 8.6 End to end
 
 ```bash
-curl -sS -X POST "${GATEWAY_URL}/v1/query" \
+just smoke
+```
+
+`just smoke` posts a fixed PII sample to `/v1/ask` on the deployed Gateway and asserts that
+the response is `200`, that the masked prompt contains `⟦TYPE_N⟧` placeholders, and that the
+raw email and phone number do **not** appear in it. It is the deployed counterpart of the
+mocked unit tests: it is the only check that exercises Cloud Run IAM, the VPC path to Gemma
+and the Firestore vault together.
+
+By hand:
+
+```bash
+curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
 ```
 
 What to check: was the text reaching Core masked, did the leak check pass, is the final
 answer rehydrated, and is an OKF record attached?
-(Adjust the endpoint path to match what the code owner implements.)
 
 ---
 
@@ -705,10 +782,11 @@ gcloud projects get-iam-policy all-thinkgs --flatten="bindings[].members" \
   --filter="bindings.members:sa-core@all-thinkgs.iam.gserviceaccount.com" \
   --format="value(bindings.role)"
 
-# Auth is enforced (403) / works with an ID token (200)
-curl -s -o /dev/null -w "no auth  -> %{http_code}\n" "${CORE_URL}/.well-known/agent.json"
-curl -s -o /dev/null -w "with ID  -> %{http_code}\n" \
-  -H "Authorization: Bearer $(gcloud auth print-identity-token)" "${CORE_URL}/.well-known/agent.json"
+# Auth is enforced (403) / works with an ID token (200), for every private service
+just verify-auth
+
+# One real request through the deployed fleet, with the privacy assertions
+just smoke
 ```
 
 Worth adding now that the infrastructure is declarative: a few seconds of

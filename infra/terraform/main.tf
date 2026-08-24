@@ -80,3 +80,18 @@ resource "google_firestore_field" "vault_ttl" {
   # not fight Firestore's single-field index defaults on every plan.
   index_config {}
 }
+
+# Masked evidence records (OKF Gateway Answer, masked prompt, tokenized Core
+# response) carry the same `expires_at` field as the vault so one TTL shape
+# covers both collections. The application also enforces expiry on read; this
+# policy is storage hygiene, not the disclosure control.
+resource "google_firestore_field" "answers_ttl" {
+  project    = var.project_id
+  database   = google_firestore_database.default.name
+  collection = var.answers_collection
+  field      = var.vault_ttl_field
+
+  ttl_config {}
+
+  index_config {}
+}

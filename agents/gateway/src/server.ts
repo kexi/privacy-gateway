@@ -4,28 +4,30 @@
  * Core is reached over A2A. Synthesis is reached over plain HTTP even though it
  * also exposes an A2A surface, because the OKF document is an audit artifact and
  * must be retrieved without an LLM rephrasing it anywhere along the way.
+ *
+ * One request, one server-generated id, one vault entry. There is no
+ * caller-supplied session and no multi-turn state: a caller who can name someone
+ * else's vault key can make the gateway resolve their placeholders, and no
+ * amount of validation on a caller-supplied id removes that, so the id is not
+ * accepted at all.
  */
 
 import {
   AskRequestSchema,
-  ApproveRequestSchema,
+  authorizedFetch,
   buildVault,
   contextFromHeaders,
   createLogger,
   currentTraceId,
   DEFAULT_GEMINI_MODEL,
   initTelemetry,
-  isStale,
+  IdTokenError,
   loadConfig,
-  outboundTraceHeaders,
-  parse as parseOkf,
   PiiLeakError,
-  REQUEST_ID_HEADER,
-  resolveRequestId,
   sendMessage,
   SPAN,
   SynthesizeResponseSchema,
-  trustTier,
+  uuidv7,
   withContext,
   withSpan,
   type AskResponse,
@@ -39,8 +41,8 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { extractUnstructured } from './agent.ts';
-import { ask, type AskResult } from './pipeline.ts';
+import { ExtractionFailedError, extractUnstructured } from './agent.ts';
+import { ask, ReservedSyntaxError, type AskResult } from './pipeline.ts';
 
 /** Cloud Run injects PORT. Locally 8081 sits between web (5173) and core (8082). */
 const DEFAULT_PORT = 8081;
@@ -74,7 +76,7 @@ function contextOf(req: Request): RequestContext | undefined {
  * Express types every path parameter as possibly absent, but a handler only runs
  * when its route matched, so the segment is present by construction.
  */
-function sessionParam(req: Request): string {
+function requestParam(req: Request): string {
   return (req.params as Record<string, string | undefined>)['id'] ?? '';
 }
 
@@ -82,21 +84,59 @@ export interface CreateAppOptions {
   readonly config: Config;
   readonly logger: Logger;
   /** Injected by tests so the whole route surface runs without a network. */
-  readonly callCore?:
-    | ((maskedPrompt: string, requestId: string, sessionId: string) => Promise<string>)
-    | undefined;
+  readonly callCore?: ((maskedPrompt: string, requestId: string) => Promise<string>) | undefined;
   readonly callSynthesis?: ((input: SynthesisInput) => Promise<SynthesizeResponse>) | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
   readonly extractSpans?: ((text: string) => Promise<Detection[]>) | undefined;
   readonly vault?: TokenVault | undefined;
+  /** Injectable clock so the rate-limit test does not sleep. */
+  readonly now?: (() => number) | undefined;
 }
 
 interface SynthesisInput {
-  readonly sessionId: string;
   readonly maskedPrompt: string;
   readonly coreAnswer: string;
   readonly generatedBy: string;
+  readonly knownTokens: readonly string[];
+  readonly vaultGeneration: number;
   readonly requestId: string;
+}
+
+/**
+ * A fixed-window per-IP counter.
+ *
+ * Demo-grade on purpose: the public gateway authenticates nobody, and one
+ * request drives two Gemma calls plus a Gemini call, so an unbounded public
+ * endpoint is a cost incident waiting to happen. A real deployment would put
+ * Cloud Armor in front; this only has to make abuse uninteresting during the
+ * demo window.
+ */
+class RateLimiter {
+  private readonly hits = new Map<string, { count: number; windowStart: number }>();
+
+  constructor(
+    private readonly perMinute: number,
+    private readonly now: () => number,
+  ) {}
+
+  /** True when this caller is over quota. */
+  exceeded(key: string): boolean {
+    if (this.perMinute <= 0) return false;
+
+    const at = this.now();
+    const entry = this.hits.get(key);
+    const isNewWindow = entry === undefined || at - entry.windowStart >= 60_000;
+    if (isNewWindow) {
+      // Sweep opportunistically; a demo gateway never sees enough distinct IPs
+      // to justify a timer, and a timer would keep the process alive.
+      if (this.hits.size > 10_000) this.hits.clear();
+      this.hits.set(key, { count: 1, windowStart: at });
+      return false;
+    }
+
+    entry.count += 1;
+    return entry.count > this.perMinute;
+  }
 }
 
 /** Builds the Express app. Importing this module must not start a listener. */
@@ -107,14 +147,20 @@ export function createApp(options: CreateAppOptions): express.Application {
   const coreActor = `core_agent/${config.GEMINI_MODEL}`;
   const synthesisBase = (config.SYNTHESIS_BASE_URL ?? 'http://localhost:8083').replace(/\/+$/u, '');
   const coreBase = config.CORE_BASE_URL ?? 'http://localhost:8082';
+  const now = options.now ?? Date.now;
+  const limiter = new RateLimiter(config.rateLimitPerMinute, now);
 
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: config.maxBodyBytes }));
 
   // Correlation must be installed before anything that logs, so every line in a
   // request — including a failure in a later middleware — carries the same ids.
+  //
+  // The id is minted here and never read from the inbound header: it is the
+  // vault key, and a caller who could choose it could name another request's
+  // mapping. The header is still echoed so a client can correlate.
   app.use((req, res, next) => {
-    const requestId = resolveRequestId(req.headers[REQUEST_ID_HEADER]);
+    const requestId = uuidv7(now());
     res.setHeader('X-Request-ID', requestId);
     (req as CorrelatedRequest).pgw = {
       requestId,
@@ -131,32 +177,28 @@ export function createApp(options: CreateAppOptions): express.Application {
     void handleAsk(req, res, next);
   });
 
-  app.get('/v1/sessions/:id/answer', (req, res, next) => {
-    void handleAnswer(req, res, next);
+  app.get('/v1/requests/:id', (req, res, next) => {
+    void handleEvidence(req, res, next);
   });
 
-  app.post('/v1/sessions/:id/approve', (req, res, next) => {
-    void handleApprove(req, res, next);
+  app.get('/v1/requests/:id/masked-prompt.md', (req, res, next) => {
+    void handleArtifact(req, res, next, 'masked-prompt.md');
   });
 
-  app.get('/v1/sessions/:id/tier', (req, res, next) => {
-    void handleTier(req, res, next);
+  app.get('/v1/requests/:id/core-response.md', (req, res, next) => {
+    void handleArtifact(req, res, next, 'core-response.md');
   });
 
   mountWebUi(app, config);
 
   /** Calls Core over the standard A2A protocol, propagating the correlation ids. */
-  async function callCore(
-    maskedPrompt: string,
-    requestId: string,
-    sessionId: string,
-  ): Promise<string> {
+  async function callCore(maskedPrompt: string, requestId: string): Promise<string> {
     if (options.callCore !== undefined) {
-      return options.callCore(maskedPrompt, requestId, sessionId);
+      return options.callCore(maskedPrompt, requestId);
     }
     const reply = await sendMessage(coreBase, maskedPrompt, {
       requestId,
-      contextId: sessionId,
+      contextId: requestId,
       timeoutMs: config.requestTimeoutMs,
       fetchImpl,
     });
@@ -167,23 +209,26 @@ export function createApp(options: CreateAppOptions): express.Application {
   async function callSynthesis(input: SynthesisInput): Promise<SynthesizeResponse> {
     if (options.callSynthesis !== undefined) return options.callSynthesis(input);
 
-    const response = await fetchImpl(`${synthesisBase}/v1/synthesize`, {
+    const response = await authorizedFetch(`${synthesisBase}/v1/synthesize`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        [REQUEST_ID_HEADER]: input.requestId,
-        ...outboundTraceHeaders(),
-      },
+      headers: { 'content-type': 'application/json' },
+      requestId: input.requestId,
+      fetchImpl,
       body: JSON.stringify({
-        session_id: input.sessionId,
+        request_id: input.requestId,
         masked_prompt: input.maskedPrompt,
         core_answer: input.coreAnswer,
         generated_by: input.generatedBy,
-        request_id: input.requestId,
+        known_tokens: [...input.knownTokens],
+        vault_generation: input.vaultGeneration,
       }),
     });
 
     if (!response.ok) {
+      // A refusal is Synthesis doing its job, not a downstream fault: its status
+      // and category list are passed through so the caller sees why.
+      const refusal = await readRefusal(response);
+      if (refusal !== null) throw refusal;
       throw new DownstreamError(`synthesis returned status ${response.status}`, response.status);
     }
     return SynthesizeResponseSchema.parse(await response.json());
@@ -193,86 +238,118 @@ export function createApp(options: CreateAppOptions): express.Application {
     const context = contextOf(req);
     if (context === undefined) return next();
 
-    const parsed = AskRequestSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({
-        error: 'invalid_request',
-        message: parsed.error.issues.map((issue) => issue.message).join('; '),
+    const callerKey = req.ip ?? 'unknown';
+    if (limiter.exceeded(callerKey)) {
+      context.logger.event('request.rate_limited', {}, 'WARNING');
+      res.status(429).json({
+        error: 'rate_limited',
+        message: 'too many requests; this demo gateway allows a limited rate per client',
         request_id: context.requestId,
       });
       return;
     }
 
-    const sessionId = parsed.data.session_id ?? context.requestId;
+    const parsed = AskRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      // `strict()` on the schema is what turns a leftover `session_id` into this
+      // 400 rather than a silently ignored field.
+      res.status(400).json({
+        error: 'invalid_request',
+        message: parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+          .join('; '),
+        request_id: context.requestId,
+      });
+      return;
+    }
+
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
 
+    // One deadline for the whole chain. Without it a hung Gemma or Core pins a
+    // worker for as long as the socket stays open.
+    const deadline = new Promise<never>((_resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new DeadlineExceededError());
+      }, config.requestDeadlineMs);
+      timer.unref?.();
+    });
+
     try {
-      const result = await withContext(parentContext, () =>
-        withSpan(
-          SPAN.request,
-          {
-            request_id: context.requestId,
-            session_id: sessionId,
-            method: 'POST',
-            path: '/v1/ask',
-          },
-          async () => {
-            const startedAt = Date.now();
-            const scoped = context.logger.child({ session_id: sessionId });
-            scoped.event('request.start', { method: 'POST', path: '/v1/ask' });
+      const result = await Promise.race([
+        withContext(parentContext, () =>
+          withSpan(
+            SPAN.request,
+            { request_id: context.requestId, method: 'POST', path: '/v1/ask' },
+            async () => {
+              const startedAt = Date.now();
+              const scoped = context.logger;
+              scoped.event('request.start', { method: 'POST', path: '/v1/ask' });
 
-            const outcome = await ask({
-              text: parsed.data.text,
-              sessionId,
-              requestId: context.requestId,
-              vault,
-              callCore: (maskedPrompt) => callCore(maskedPrompt, context.requestId, sessionId),
-              callSynthesis: (input) => callSynthesis({ ...input, requestId: context.requestId }),
-              coreActor,
-              extractSpans:
-                options.extractSpans ??
-                ((text) =>
-                  extractUnstructured(text, {
-                    logger: scoped,
-                    model: config.GEMMA_MODEL,
-                    baseUrl: config.GEMMA_BASE_URL,
-                    apiKey: config.GEMMA_API_KEY,
-                    ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
-                  })),
-              logger: scoped,
-            });
+              const outcome = await ask({
+                text: parsed.data.text,
+                requestId: context.requestId,
+                vault,
+                callCore: (maskedPrompt) => callCore(maskedPrompt, context.requestId),
+                callSynthesis: (input) => callSynthesis({ ...input, requestId: context.requestId }),
+                coreActor,
+                extractSpans:
+                  options.extractSpans ??
+                  ((text) =>
+                    extractUnstructured(text, {
+                      logger: scoped,
+                      model: config.GEMMA_MODEL,
+                      baseUrl: config.GEMMA_BASE_URL,
+                      apiKey: config.GEMMA_API_KEY,
+                      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+                    })),
+                logger: scoped,
+              });
 
-            scoped.event('request.end', {
-              duration_ms: Date.now() - startedAt,
-              status: outcome.status,
-              trust_tier: outcome.trustTier,
-            });
-            return outcome;
-          },
+              scoped.event('request.end', {
+                duration_ms: Date.now() - startedAt,
+                document_status: outcome.status,
+                trust_tier: outcome.trustTier,
+              });
+              return outcome;
+            },
+          ),
         ),
-      );
+        deadline,
+      ]);
 
       res.json(toPayload(result));
     } catch (error) {
-      handleAskError(error, res, context, sessionId);
+      handleAskError(error, res, context);
     }
   }
 
-  function handleAskError(
-    error: unknown,
-    res: Response,
-    context: RequestContext,
-    sessionId: string,
-  ): void {
+  /**
+   * Map a failure onto a status.
+   *
+   * Every branch is a refusal to release something, so none of them carries the
+   * Core body, a mapping value, or an exception message. The category list is the
+   * most detail a caller gets.
+   */
+  function handleAskError(error: unknown, res: Response, context: RequestContext): void {
+    if (error instanceof ReservedSyntaxError) {
+      context.logger.event('request.refused', { refusal: 'reserved_syntax' }, 'WARNING');
+      res.status(400).json({
+        error: 'reserved_syntax',
+        message: error.message,
+        request_id: context.requestId,
+      });
+      return;
+    }
+
     if (error instanceof PiiLeakError) {
       // Raw PII was about to cross the boundary. Stop with a 422 instead of sending.
       context.logger.event(
         'request.refused',
-        { session_id: sessionId, categories: [...error.categories] },
+        { refusal: 'egress_guard', categories: [...error.categories] },
         'ERROR',
       );
       res.status(422).json({
-        error: 'outbound guard refused the request',
+        error: 'outbound_guard_refused',
         message: error.message,
         categories: [...error.categories],
         request_id: context.requestId,
@@ -280,29 +357,69 @@ export function createApp(options: CreateAppOptions): express.Application {
       return;
     }
 
-    const status = error instanceof DownstreamError ? 502 : 500;
+    if (error instanceof ExtractionFailedError) {
+      // The regexes cannot see names or addresses, so an unusable extractor means
+      // the request's unstructured PII is unknown. Nothing was sent to Core.
+      context.logger.event('request.refused', { refusal: 'extraction_failed' }, 'ERROR');
+      res.status(502).json({
+        error: 'extraction_unavailable',
+        message: 'unstructured PII extraction is unavailable, so the request was not forwarded',
+        request_id: context.requestId,
+      });
+      return;
+    }
+
+    if (error instanceof SynthesisRefusedError) {
+      context.logger.event(
+        'request.refused',
+        { refusal: error.kind, categories: [...error.categories] },
+        'ERROR',
+      );
+      res.status(error.status).json({
+        error: error.kind,
+        message: error.message,
+        categories: [...error.categories],
+        request_id: context.requestId,
+      });
+      return;
+    }
+
+    if (error instanceof DeadlineExceededError) {
+      context.logger.event('request.failed', { error_code: 'deadline_exceeded' }, 'ERROR');
+      res.status(504).json({
+        error: 'deadline_exceeded',
+        message: 'the request exceeded the gateway deadline',
+        request_id: context.requestId,
+      });
+      return;
+    }
+
+    // A missing ID token is a deployment/credential fault on *our* side of the
+    // hop, not a caller error, and it is indistinguishable from a downstream
+    // outage to the client — so it reports as 502 under its own event name.
+    const isAuthFailure = error instanceof IdTokenError;
+    const status = isAuthFailure || error instanceof DownstreamError ? 502 : 500;
     context.logger.event(
-      'request.failed',
+      isAuthFailure ? 'auth.id_token.failed' : 'request.failed',
       {
-        session_id: sessionId,
-        error_code: status === 502 ? 'downstream_error' : 'internal_error',
-        error_message: error instanceof Error ? error.message : String(error),
+        error_class: error instanceof Error ? error.name : 'unknown',
+        error_code: isAuthFailure
+          ? 'id_token_unavailable'
+          : status === 502
+            ? 'downstream_error'
+            : 'internal_error',
       },
       'ERROR',
     );
     res.status(status).json({
       error: status === 502 ? 'downstream_agent_failed' : 'internal_error',
-      message: error instanceof Error ? error.message : String(error),
       request_id: context.requestId,
     });
   }
 
-  /** Fetches the stored OKF document from Synthesis. */
-  async function fetchAnswer(sessionId: string, requestId: string): Promise<string | null> {
-    const response = await fetchImpl(
-      `${synthesisBase}/v1/sessions/${encodeURIComponent(sessionId)}/answer`,
-      { headers: { [REQUEST_ID_HEADER]: requestId, ...outboundTraceHeaders() } },
-    );
+  /** Proxies one masked artifact from the Synthesis store. */
+  async function fetchFromSynthesis(url: string, requestId: string): Promise<string | null> {
+    const response = await authorizedFetch(url, { requestId, fetchImpl });
     if (response.status === 404) return null;
     if (!response.ok) {
       throw new DownstreamError(`synthesis returned status ${response.status}`, response.status);
@@ -310,14 +427,18 @@ export function createApp(options: CreateAppOptions): express.Application {
     return response.text();
   }
 
-  async function handleAnswer(req: Request, res: Response, next: NextFunction): Promise<void> {
+  /** Returns the masked OKF evidence document for one request. */
+  async function handleEvidence(req: Request, res: Response, next: NextFunction): Promise<void> {
     const context = contextOf(req);
     if (context === undefined) return next();
 
     try {
-      const markdown = await fetchAnswer(sessionParam(req), context.requestId);
+      const markdown = await fetchFromSynthesis(
+        `${synthesisBase}/v1/requests/${encodeURIComponent(requestParam(req))}/evidence`,
+        context.requestId,
+      );
       if (markdown === null) {
-        res.status(404).json({ error: 'unknown session', request_id: context.requestId });
+        res.status(404).json({ error: 'unknown_request', request_id: context.requestId });
         return;
       }
       res.type('text/markdown; charset=utf-8').send(markdown);
@@ -326,85 +447,65 @@ export function createApp(options: CreateAppOptions): express.Application {
     }
   }
 
-  async function handleApprove(req: Request, res: Response, next: NextFunction): Promise<void> {
+  /**
+   * Serves the two masked sources the OKF document names.
+   *
+   * Without these routes the `sources[]` entries would be dangling links and the
+   * `attestation` digests could not be re-derived by a reader.
+   */
+  async function handleArtifact(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+    artifact: 'masked-prompt.md' | 'core-response.md',
+  ): Promise<void> {
     const context = contextOf(req);
     if (context === undefined) return next();
 
-    const parsed = ApproveRequestSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      res.status(400).json({ error: 'invalid_request', request_id: context.requestId });
-      return;
-    }
-
     try {
-      const response = await fetchImpl(
-        `${synthesisBase}/v1/sessions/${encodeURIComponent(sessionParam(req))}/approve`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            [REQUEST_ID_HEADER]: context.requestId,
-            ...outboundTraceHeaders(),
-          },
-          body: JSON.stringify(parsed.data),
-        },
+      const body = await fetchFromSynthesis(
+        `${synthesisBase}/v1/requests/${encodeURIComponent(requestParam(req))}/${artifact}`,
+        context.requestId,
       );
-
-      if (response.status === 404) {
-        res.status(404).json({ error: 'unknown session', request_id: context.requestId });
+      if (body === null) {
+        res.status(404).json({ error: 'unknown_request', request_id: context.requestId });
         return;
       }
-      if (!response.ok) {
-        throw new DownstreamError(`synthesis returned status ${response.status}`, response.status);
-      }
-
-      const body = (await response.json()) as { trust_tier?: string };
-      context.logger.event('approve.done', {
-        session_id: sessionParam(req),
-        trust_tier: body.trust_tier,
-      });
-      res.json({ ...body, request_id: context.requestId });
-    } catch (error) {
-      next(error);
-    }
-  }
-
-  /** Derives the trust tier from the stored document; never stored (SPEC §5.3). */
-  async function handleTier(req: Request, res: Response, next: NextFunction): Promise<void> {
-    const context = contextOf(req);
-    if (context === undefined) return next();
-
-    try {
-      const markdown = await fetchAnswer(sessionParam(req), context.requestId);
-      if (markdown === null) {
-        res.status(404).json({ error: 'unknown session', request_id: context.requestId });
-        return;
-      }
-      const document = parseOkf(markdown);
-      res.json({
-        session_id: sessionParam(req),
-        trust_tier: trustTier(document.metadata),
-        status: (document.metadata['status'] as string | undefined) ?? 'stable',
-        stale: isStale(document.metadata),
-      });
+      res.type('text/markdown; charset=utf-8').send(body);
     } catch (error) {
       next(error);
     }
   }
 
   // Terminal error handler: an unhandled route failure still answers with the
-  // request id, so a user report is enough to find the logs.
+  // request id, so a user report is enough to find the logs. The body carries no
+  // message: an exception message can embed the value that caused it.
   app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
     const context = contextOf(req);
-    const status = error instanceof DownstreamError ? 502 : 500;
+    // body-parser attaches its own status (413 for an oversized body, 400 for
+    // malformed JSON). Honouring it keeps a client-side mistake from being
+    // reported as a server fault.
+    const parserStatus = (error as { status?: unknown }).status;
+    const status =
+      typeof parserStatus === 'number' && parserStatus >= 400 && parserStatus < 500
+        ? parserStatus
+        : error instanceof DownstreamError
+          ? 502
+          : 500;
     context?.logger.event(
       'request.failed',
-      { error_code: error.name, error_message: error.message },
+      { error_class: error.name, error_code: error.name },
       'ERROR',
     );
     res.status(status).json({
-      error: status === 502 ? 'downstream_agent_failed' : 'internal_error',
-      message: error.message,
+      error:
+        status === 413
+          ? 'payload_too_large'
+          : status < 500
+            ? 'invalid_request'
+            : status === 502
+              ? 'downstream_agent_failed'
+              : 'internal_error',
       request_id: context?.requestId,
     });
   });
@@ -423,9 +524,67 @@ export class DownstreamError extends Error {
   }
 }
 
+/** The whole gateway → core → synthesis chain ran past its deadline. */
+export class DeadlineExceededError extends Error {
+  constructor() {
+    super('request deadline exceeded');
+    this.name = 'DeadlineExceededError';
+  }
+}
+
+/**
+ * Synthesis declined to release an answer.
+ *
+ * Distinguished from `DownstreamError` because it is not a fault: the fleet
+ * worked exactly as designed, and the caller should see the same status and
+ * category list Synthesis chose rather than a generic 502.
+ */
+export class SynthesisRefusedError extends Error {
+  readonly kind: string;
+  readonly status: number;
+  readonly categories: readonly string[];
+
+  constructor(kind: string, message: string, status: number, categories: readonly string[]) {
+    super(message);
+    this.name = 'SynthesisRefusedError';
+    this.kind = kind;
+    this.status = status;
+    this.categories = categories;
+  }
+}
+
+/**
+ * Recognize a Synthesis refusal body, or return null for a genuine fault.
+ *
+ * Only the statuses the pipeline uses are accepted, so a stray 4xx from a proxy
+ * cannot be replayed to the caller as if Synthesis had reasoned about it.
+ */
+async function readRefusal(response: globalThis.Response): Promise<SynthesisRefusedError | null> {
+  const isRefusalStatus = [409, 410, 422].includes(response.status);
+  if (!isRefusalStatus) return null;
+
+  try {
+    const body = (await response.json()) as {
+      error?: unknown;
+      message?: unknown;
+      categories?: unknown;
+    };
+    if (typeof body.error !== 'string') return null;
+    return new SynthesisRefusedError(
+      body.error,
+      typeof body.message === 'string' ? body.message : 'the answer was not released',
+      response.status,
+      Array.isArray(body.categories)
+        ? body.categories.filter((entry): entry is string => typeof entry === 'string')
+        : [],
+    );
+  } catch {
+    return null;
+  }
+}
+
 function toPayload(result: AskResult): AskResponse {
   return {
-    session_id: result.sessionId,
     request_id: result.requestId,
     ...(result.traceId !== undefined ? { trace_id: result.traceId } : {}),
     masked_prompt: result.maskedPrompt,
@@ -433,6 +592,7 @@ function toPayload(result: AskResult): AskResponse {
     answer: result.answer,
     trust_tier: result.trustTier,
     status: result.status,
+    dimensions: result.dimensions,
     attestation: result.attestation,
     consistency: result.consistency,
     stats: result.stats,
@@ -484,13 +644,12 @@ export async function main(): Promise<void> {
   const app = createApp({ config, logger });
 
   app.listen(port, () => {
+    // Endpoint URLs are deliberately absent: they are deployment topology, and
+    // the allowlist has no field for a free-form URL.
     logger.event('server.start', {
       port,
       model: config.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL,
-      gemma_model: config.GEMMA_MODEL,
       vault_backend: config.VAULT_BACKEND,
-      core_base_url: config.CORE_BASE_URL,
-      synthesis_base_url: config.SYNTHESIS_BASE_URL,
       trace_id: currentTraceId(),
     });
   });

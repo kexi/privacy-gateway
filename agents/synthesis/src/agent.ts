@@ -3,15 +3,19 @@
  *
  * The A2A surface exists so the fleet is uniformly discoverable, but the actual
  * verification is done by the deterministic pipeline. The LLM is never allowed
- * to compose the answer prose: the rehydrated document is a signed audit
- * artifact, and an LLM rewording it would invalidate the attestation it carries.
+ * to compose the answer prose: the document is an audit artifact bound to
+ * content hashes, and an LLM rewording it would break every digest recorded in
+ * its `attestation` block.
  */
 
 import { LlmAgent } from '@google/adk';
 import {
+  authorizedHeaders,
+  gemmaAuthMode,
   LeakJudgeSchema,
   ollamaModelId,
   registerOllamaLlm,
+  type GemmaAuthMode,
   type Logger,
 } from '@privacy-gateway/common';
 
@@ -21,8 +25,8 @@ export const INSTRUCTION = `You are the Synthesis Agent of a privacy-preserving 
 
 You receive a JSON object describing one gateway exchange. Report on it and nothing
 else. You do not rewrite, summarize, translate or comment on any answer text you are
-shown: the document assembled around it is a signed audit artifact, and altering it
-would invalidate the attestation it carries.
+shown: the document assembled around it is an audit artifact bound to content hashes,
+and altering it would break every digest it records.
 
 Reply with JSON only, in this exact shape:
 
@@ -59,6 +63,8 @@ export interface JudgeOptions {
   readonly baseUrl?: string | undefined;
   readonly model?: string | undefined;
   readonly apiKey?: string | undefined;
+  /** `iam` (Cloud Run ID token) or `none` (static key). Defaults from the scheme. */
+  readonly auth?: GemmaAuthMode | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
   readonly logger?: Logger | undefined;
   readonly timeoutMs?: number | undefined;
@@ -67,8 +73,9 @@ export interface JudgeOptions {
 /**
  * Ask Gemma whether any raw PII remains.
  *
- * Advisory only: it never decides pass or fail — the deterministic attester is
- * the sole judge. Used for logging and UI display.
+ * Probabilistic, and applied asymmetrically by the pipeline: `leak: true` or an
+ * unusable answer blocks the release, `leak: false` adds no trust whatsoever.
+ * The deterministic attester remains the only thing that can pass a response.
  *
  * The endpoint is called directly rather than through a runner because a single
  * JSON classification needs no session, no tools and no event stream.
@@ -84,6 +91,20 @@ export function createLeakJudge(
   const model = options.model ?? process.env['GEMMA_MODEL'] ?? 'gemma3:12b';
   const apiKey = options.apiKey ?? process.env['GEMMA_API_KEY'] ?? 'ollama';
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  // Cloud Run's Gemma service is IAM-protected, so the static key is not a
+  // credential there: an ID token minted for the Gemma origin is. Derived from
+  // the scheme unless GEMMA_AUTH says otherwise.
+  const auth = gemmaAuthMode(
+    baseUrl,
+    options.auth ?? (process.env['GEMMA_AUTH'] as GemmaAuthMode | undefined),
+  );
+  const url = `${baseUrl}/chat/completions`;
+
+  const judgeHeaders = async (): Promise<Record<string, string>> => {
+    const base = { 'content-type': 'application/json' };
+    if (auth === 'iam') return authorizedHeaders(url, { headers: base, useIdToken: true });
+    return { ...base, authorization: `Bearer ${apiKey}` };
+  };
 
   return async (text: string) => {
     const controller = new AbortController();
@@ -92,9 +113,9 @@ export function createLeakJudge(
     }, options.timeoutMs ?? 60_000);
 
     try {
-      const response = await fetchImpl(`${baseUrl}/chat/completions`, {
+      const response = await fetchImpl(url, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+        headers: await judgeHeaders(),
         body: JSON.stringify({
           model,
           messages: [
@@ -102,6 +123,10 @@ export function createLeakJudge(
             { role: 'user', content: text },
           ],
           response_format: { type: 'json_object' },
+          // Deterministic generation. The verdict can block a release, so the
+          // same body must not pass on one call and block on the next.
+          temperature: 0,
+          top_p: 1,
           stream: false,
         }),
         signal: controller.signal,

@@ -10,7 +10,7 @@ generated: { by: gateway_fleet/bootstrap, at: 2026-08-24T00:00:00Z }
 # Purpose
 
 Execute [the leak-check computation](/computations/leak-check.md) over a core agent's
-still-tokenized response and return a receipt. Run it **before** rehydration.
+still-tokenized response and return a receipt. Run it **before** any rehydration. A failing verdict stops the release entirely: no answer body is returned, and only masked artifacts are persisted.
 
 The runner does not decide whether the response is safe; it only produces evidence. The
 verdict comes from the attester.
@@ -19,10 +19,11 @@ verdict comes from the attester.
 
 Supply values for the declared parameters only. Do not edit the computation.
 
-| Parameter    | Type   | Required |
-| ------------ | ------ | -------- |
-| `session_id` | string | yes      |
-| `response`   | string | yes      |
+| Parameter       | Type   | Required |
+| --------------- | ------ | -------- |
+| `request_id`    | string | yes      |
+| `masked_prompt` | string | yes      |
+| `response`      | string | yes      |
 
 # Steps
 
@@ -39,7 +40,8 @@ Supply values for the declared parameters only. Do not edit the computation.
 
    ```typescript
    const receipt = {
-     session_id: sessionId,
+     request_id: requestId,
+     masked_prompt_hash: responseHash(maskedPrompt),
      response_hash: responseHash(response),
      findings: scan(response),
      response,
@@ -51,9 +53,10 @@ Supply values for the declared parameters only. Do not edit the computation.
 
 # Output
 
-The receipt above. `session_id`, `response_hash` and `findings` are the declared
-`executor.receipt` fields; `response` is carried alongside so the attester can re-derive
-the findings independently instead of trusting the runner.
+The receipt above. All five fields are declared in `executor.receipt`, and the attester
+exports the same list as `RECEIPT_FIELDS`, so the contract and the check cannot drift.
+`response` is carried so the attester can re-derive the findings independently instead of
+trusting the runner; `masked_prompt_hash` binds the verdict to one exchange.
 
 # Constraints
 

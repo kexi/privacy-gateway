@@ -9,19 +9,27 @@ JSON over HTTP, so consuming the fleet needs no SDK and no shared runtime with
 the agents. This file exists to demonstrate exactly that.
 
 Usage:
-    uv run clients/python/pgw.py ask "text" [--gateway URL] [--session ID]
-    uv run clients/python/pgw.py answer <session> [--gateway URL]
-    uv run clients/python/pgw.py approve <session> --by human:<id> [--gateway URL]
+    uv run clients/python/pgw.py ask "text" [--gateway URL]
+    uv run clients/python/pgw.py evidence <request_id> [--gateway URL] [--json]
+    uv run clients/python/pgw.py verify <request_id> [--base URL]
+
+There is no session argument: the gateway mints one id per request and rejects a
+body carrying ``session_id``.
 
 The trust tier is derived here, on the client, from the OKF ``verified`` field
 rather than read from the server's response: OKF SPEC §5.3 requires the tier to
 be derived and never stored, and a client that re-derives it proves the property
 holds end to end.
+
+``verify`` goes further: it re-runs the leak-check scan over the masked artifacts
+the gateway serves and compares every digest the answer records, so the fleet's
+own claim about the verdict is checked rather than believed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -104,8 +112,6 @@ def describe_http_error(exc: httpx.HTTPStatusError) -> str:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"text": args.text}
-    if args.session:
-        payload["session_id"] = args.session
 
     with client(args.gateway) as http:
         try:
@@ -145,7 +151,20 @@ def cmd_ask(args: argparse.Namespace) -> int:
         summary = ", ".join(f"{key}x{value}" for key, value in sorted(counts.items()))
         print(f"masked     : {stats.get('masked_count')} span(s) {summary}".rstrip())
 
-    print(f"session    : {body.get('session_id')}")
+    withheld = attestation.get("withheld") or []
+    if withheld:
+        print(f"withheld   : {', '.join(withheld)} (left masked by the disclosure policy)")
+
+    dimensions = body.get("dimensions") or {}
+    if dimensions:
+        print(
+            "dimensions : "
+            f"verdict={dimensions.get('policy_verdict')} "
+            f"status={dimensions.get('document_status')} "
+            f"freshness={dimensions.get('freshness')} "
+            f"review={dimensions.get('review_identity')}"
+        )
+
     print(f"request_id : {body.get('request_id')}")
     if body.get("trace_id"):
         print(f"trace_id   : {body['trace_id']}")
@@ -155,14 +174,15 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0 if attestation.get("ok") else 2
 
 
-def cmd_answer(args: argparse.Namespace) -> int:
+def cmd_evidence(args: argparse.Namespace) -> int:
+    """Fetch the stored masked OKF evidence document for one request."""
     with client(args.gateway) as http:
         try:
-            response = http.get(f"/v1/sessions/{args.session}/answer")
+            response = http.get(f"/v1/requests/{args.request_id}")
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                return fail(f"unknown session: {args.session}")
+                return fail(f"unknown request: {args.request_id}")
             return fail(describe_http_error(exc))
         except httpx.HTTPError as exc:
             return fail(f"could not reach the gateway at {args.gateway}: {exc}")
@@ -172,9 +192,8 @@ def cmd_answer(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "session_id": args.session,
+                    "request_id": args.request_id,
                     "trust_tier": trust_tier(markdown),
-                    "request_id": field(markdown, "request_id"),
                     "trace_id": field(markdown, "trace_id"),
                     "okf": markdown,
                 },
@@ -189,30 +208,127 @@ def cmd_answer(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_approve(args: argparse.Namespace) -> int:
-    # SPEC §7: a human actor is `human:<id>`; the prefix is what the tier
-    # derivation keys on, so it is normalized before sending.
-    approver = args.by if args.by.startswith("human:") else f"human:{args.by}"
+# --- replay ------------------------------------------------------------------
 
-    with client(args.gateway) as http:
+# The attester's patterns, transcribed. A replay that imported the fleet's own
+# module would only prove the fleet agrees with itself; an independent
+# transcription is what makes the check worth running.
+_SCAN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("EMAIL", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
+    ("AWS_KEY", re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA)[0-9A-Z]{16}\b")),
+    (
+        "API_KEY",
+        re.compile(
+            r"\bsk-(?:[A-Za-z0-9]+-)?[A-Za-z0-9_-]{20,}\b"
+            r"|\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b"
+            r"|\bAIza[0-9A-Za-z_-]{35}\b"
+        ),
+    ),
+    ("CREDIT_CARD", re.compile(r"\b(?:\d[ -]?){12,18}\d\b")),
+    ("PHONE", re.compile(r"(?<![\d-])(?:\+81[ -]?|0)\d{1,4}[ -]?\d{1,4}[ -]?\d{3,4}(?![\d-])")),
+    ("MY_NUMBER", re.compile(r"(?<![\d-])\d{12}(?![\d-])")),
+    ("IPV4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+]
+
+
+def _luhn_ok(digits: str) -> bool:
+    if not digits.isdigit() or not 12 <= len(digits) <= 19:
+        return False
+    total = 0
+    for index, char in enumerate(reversed(digits)):
+        value = int(char)
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
+def scan(text: str) -> list[str]:
+    """Return the sorted set of PII categories in ``text``."""
+    found: set[str] = set()
+    for category, pattern in _SCAN_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(0)
+            digits = re.sub(r"\D", "", value)
+            if category == "CREDIT_CARD" and not _luhn_ok(digits):
+                continue
+            if category == "MY_NUMBER" and len(digits) != 12:
+                continue
+            if category == "IPV4":
+                parts = value.split(".")
+                if len(parts) != 4 or any(int(part) > 255 for part in parts):
+                    continue
+            found.add(category)
+    return sorted(found)
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _attestation_block(markdown: str) -> dict[str, str]:
+    """Read the flat scalars of the frontmatter ``attestation:`` block."""
+    front = frontmatter(markdown)
+    match = re.search(r"^attestation:\s*$\n((?:^[ \t]+.*$\n?)*)", front, re.MULTILINE)
+    if match is None:
+        return {}
+    return {
+        key: value.strip().strip("\"'")
+        for key, value in re.findall(r"^\s+([a-z_]+):\s*(.+)$", match.group(1), re.MULTILINE)
+    }
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Re-derive one answer's verdict from the artifacts the gateway serves."""
+    base = args.base.rstrip("/")
+    with httpx.Client(base_url=base, timeout=TIMEOUT_SECONDS) as http:
         try:
-            response = http.post(
-                f"/v1/sessions/{args.session}/approve",
-                json={"approver": approver},
-            )
-            response.raise_for_status()
+            okf = http.get(f"/v1/requests/{args.request_id}")
+            okf.raise_for_status()
+            prompt = http.get(f"/v1/requests/{args.request_id}/masked-prompt.md")
+            prompt.raise_for_status()
+            core = http.get(f"/v1/requests/{args.request_id}/core-response.md")
+            core.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                return fail(f"unknown session: {args.session}")
+                return fail(f"unknown request: {args.request_id}")
             return fail(describe_http_error(exc))
         except httpx.HTTPError as exc:
-            return fail(f"could not reach the gateway at {args.gateway}: {exc}")
+            return fail(f"could not reach the gateway at {base}: {exc}")
 
-    body = response.json()
-    markdown = body.get("markdown", "")
-    print(f"approved by {approver}")
-    print(f"trust tier : {trust_tier(markdown)}")
-    return 0
+    recorded = _attestation_block(okf.text)
+    if not recorded:
+        return fail("the document carries no attestation block; nothing to replay")
+
+    findings = scan(core.text)
+    checks: list[tuple[str, bool, str]] = [
+        (
+            "masked_prompt_sha256",
+            recorded.get("masked_prompt_sha256") == sha256(prompt.text),
+            recorded.get("masked_prompt_sha256", "(absent)"),
+        ),
+        (
+            "core_response_sha256",
+            recorded.get("core_response_sha256") == sha256(core.text),
+            recorded.get("core_response_sha256", "(absent)"),
+        ),
+        (
+            "verdict",
+            recorded.get("verdict") == ("pass" if not findings else "fail"),
+            recorded.get("verdict", "(absent)"),
+        ),
+    ]
+
+    for name, ok, value in checks:
+        print(f"{'OK  ' if ok else 'FAIL'} {name}: {value}")
+    print(f"     independently derived findings: {', '.join(findings) or '(none)'}")
+    print(f"     recorded attester_sha256: {recorded.get('attester_sha256', '(absent)')}")
+    print(f"     trust tier: {trust_tier(okf.text)}")
+
+    return 0 if all(ok for _, ok, _ in checks) else 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,18 +345,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask = sub.add_parser("ask", help="send a request across the trust boundary")
     ask.add_argument("text", help="the request, in the clear; it is masked before it leaves")
-    ask.add_argument("--session", help="reuse a session so placeholders stay stable")
     ask.set_defaults(func=cmd_ask)
 
-    answer = sub.add_parser("answer", help="fetch the stored OKF answer document")
-    answer.add_argument("session", help="the session id")
-    answer.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
-    answer.set_defaults(func=cmd_answer)
+    evidence = sub.add_parser("evidence", help="fetch the stored masked OKF document")
+    evidence.add_argument("request_id", help="the request id")
+    evidence.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
+    evidence.set_defaults(func=cmd_evidence)
 
-    approve = sub.add_parser("approve", help="add a human approval to the answer")
-    approve.add_argument("session", help="the session id")
-    approve.add_argument("--by", required=True, help="approver id, e.g. human:kei")
-    approve.set_defaults(func=cmd_approve)
+    verify = sub.add_parser("verify", help="replay one answer's attestation from the artifacts")
+    verify.add_argument("request_id", help="the request id")
+    verify.add_argument(
+        "--base",
+        default=DEFAULT_GATEWAY,
+        help=f"gateway base URL (default: {DEFAULT_GATEWAY})",
+    )
+    verify.set_defaults(func=cmd_verify)
 
     return parser
 

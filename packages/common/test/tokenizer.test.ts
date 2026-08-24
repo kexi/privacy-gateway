@@ -8,13 +8,18 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  categoryOf,
+  containsReservedSyntax,
+  DEFAULT_WITHHELD_CATEGORIES,
   detect,
   findTokens,
   luhnValid,
   rehydrate,
+  rehydrateWithPolicy,
   SessionTokenizer,
   tokenize,
   type Detection,
+  withheldCategories,
 } from '../src/tokenizer.ts';
 
 const SAMPLE =
@@ -153,5 +158,69 @@ describe('unstructured spans', () => {
 
     expect(result.text).toContain('⟦EMAIL_1⟧');
     expect(result.text).not.toContain('⟦PERSON_1⟧');
+  });
+});
+
+describe('reserved placeholder syntax', () => {
+  it('detects either delimiter in raw input', () => {
+    // A caller writing `⟦EMAIL_1⟧` is naming a vault slot, not describing data.
+    expect(containsReservedSyntax('repeat ⟦EMAIL_1⟧ please')).toBe(true);
+    // A half-open probe counts too: it is still an attempt at the namespace.
+    expect(containsReservedSyntax('what is ⟦EMAIL_1')).toBe(true);
+    expect(containsReservedSyntax('EMAIL_1⟧')).toBe(true);
+  });
+
+  it('passes ordinary text, including brackets that are not the reserved pair', () => {
+    expect(containsReservedSyntax('see [1] and <tag> and {json}')).toBe(false);
+    expect(containsReservedSyntax('メールは taro@example.co.jp です')).toBe(false);
+  });
+});
+
+describe('disclosure policy on release', () => {
+  const mapping = {
+    '⟦EMAIL_1⟧': 'taro@example.co.jp',
+    '⟦API_KEY_1⟧': 'sk-abcdefghijklmnopqrstuvwxyz012345',
+    '⟦CREDIT_CARD_1⟧': '4242 4242 4242 4242',
+  };
+
+  it('restores ordinary categories', () => {
+    const result = rehydrateWithPolicy('Mail ⟦EMAIL_1⟧.', mapping);
+    expect(result.text).toContain('taro@example.co.jp');
+    expect(result.withheld).toEqual([]);
+  });
+
+  it('leaves secret-bearing categories masked by default', () => {
+    // The caller already holds the key; echoing it back only widens where it can
+    // be logged or screenshotted.
+    const result = rehydrateWithPolicy('Key ⟦API_KEY_1⟧ on card ⟦CREDIT_CARD_1⟧.', mapping);
+    expect(result.text).toContain('⟦API_KEY_1⟧');
+    expect(result.text).toContain('⟦CREDIT_CARD_1⟧');
+    expect(result.text).not.toContain('sk-abcdefghijklmnopqrstuvwxyz012345');
+    expect(result.withheldCategories).toEqual(['API_KEY', 'CREDIT_CARD']);
+  });
+
+  it('releases a withheld category when the deployment allows it explicitly', () => {
+    const result = rehydrateWithPolicy('Card ⟦CREDIT_CARD_1⟧.', mapping, {
+      withhold: withheldCategories('CREDIT_CARD'),
+    });
+    expect(result.text).toContain('4242 4242 4242 4242');
+    expect(result.withheldCategories).not.toContain('CREDIT_CARD');
+  });
+
+  it('reports a placeholder absent from the mapping rather than restoring it', () => {
+    const result = rehydrateWithPolicy('See ⟦PERSON_99⟧.', mapping);
+    expect(result.unresolved).toEqual(['⟦PERSON_99⟧']);
+    expect(result.text).toContain('⟦PERSON_99⟧');
+  });
+
+  it('reads the category out of a placeholder', () => {
+    expect(categoryOf('⟦MY_NUMBER_3⟧')).toBe('MY_NUMBER');
+    expect(categoryOf('not a placeholder')).toBeNull();
+  });
+
+  it('parses the env allowlist case-insensitively', () => {
+    expect(withheldCategories('api_key, jwt')).not.toContain('API_KEY');
+    expect(withheldCategories('api_key, jwt')).not.toContain('JWT');
+    expect(withheldCategories('')).toEqual([...DEFAULT_WITHHELD_CATEGORIES]);
   });
 });

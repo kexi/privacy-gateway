@@ -71,22 +71,21 @@ web-e2e-report:
 # --- clients ----------------------------------------------------------------
 
 # Send a request through the Python client example
-ask text session="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ -n "{{ session }}" ]; then
-      uv run clients/python/pgw.py ask "{{ text }}" --session "{{ session }}"
-    else
-      uv run clients/python/pgw.py ask "{{ text }}"
-    fi
+ask text:
+    uv run clients/python/pgw.py ask "{{ text }}"
 
-# Fetch the stored OKF answer document for a session
-answer session:
-    uv run clients/python/pgw.py answer {{ session }}
+# Fetch the stored masked OKF evidence document for a request
+evidence request_id:
+    uv run clients/python/pgw.py evidence {{ request_id }}
 
-# Add a human approval to a session's answer, raising it to human-reviewed
-approve session by="human:kei":
-    uv run clients/python/pgw.py approve {{ session }} --by {{ by }}
+# Re-run the attester over a stored answer's masked artifacts and compare every hash
+#
+# Fetches /v1/requests/<id> plus the two masked sources it names, re-derives the
+# leak-check verdict with the bundle attester, and reports whether the recorded
+# `attestation` digests still match. This is the replay the OKF document promises:
+# it trusts nothing the fleet asserts except the bytes it serves.
+verify-answer request_id base="http://localhost:8081":
+    uv run clients/python/pgw.py verify {{ request_id }} --base {{ base }}
 
 # --- deploy -----------------------------------------------------------------
 # Terraform-backed. See .just/deploy.just and docs/DEPLOY.md.

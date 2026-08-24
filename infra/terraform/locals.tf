@@ -34,6 +34,7 @@ locals {
     VAULT_BACKEND         = "firestore"
     FIRESTORE_DATABASE    = var.firestore_database
     VAULT_COLLECTION      = var.vault_collection
+    ANSWER_COLLECTION     = var.answers_collection
     GEMMA_MODEL           = var.gemma_model
     OTEL_ENABLED          = var.otel_enabled ? "1" : "0"
   }
@@ -43,10 +44,16 @@ locals {
   agent_services = {
     "core-agent" = {
       image_dir = "core"
-      # Core reaches only Vertex AI, which is a public endpoint, so it needs no
-      # VPC egress. Its ingress stays open to accept the Gateway's A2A calls;
-      # IAM (no allUsers invoker) is what keeps it private.
-      vpc_egress = false
+      # Internal ingress: Core is only ever called by the Gateway, which egresses
+      # through the VPC, so nothing on the internet needs to reach it. IAM (no
+      # allUsers invoker) still denies an unauthenticated caller; this stops one
+      # from arriving at all.
+      ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+      # Core itself calls only Vertex AI, but its egress still goes through the
+      # VPC so that Vertex AI is reached over Private Google Access rather than
+      # the public internet — the reasoning that keeps Core's traffic inside
+      # Google's network, matching the trust-boundary claim.
+      vpc_egress = true
       env = {
         # ADK takes the Vertex AI path rather than the AI Studio one.
         GOOGLE_GENAI_USE_VERTEXAI = "1"
@@ -55,17 +62,22 @@ locals {
     }
     "synthesis-agent" = {
       image_dir = "synthesis"
-      # Calls gemma-serving, which is internal-ingress, so it needs Direct VPC
-      # egress for the request to be accepted.
+      # Called only by the Gateway; calls internal-ingress gemma-serving. Both
+      # directions therefore require the VPC path.
+      ingress    = "INGRESS_TRAFFIC_INTERNAL_ONLY"
       vpc_egress = true
       env = {
         GEMMA_BASE_URL = local.gemma_base_url
+        GEMMA_AUTH     = "iam"
       }
     }
     "gateway-agent" = {
-      image_dir  = "gateway"
+      image_dir = "gateway"
+      # The one public door: it serves the demo UI and /v1/ask to the internet.
+      ingress    = "INGRESS_TRAFFIC_ALL"
       vpc_egress = true
       env = {
+        GEMMA_AUTH         = "iam"
         CORE_BASE_URL      = local.run_url["core-agent"]
         SYNTHESIS_BASE_URL = local.run_url["synthesis-agent"]
         GEMMA_BASE_URL     = local.gemma_base_url

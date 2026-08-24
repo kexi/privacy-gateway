@@ -161,10 +161,26 @@ export function getTracer(): Tracer {
 }
 
 /**
- * Run `fn` inside a span, recording exceptions and always ending the span.
+ * Re-exported so a consumer can hold a span handle without a direct dependency
+ * on @opentelemetry/api — Core, whose package graph is deliberately minimal,
+ * does exactly this.
+ *
+ * Renamed because `schema.ts` already exports a `Span`: a detected PII span.
+ * Two unrelated things called Span in one barrel would be a trap.
+ */
+export type { Span as TraceSpan, Tracer } from '@opentelemetry/api';
+
+/**
+ * Run `fn` inside a span, recording the failure class and always ending the span.
  *
  * Attributes must never carry PII values — only counts, categories, verdicts and
  * identifiers.
+ *
+ * Why not `span.recordException(error)`: it copies `exception.message` and
+ * `exception.stacktrace` onto the span verbatim, and an exception message
+ * routinely embeds the value that caused it (a response body, a prompt
+ * fragment). The class name and an optional `code` locate the throw site just as
+ * well, and the request id in the correlated log line does the rest.
  */
 export async function withSpan<T>(
   name: string,
@@ -178,11 +194,14 @@ export async function withSpan<T>(
       span.setStatus({ code: SpanStatusCode.OK });
       return result;
     } catch (error) {
-      span.recordException(error instanceof Error ? error : new Error(String(error)));
-      span.setStatus({
-        code: SpanStatusCode.ERROR,
-        message: error instanceof Error ? error.message : String(error),
-      });
+      const errorClass = error instanceof Error ? error.name : 'unknown_error';
+      const code = (error as { code?: unknown } | null)?.code;
+      span.setAttribute('error.class', errorClass);
+      if (typeof code === 'string' || typeof code === 'number') {
+        span.setAttribute('error.code', String(code));
+      }
+      // The status message is the class, not the exception text.
+      span.setStatus({ code: SpanStatusCode.ERROR, message: errorClass });
       throw error;
     } finally {
       span.end();

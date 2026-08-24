@@ -7,9 +7,18 @@ Everything is keyed by **`request_id`** (UUIDv7, header `X-Request-ID`) and **`t
 
 ## 0. Ground rules
 
-- Logs are one JSON object per line. Never expect raw PII in logs — only `⟦TYPE_N⟧`
-  placeholders, counts and hashes. If you see raw PII in a log, that is itself a bug: report it.
-- Always start from `request_id`, then widen to `session_id`, then to time window.
+- Logs are one JSON object per line, filtered through a **typed allowlist** in
+  `packages/common/src/logging.ts`. Only named fields — hashes, counts, enums, internal
+  UUIDs — are emitted at all; anything else is **dropped**, and the dropped key _names_
+  appear under `dropped_fields`. So a field you expect and cannot find is usually missing
+  from the allowlist, not missing from the code. If you ever see raw PII in a log, that is
+  a bug: report it.
+- **There is no `error_message` field, and spans carry no exception message or stack.**
+  An exception message routinely embeds the value that caused it, so only `error_class`
+  and `error_code` are recorded. Locate a throw site by class plus `request_id`.
+- Everything is keyed by `request_id`. **There is no `session_id`** — one server-generated
+  request id per request is also the Token Vault key. Start from `request_id`, then widen
+  to a time window.
 - Prefer `gcloud logging read` (returns JSON you can `jq`) over the console for scripted digging.
 
 ## 1. Where the logs are
@@ -31,18 +40,18 @@ Local pipe: `just dev 2>&1 | tee /tmp/pgw-dev.log`, then `just logs-local <reque
 
 ## 2. Endpoints (for reproducing / health)
 
-| Service   | Path                                                | Purpose                                                                 |
-| --------- | --------------------------------------------------- | ----------------------------------------------------------------------- |
-| gateway   | `GET /healthz`                                      | liveness                                                                |
-| gateway   | `POST /v1/ask` `{text, session_id?}`                | main entry; returns `request_id`, `trace_id`, masked prompt, OKF answer |
-| gateway   | `GET /v1/sessions/:id/answer`                       | OKF markdown of the answer                                              |
-| gateway   | `GET /v1/sessions/:id/tier`                         | derived trust tier                                                      |
-| gateway   | `POST /v1/sessions/:id/approve`                     | adds `human:<id>` to `verified`                                         |
-| core      | `GET /.well-known/agent-card.json`                  | A2A Agent Card (registry)                                               |
-| core      | `POST /jsonrpc` (`message/send`)                    | A2A entry (IAM-protected on Cloud Run)                                  |
-| synthesis | `GET /.well-known/agent-card.json`, `POST /jsonrpc` | A2A                                                                     |
-| synthesis | `POST /v1/synthesize`                               | HTTP route used by gateway                                              |
-| gemma     | `GET /v1/models`, `POST /v1/chat/completions`       | Ollama OpenAI-compatible API (internal ingress only)                    |
+| Service   | Path                                                | Purpose                                                                                                                            |
+| --------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| gateway   | `GET /healthz`                                      | liveness                                                                                                                           |
+| gateway   | `POST /v1/ask` `{text}`                             | main entry; returns `request_id`, `trace_id`, masked prompt, ephemeral answer, OKF document. A body carrying `session_id` is a 400 |
+| gateway   | `GET /v1/requests/:id`                              | the stored **masked** OKF evidence document                                                                                        |
+| gateway   | `GET /v1/requests/:id/masked-prompt.md`             | the masked prompt Core received (an OKF `sources` target)                                                                          |
+| gateway   | `GET /v1/requests/:id/core-response.md`             | Core's still-tokenized response (an OKF `sources` target)                                                                          |
+| core      | `GET /.well-known/agent-card.json`                  | A2A Agent Card (registry)                                                                                                          |
+| core      | `POST /jsonrpc` (`message/send`)                    | A2A entry (IAM-protected on Cloud Run)                                                                                             |
+| synthesis | `GET /.well-known/agent-card.json`, `POST /jsonrpc` | A2A                                                                                                                                |
+| synthesis | `POST /v1/synthesize`                               | HTTP route used by gateway                                                                                                         |
+| gemma     | `GET /v1/models`, `POST /v1/chat/completions`       | Ollama OpenAI-compatible API (internal ingress only)                                                                               |
 
 Cloud Run URLs: `just urls`. Liveness across all services: `just health`.
 Agent Card for one service: `just agent-card <service>` (both attach the ID token that
@@ -60,9 +69,11 @@ Queries (paste into Logs Explorer or use with `gcloud logging read '<query>'`):
 resource.type="cloud_run_revision"
 jsonPayload.request_id="<request_id>"
 
-# one session (multiple requests, approvals)
-resource.type="cloud_run_revision"
-jsonPayload.session_id="<session_id>"
+# every refused release, by reason
+jsonPayload.event="request.refused"
+# jsonPayload.refusal is one of: reserved_syntax | egress_guard | extraction_failed |
+# vault_missing | vault_expired | vault_generation_mismatch | invented_token |
+# unresolved_token | leak_check_failed | judge_flagged | judge_unavailable
 
 # a single service, errors only
 resource.type="cloud_run_revision"
@@ -81,7 +92,7 @@ CLI -- use the recipes rather than retyping the queries:
 
 ```sh
 just logs-request <request_id>        # one request across all agents
-just logs-session <session_id>        # one session
+just logs-refusals [reason]           # every refused release, or one gate
 just logs-service synthesis-agent 30  # one service, errors, last 30 min
 just logs-attest-failures             # failed leak checks
 ```
@@ -107,34 +118,49 @@ Expected span tree (names are stable identifiers):
 
 Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. Key events:
 
-| event                             | agent     | meaning / what to check                                                                       |
-| --------------------------------- | --------- | --------------------------------------------------------------------------------------------- |
-| `request.start` / `request.end`   | gateway   | envelope; `duration_ms`, `status`                                                             |
-| `mask.done`                       | gateway   | `placeholder_count` per category; 0 on PII-laden input ⇒ detector regression                  |
-| `guard.egress.blocked`            | gateway   | raw PII would have left the boundary — request refused (correct behavior; inspect categories) |
-| `a2a.core.send` / `a2a.core.recv` | gateway   | Core round-trip; `status`, `duration_ms`; 401/403 ⇒ IAM invoker binding / ID token audience   |
-| `a2a.receive`                     | core      | inbound A2A request accepted; `placeholder_count`                                             |
-| `guard.inbound.blocked`           | core      | Core's own guard refused a payload that still held raw PII (categories only)                  |
-| `llm.gemini.call`                 | core      | model id, token counts; 404 ⇒ wrong `GEMINI_MODEL` (use `gemini-3.5-flash`)                   |
-| `attest.verdict`                  | synthesis | `verdict: pass                                                                                | fail`, `findings` (categories only) |
-| `judge.gemma`                     | synthesis | Gemma judge result; parse failures ⇒ `OllamaLlm` JSON mode / model not pulled                 |
-| `rehydrate.done`                  | synthesis | `tokens_resolved`, `tokens_unknown` (>0 ⇒ Core invented a placeholder ⇒ consistency fail)     |
-| `okf.persist`                     | synthesis | Firestore write; permission errors ⇒ SA roles (`sa-synthesis` needs datastore.user)           |
-| `config.invalid`                  | any       | zod env validation failed at boot; message lists the keys                                     |
+| event                             | agent     | meaning / what to check                                                                                            |
+| --------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------ |
+| `request.start` / `request.end`   | gateway   | envelope; `duration_ms`, `status`                                                                                  |
+| `mask.done`                       | gateway   | `placeholder_count` per category; 0 on PII-laden input ⇒ detector regression                                       |
+| `mask.gemma.unparseable`          | gateway   | the span extractor's answer could not be read; two of these ⇒ 502, request never reached Core                      |
+| `mask.gemma.failed`               | gateway   | extractor transport failure ⇒ 502 immediately; the regexes cannot see names or addresses                           |
+| `request.refused`                 | gateway   | a gate refused; read `refusal` for which one and `categories` for the (category-level) detail                      |
+| `request.rate_limited`            | gateway   | over the per-IP demo quota (`RATE_LIMIT_PER_MINUTE`)                                                               |
+| `guard.egress.blocked`            | gateway   | raw PII would have left the boundary — request refused (correct behavior; inspect categories)                      |
+| `a2a.core.send` / `a2a.core.recv` | gateway   | Core round-trip; `status`, `duration_ms`; 401/403 ⇒ IAM invoker binding / ID token audience                        |
+| `a2a.receive`                     | core      | inbound A2A request accepted; `placeholder_count`                                                                  |
+| `guard.inbound.blocked`           | core      | Core's own guard refused a payload that still held raw PII (categories only)                                       |
+| `llm.gemini.call`                 | core      | model id, token counts; 404 ⇒ wrong `GEMINI_MODEL` (use `gemini-3.5-flash`)                                        |
+| `attest.verdict`                  | synthesis | `verdict: pass                                                                                                     | fail`, `findings` (categories only) |
+| `judge.gemma`                     | synthesis | Gemma judge result. **Asymmetric**: `leak: true` or a null verdict blocks the release; `leak: false` adds no trust |
+| `release.ok`                      | synthesis | the answer was released; `tokens_resolved`, `withheld_count`                                                       |
+| `release.refused`                 | synthesis | no answer was released; `refusal` names the gate                                                                   |
+| `okf.persist`                     | synthesis | Firestore write; permission errors ⇒ SA roles (`sa-synthesis` needs datastore.user)                                |
+| `config.invalid`                  | any       | zod env validation failed at boot; message lists the keys                                                          |
 
 ## 6. Typical failure → first place to look
 
-| Symptom                                      | Look at                                                                                                                                |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Gateway 502/504                              | gateway `a2a.core.*` events; core service logs for the same `request_id`; core cold start (`gemma` not involved)                       |
-| Answer status `draft`, tier `unverified`     | synthesis `attest.verdict` findings; this is the leak check doing its job — inspect what Core emitted (tokenized text is safe to read) |
-| Placeholders left unresolved in final answer | `rehydrate.done.tokens_unknown`; vault expiry (`stale_after` passed ⇒ vault TTL purged mapping)                                        |
-| Gemma timeouts                               | `gemma-serving` logs (model load on cold start ≈ 30–60 s on L4); `--no-cpu-throttling`, min instances                                  |
-| 403 between services                         | `infra/terraform/iam.tf` bindings; token audience must be the callee's URL                                                             |
-| No trace / broken trace                      | `OTEL_ENABLED`, exporter errors in that service's logs (`event="otel.export.error"`)                                                   |
+| Symptom                                  | Look at                                                                                                                                    |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Gateway 502/504                          | gateway `a2a.core.*` events; core service logs for the same `request_id`; core cold start (`gemma` not involved)                           |
+| 4xx with no answer body                  | gateway `request.refused` / synthesis `release.refused`; `refusal` names the gate. This is the fleet working, not failing                  |
+| Answer status `draft`, tier `unverified` | synthesis `attest.verdict` findings; the leak check doing its job — inspect what Core emitted (tokenized text is safe to read)             |
+| Placeholders left in the released answer | expected for `API_KEY` / `AWS_KEY` / `JWT` / `CREDIT_CARD` / `MY_NUMBER`: the disclosure policy withholds them. See `attestation.withheld` |
+| 409 `unresolved_token` / `vault_missing` | vault expiry (`stale_after` passed ⇒ TTL purged the mapping) or a generation mismatch; no answer is released either way                    |
+| Gemma timeouts                           | `gemma-serving` logs (model load on cold start ≈ 30–60 s on L4); `--no-cpu-throttling`, min instances                                      |
+| 403 between services                     | `infra/terraform/iam.tf` bindings; token audience must be the callee's URL                                                                 |
+| No trace / broken trace                  | `OTEL_ENABLED`, exporter errors in that service's logs (`event="otel.export.error"`)                                                       |
 
 ## 7. Firestore
 
 - Console: `https://console.cloud.google.com/firestore/databases/-default-/data/panel/gateway_answers?project=all-thinkgs`
-- Answers are OKF documents: read `verified`, `status`, `stale_after`, `request_id`, `trace_id` from the frontmatter.
-- `token_vault` docs are masked mappings with `expires_at` TTL — they are inside the trust boundary; never copy their contents into a report.
+- `gateway_answers` docs are keyed by `request_id` and hold **only masked artifacts**:
+  `okf` (the document, whose body is the masked answer), `masked_prompt`, `core_response`
+  (still tokenized) and `expires_at`. The rehydrated answer is returned in one API
+  response and is never stored — finding one here is a bug.
+- Read `verified`, `status`, `stale_after`, `request_id`, `trace_id` and the top-level
+  `attestation` block from the frontmatter. Replay a verdict with
+  `just verify-answer <request_id>`.
+- `token_vault` docs are masked-token → raw-value mappings with an `expires_at` TTL and a
+  `generation` counter. They are inside the trust boundary; never copy their contents into
+  a report.

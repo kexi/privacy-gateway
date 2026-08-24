@@ -9,24 +9,23 @@
  */
 
 import {
-  ApproveResponseSchema,
   AskResponseSchema,
   ErrorResponseSchema,
   GatewayAnswerFrontmatterSchema,
-  type ApproveResponse,
   type AskResponse,
   type Attestation,
   type ConsistencyReport,
+  type TrustDimensions,
   type TrustTier,
   type VerificationEvent,
 } from '@privacy-gateway/common/schema';
 import { parse as parseYaml } from 'yaml';
 
 export type {
-  ApproveResponse,
   AskResponse,
   Attestation,
   ConsistencyReport,
+  TrustDimensions,
   TrustTier,
   VerificationEvent,
 };
@@ -83,19 +82,24 @@ async function toApiError(response: Response): Promise<ApiError> {
   return new ApiError(`request failed with status ${response.status}`, response.status, requestId);
 }
 
-export function ask(text: string, sessionId?: string): Promise<AskResponse> {
+/**
+ * Send one request.
+ *
+ * There is no session parameter: the gateway mints one id per request and
+ * rejects a body that carries `session_id` at all.
+ */
+export function ask(text: string): Promise<AskResponse> {
   return request('/v1/ask', (value) => AskResponseSchema.parse(value), {
     method: 'POST',
-    body: JSON.stringify({ text, session_id: sessionId ?? null }),
+    body: JSON.stringify({ text }),
   });
 }
 
-export function approve(sessionId: string, approver?: string): Promise<ApproveResponse> {
-  return request(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/approve`,
-    (value) => ApproveResponseSchema.parse(value),
-    { method: 'POST', body: JSON.stringify(approver ? { approver } : {}) },
-  );
+/** Fetch the stored masked OKF evidence document for one request. */
+export async function evidence(requestId: string): Promise<string> {
+  const response = await fetch(`/v1/requests/${encodeURIComponent(requestId)}`);
+  if (!response.ok) throw await toApiError(response);
+  return response.text();
 }
 
 /**

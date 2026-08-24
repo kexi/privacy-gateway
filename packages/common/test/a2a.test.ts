@@ -5,7 +5,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { agentCardUrl, extractText, sendMessage } from '../src/a2a.ts';
+import {
+  AgentCardOriginError,
+  agentCardUrl,
+  extractText,
+  resolveRpcUrl,
+  sendMessage,
+} from '../src/a2a.ts';
 
 const BASE_URL = 'http://core.test';
 
@@ -183,5 +189,66 @@ describe('text extraction', () => {
   it('returns an empty string for a result with no text', () => {
     expect(extractText({ parts: [{ kind: 'file' }] })).toBe('');
     expect(extractText(null)).toBe('');
+  });
+});
+
+/**
+ * What the Agent Card origin constraint guarantees: the card is fetched from
+ * the callee, so its `url` is attacker-controlled the moment that callee is
+ * spoofed. Following it elsewhere would send the masked prompt — and the ID
+ * token minted for this fleet — to a host of the attacker's choosing.
+ */
+describe('agent card rpc url origin', () => {
+  it('accepts a card url on the configured origin', () => {
+    expect(resolveRpcUrl('http://core.test', 'http://core.test/a2a')).toBe('http://core.test/a2a');
+  });
+
+  it('accepts a relative card url, resolving it against the base', () => {
+    expect(resolveRpcUrl('http://core.test', '/a2a')).toBe('http://core.test/a2a');
+  });
+
+  it('falls back to the base url when the card advertises none', () => {
+    expect(resolveRpcUrl('http://core.test', undefined)).toBe('http://core.test');
+  });
+
+  it('rejects a card url pointing at another host', () => {
+    expect(() => resolveRpcUrl('http://core.test', 'https://attacker.example/a2a')).toThrow(
+      AgentCardOriginError,
+    );
+  });
+
+  it('rejects a card url that only changes the scheme or port', () => {
+    expect(() => resolveRpcUrl('https://core.test', 'http://core.test/a2a')).toThrow(
+      AgentCardOriginError,
+    );
+    expect(() => resolveRpcUrl('https://core.test', 'https://core.test:8443/a2a')).toThrow(
+      AgentCardOriginError,
+    );
+  });
+
+  it('names the event and both origins on the error', () => {
+    const error = (() => {
+      try {
+        resolveRpcUrl('http://core.test', 'https://attacker.example/a2a');
+        return undefined;
+      } catch (e) {
+        return e as AgentCardOriginError;
+      }
+    })();
+
+    expect(error?.event).toBe('a2a.card.origin_mismatch');
+    expect(error?.expectedOrigin).toBe('http://core.test');
+    expect(error?.cardUrl).toBe('https://attacker.example/a2a');
+  });
+
+  it('aborts sendMessage before any rpc call when the card points elsewhere', async () => {
+    const { impl, calls } = mockCore(() => ({}), 'https://attacker.example/a2a');
+
+    await expect(sendMessage(BASE_URL, 'hello', { fetchImpl: impl })).rejects.toBeInstanceOf(
+      AgentCardOriginError,
+    );
+
+    // Only the card fetch happened; the prompt never left for the attacker.
+    expect(calls).toHaveLength(1);
   });
 });

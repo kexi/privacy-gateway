@@ -22,6 +22,8 @@ import {
   type LlmResponse,
 } from '@google/adk';
 import type { Content, Part } from '@google/genai';
+import { gemmaAuthMode, type GemmaAuthMode } from './config.ts';
+import { authorizedHeaders } from './http_client.ts';
 
 /** Model names this class claims in the registry, e.g. `ollama/gemma3:12b`. */
 const SUPPORTED_MODEL_PATTERN = /^ollama\/.*/u;
@@ -57,6 +59,11 @@ export interface OllamaLlmOptions {
   readonly model: string;
   readonly baseUrl?: string | undefined;
   readonly apiKey?: string | undefined;
+  /**
+   * `iam` to send a Google ID token, `none` to send the static key. Defaults to
+   * the scheme-derived value (https => iam), see `gemmaAuthMode`.
+   */
+  readonly auth?: GemmaAuthMode | undefined;
   /** Injectable for tests; defaults to the global `fetch`. */
   readonly fetchImpl?: typeof fetch | undefined;
   readonly timeoutMs?: number | undefined;
@@ -73,6 +80,7 @@ export class OllamaLlm extends BaseLlm {
 
   private readonly baseUrl: string;
   private readonly apiKey: string;
+  private readonly auth: GemmaAuthMode;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
 
@@ -85,9 +93,14 @@ export class OllamaLlm extends BaseLlm {
       process.env['GEMMA_BASE_URL'] ??
       DEFAULT_GEMMA_BASE_URL
     ).replace(/\/+$/u, '');
-    // Ollama ignores the key but the OpenAI wire format requires one, and a real
-    // gateway in front of Cloud Run may check it.
+    // Ollama ignores the key but the OpenAI wire format requires one. On Cloud
+    // Run this static value is NOT a credential: the service is IAM-protected,
+    // so `auth: 'iam'` replaces it with a Google-signed ID token.
     this.apiKey = opts.apiKey ?? process.env['GEMMA_API_KEY'] ?? 'ollama';
+    this.auth = gemmaAuthMode(
+      this.baseUrl,
+      opts.auth ?? (process.env['GEMMA_AUTH'] as GemmaAuthMode | undefined),
+    );
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = opts.timeoutMs ?? 120_000;
   }
@@ -136,12 +149,10 @@ export class OllamaLlm extends BaseLlm {
     });
 
     try {
-      const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+      const url = `${this.baseUrl}/chat/completions`;
+      const response = await this.fetchImpl(url, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${this.apiKey}`,
-        },
+        headers: await this.authHeaders(url),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -165,6 +176,20 @@ export class OllamaLlm extends BaseLlm {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * Request headers, with the credential the target actually checks.
+   *
+   * `iam` fails closed: `authorizedHeaders` throws `IdTokenError` rather than
+   * sending a request Cloud Run is certain to reject with an opaque 403.
+   */
+  private async authHeaders(url: string): Promise<Record<string, string>> {
+    const base = { 'content-type': 'application/json' };
+    if (this.auth === 'iam') {
+      return authorizedHeaders(url, { headers: base, useIdToken: true });
+    }
+    return { ...base, authorization: `Bearer ${this.apiKey}` };
   }
 
   /** Parse an SSE stream into partial responses plus one aggregate. */

@@ -10,13 +10,17 @@ Japanese version: [OBSERVABILITY.ja.md](OBSERVABILITY.ja.md).
 
 | Identifier   | Where it comes from                                       | Where it appears                                                                      |
 | ------------ | --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `request_id` | `X-Request-ID` header, or a UUIDv7 minted by the Gateway  | every log line, the `X-Request-ID` response header, the API body, the OKF frontmatter |
+| `request_id` | a UUIDv7 minted by the Gateway, one per request           | every log line, the `X-Request-ID` response header, the API body, the OKF frontmatter |
 | `trace_id`   | W3C `traceparent`, or Cloud Run's `X-Cloud-Trace-Context` | every log line, the API body, the OKF frontmatter, Cloud Trace                        |
 
 `request_id` is a **UUIDv7**: its leading 48 bits are a millisecond timestamp, so
-sorting a result set by it also sorts by time. An inbound value is adopted only
-when it is a well-formed UUID — an arbitrary caller string would otherwise become
-a log-injection vector.
+sorting a result set by it also sorts by time. It is always minted server-side by
+the Gateway and used as-is as the Token Vault key. An inbound `X-Request-ID`
+header is echoed back on the response for correlation, but it is **never
+adopted** as the request's own id: the id is the vault key, and a caller who
+could choose it could name another request's mapping and read its
+placeholders back. There is no `session_id` anywhere in this system — see
+`ARCHITECTURE.md` §2 for why sessions were removed entirely.
 
 Both ids reach the user: the web UI shows them with copy buttons, the API returns
 them in the body, and the Python client prints them. A bug report that quotes
@@ -33,10 +37,9 @@ trace_id    ─┬─▶ Cloud Trace: one trace, gateway → core → synthesis
 ```
 
 1. **Start from `request_id`.** One query returns every line from all three
-   services, in order.
-2. **Widen to `session_id`** when the question spans several requests (placeholder
-   stability, an approval that came later).
-3. **Switch to `trace_id`** for latency: which hop was slow, and where the time
+   services, in order — it is the only correlation id this system has, since
+   there is no session to widen the search to.
+2. **Switch to `trace_id`** for latency: which hop was slow, and where the time
    went inside it.
 
 Direct links (project `all-thinkgs`):
@@ -60,26 +63,70 @@ gcloud logging read 'resource.type="cloud_run_revision" jsonPayload.request_id="
 One JSON object per line on stdout (stderr for `ERROR`), which Cloud Run ingests
 as a structured entry without a sidecar.
 
-| Field                           | Always       | Meaning                                        |
-| ------------------------------- | ------------ | ---------------------------------------------- |
-| `severity`                      | yes          | `DEBUG` / `INFO` / `WARNING` / `ERROR`         |
-| `message`                       | yes          | human-readable text; equals `event` for events |
-| `time`                          | yes          | ISO 8601 UTC                                   |
-| `agent`                         | yes          | `gateway` / `core` / `synthesis`               |
-| `event`                         | events       | the stable identifier from §4                  |
-| `request_id`                    | mostly       | correlation id                                 |
-| `session_id`                    | mostly       | the gateway session                            |
-| `trace_id`, `span_id`           | when tracing | raw ids, for local use                         |
-| `logging.googleapis.com/trace`  | on GCP       | `projects/<project>/traces/<trace_id>`         |
-| `logging.googleapis.com/spanId` | on GCP       | links the line to its span                     |
-| `duration_ms`                   | timed        | elapsed milliseconds                           |
-| `error_code`, `error_message`   | errors       | see §6                                         |
+### A typed allowlist, not recursive scrubbing
 
-**No raw PII, ever.** Every string value is passed through the tokenizer before
-serialization, so a value that reaches a log by accident appears as `⟦EMAIL_1⟧`.
-Identifier-like keys (`session_id`, `request_id`, `trace_id`, `verdict`,
+Log fields are filtered against a **typed allowlist** (`packages/common/src/logging.ts`),
+not scrubbed. The previous design ran the tokenizer's own regexes over log values —
+but those regexes never saw a personal name or a postal address (that is Gemma's job,
+upstream), so an exception message or a fragment of a response body could carry either
+straight into a log line unmasked. The allowlist instead names every field a log line
+may carry and the shape it is coerced into; anything not on the list is **dropped
+entirely**, and the dropped key _names_ (never their values) are recorded under
+`dropped_fields`, so a developer who adds a new field and forgets the allowlist sees a
+visible gap instead of a silently missing log line.
+
+| Field kind    | Meaning                                                      | Example fields                                                                                                                                                                                                                                        |
+| ------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`          | internal UUIDs / span & trace ids, minted server-side        | `request_id`, `trace_id`, `span_id`                                                                                                                                                                                                                   |
+| `enum`        | a value drawn from a closed set in the code                  | `agent`, `event`, `severity`, `model`, `status`, `verdict`, `trust_tier`, `document_status`, `freshness`, `hop`, `path`, `method`, `error_code`, `error_class`, `refusal`, `vault_backend`, `time`                                                    |
+| `number`      | a finite number                                              | `duration_ms`, `attempt`, `port`, `placeholder_count`, `masked_count`, `unstructured_spans`, `span_count`, `tokens_resolved`, `tokens_unknown`, `withheld_count`, `vault_generation`, `body_bytes`, `finding_count`, `text_length`, `tokens_withheld` |
+| `boolean`     | true/false                                                   | `ok`, `leak`, `stale`                                                                                                                                                                                                                                 |
+| `string_list` | an array of short strings, each truncated to 128 chars       | `finding_kinds`, `categories`, `findings`, `withheld`, `unresolved_tokens`, `invented_tokens`, `issues`                                                                                                                                               |
+| `count_map`   | an object of `{category: number}`                            | `counts_by_category`                                                                                                                                                                                                                                  |
+| `hash`        | a hex digest, treated like an `enum` (truncated, not parsed) | `response_hash`, `masked_prompt_hash`, `attester_sha256`, `computation_sha256`                                                                                                                                                                        |
+
+Everything else a caller-controlled value could reach — a prompt, a response
+fragment, an exception message, a header value — is not on the allowlist and is
+dropped. There is no field for "free text supplied by a caller"; the list is
+closed by design.
+
+| Field                           | Always       | Meaning                                           |
+| ------------------------------- | ------------ | ------------------------------------------------- |
+| `severity`                      | yes          | `DEBUG` / `INFO` / `WARNING` / `ERROR`            |
+| `message`                       | yes          | human-readable text; equals `event` for events    |
+| `time`                          | yes          | ISO 8601 UTC                                      |
+| `agent`                         | yes          | `gateway` / `core` / `synthesis`                  |
+| `event`                         | events       | the stable identifier from §4                     |
+| `request_id`                    | mostly       | correlation id                                    |
+| `trace_id`, `span_id`           | when tracing | raw ids, for local use                            |
+| `logging.googleapis.com/trace`  | on GCP       | `projects/<project>/traces/<trace_id>`            |
+| `logging.googleapis.com/spanId` | on GCP       | links the line to its span                        |
+| `duration_ms`                   | timed        | elapsed milliseconds                              |
+| `error_code`, `error_class`     | errors       | see §6; **never `error_message`** — see below     |
+| `dropped_fields`                | when needed  | names of keys that were dropped, not their values |
+
+**No raw PII, ever — because it is never on the allowlist to begin with, not
+because it was masked.** Identifier-like keys (`request_id`, `trace_id`, `verdict`,
 `trust_tier`, `status`, `model`, …) pass through unmasked, because masking them
-would make correlation impossible. **Raw PII in a log is itself a bug — report it.**
+would make correlation impossible; they carry no PII by construction (they are
+minted server-side or drawn from a closed enum). **Raw PII in a log is itself a
+bug — report it.**
+
+### `error_class` / `error_code`, never `error_message`
+
+`errorFields()` (`packages/common/src/logging.ts`) emits `error_class` (the
+exception's constructor name) and `error_code` (a stable code, defaulting to the
+class name), and **deliberately never** an `error_message`. An exception message
+routinely embeds the value that caused it — a response body, a prompt fragment, a
+header — and no masking pass can be trusted to catch a name or an address inside
+one. The class, the code, and the `request_id` that ties the line to the rest of
+the request are enough to locate the throw site.
+
+The same rule applies to spans: `withSpan()` (`packages/common/src/telemetry.ts`)
+records `error.class` and `error.code` as span attributes on failure, and
+**`span.recordException()` is not used anywhere in this codebase** — it copies
+`exception.message` and `exception.stacktrace` onto the span verbatim, which is
+exactly the leak this design avoids.
 
 ## 4. Event vocabulary
 
@@ -87,39 +134,49 @@ Event names are stable identifiers; queries and dashboards depend on them.
 
 ### Gateway
 
-| event                    | severity     | meaning / what to check                                                                                        |
-| ------------------------ | ------------ | -------------------------------------------------------------------------------------------------------------- |
-| `request.start`          | INFO         | envelope open; carries `method`, `path`                                                                        |
-| `request.end`            | INFO         | envelope close; `duration_ms`, `status`, `trust_tier`                                                          |
-| `mask.done`              | INFO         | `placeholder_count`, `counts_by_category`, `unstructured_spans`. Zero on PII-laden input ⇒ detector regression |
-| `mask.gemma.unparseable` | INFO/WARNING | Gemma's span JSON could not be used; retried once. Persistent ⇒ JSON mode or model not pulled                  |
-| `mask.gemma.failed`      | WARNING      | Gemma unreachable. Masking degrades to regex only — the guard still holds                                      |
-| `guard.egress.blocked`   | ERROR        | raw PII would have left the boundary; the request was refused. **Correct behaviour** — inspect `categories`    |
-| `a2a.core.send`          | INFO         | Core round-trip opened                                                                                         |
-| `a2a.core.recv`          | INFO         | Core replied; `duration_ms`, `status`                                                                          |
-| `approve.done`           | INFO         | a human approval was recorded; `trust_tier`                                                                    |
-| `request.refused`        | ERROR        | 422 to the caller after `guard.egress.blocked`                                                                 |
-| `request.failed`         | ERROR        | 5xx; `error_code`, `error_message`                                                                             |
-| `server.start`           | INFO         | boot; model ids, vault backend, downstream URLs                                                                |
+| event                    | severity      | meaning / what to check                                                                                                                                                                               |
+| ------------------------ | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `request.start`          | INFO          | envelope open; carries `method`, `path`                                                                                                                                                               |
+| `request.end`            | INFO          | envelope close; `duration_ms`, `document_status`, `trust_tier`                                                                                                                                        |
+| `mask.done`              | INFO          | `placeholder_count`, `counts_by_category`, `unstructured_spans`, `vault_generation`. Zero on PII-laden input ⇒ detector regression                                                                    |
+| `mask.gemma.unparseable` | INFO/WARNING  | Gemma's span JSON could not be used; retried once. Persistent ⇒ JSON mode or model not pulled                                                                                                         |
+| `mask.gemma.failed`      | ERROR         | Gemma unreachable during span extraction. This now **fails the request** (`502 extraction_unavailable`) rather than degrading to regex-only, because the regexes cannot see names or addresses at all |
+| `guard.egress.blocked`   | ERROR         | raw PII would have left the boundary; the request was refused. **Correct behaviour** — inspect `categories`                                                                                           |
+| `a2a.core.send`          | INFO          | Core round-trip opened                                                                                                                                                                                |
+| `a2a.core.recv`          | INFO          | Core replied; `duration_ms`, `status`                                                                                                                                                                 |
+| `request.refused`        | WARNING/ERROR | a gate refused the request; `refusal` names which one (`reserved_syntax`, `egress_guard`, `extraction_failed`, or a `RefusalKind` proxied from Synthesis), `categories` when applicable               |
+| `request.rate_limited`   | WARNING       | the per-IP demo rate limit was exceeded; `429`                                                                                                                                                        |
+| `request.failed`         | ERROR         | 5xx; `error_class`, `error_code` (never `error_message`)                                                                                                                                              |
+| `auth.id_token.failed`   | ERROR         | the Gateway could not obtain an ID token for a downstream call; a deployment/credential fault, reported as 502                                                                                        |
+| `server.start`           | INFO          | boot; model ids, vault backend, `trace_id`                                                                                                                                                            |
+
+There is no `approve.done` event: human approval does not exist in this system
+(see `ARCHITECTURE.md` §2).
 
 ### Core
 
-| event                   | severity | meaning                                                                |
-| ----------------------- | -------- | ---------------------------------------------------------------------- |
-| `a2a.receive`           | INFO     | an A2A request was accepted; `placeholder_count`, `text_length`        |
-| `guard.inbound.blocked` | ERROR    | the payload still held raw PII; `finding_kinds` only, never the values |
-| `llm.gemini.call`       | INFO     | model id, token counts. 404 ⇒ wrong `GEMINI_MODEL`                     |
-| `server.start`          | INFO     | boot; model id, Vertex AI settings, Agent Card path                    |
+| event                   | severity | meaning                                                                                     |
+| ----------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| `a2a.receive`           | INFO     | an A2A request was accepted; `placeholder_count`, `text_length`, `path`                     |
+| `guard.inbound.blocked` | ERROR    | the payload still held raw PII; `finding_kinds`, `finding_count`, `path` — never the values |
+| `server.start`          | INFO     | boot; model id, Vertex AI settings, Agent Card path                                         |
+
+The `llm.gemini` span (see §5) covers the Gemini call itself; there is no
+separate `llm.gemini.call` log event — the span, with the model id as its only
+attribute, is the record.
 
 ### Synthesis
 
-| event                                              | severity     | meaning / what to check                                                                     |
-| -------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------- |
-| `attest.verdict`                                   | INFO         | `verdict: pass\|fail`, `findings` (categories only, never values)                           |
-| `judge.gemma`                                      | INFO/WARNING | the advisory Gemma opinion; parse failures ⇒ JSON mode or model not pulled                  |
-| `rehydrate.done`                                   | INFO/WARNING | `tokens_resolved`, `tokens_unknown`. `tokens_unknown > 0` ⇒ invented token or expired vault |
-| `okf.persist`                                      | INFO         | Firestore write. Permission errors ⇒ `sa-synthesis` needs `roles/datastore.user`            |
-| `request.start` / `request.end` / `request.failed` | —            | as for the Gateway                                                                          |
+| event                                              | severity     | meaning / what to check                                                                                                                                                                                                   |
+| -------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attest.verdict`                                   | INFO         | `verdict: pass\|fail`, `findings` (categories only, never values)                                                                                                                                                         |
+| `judge.gemma`                                      | INFO/WARNING | the advisory Gemma opinion; `leak` (boolean or absent). A transport failure or parse failure counts as "no usable verdict" and blocks the release just as `leak: true` does — it never falls back to trusting the release |
+| `release.refused`                                  | ERROR        | a gate refused the release; `refusal` is one of `vault_missing`, `vault_expired`, `vault_generation_mismatch`, `invented_token`, `leak_check_failed`, `judge_flagged`, `judge_unavailable`, `unresolved_token`            |
+| `release.ok`                                       | INFO         | the release passed every gate; `tokens_resolved`, `withheld_count`                                                                                                                                                        |
+| `okf.persist`                                      | INFO         | Firestore write of the masked evidence document (always, on release and on refusal alike); `document_status`, `verdict`. Permission errors ⇒ `sa-synthesis` needs `roles/datastore.user`                                  |
+| `okf.persist.failed`                               | ERROR        | the evidence document could not be persisted after a refusal; `refusal` names the original refusal kind                                                                                                                   |
+| `request.start` / `request.end` / `request.failed` | —            | as for the Gateway                                                                                                                                                                                                        |
+| `request.refused`                                  | ERROR        | the HTTP layer turned a `ReleaseRefusedError` into a response; `refusal`, `categories`                                                                                                                                    |
 
 ### Any service
 
@@ -145,30 +202,59 @@ request                            (gateway)
                                        persist
 ```
 
-Span attributes carry counts, verdicts and identifiers — `placeholder_count`,
-`tokens_unknown`, `verdict`, `trust_tier`, `session_id`, `request_id` — and
-**never a PII value**.
+`llm.gemini` is a real span, not an aspirational one: the Core agent opens it in
+an ADK `beforeModelCallback` and closes it in `afterModelCallback` (there is no
+function to wrap with `withSpan` — ADK owns the call between the two callbacks),
+with the model id as its **only** attribute. Earlier revisions of this document
+promised the span before the code carried it; it is now present in
+`agents/core/src/agent.ts`.
 
-Propagation: the Gateway injects `traceparent` into both the A2A call and the
-Synthesis HTTP call. On Cloud Run, `X-Cloud-Trace-Context` is translated into a
-traceparent when no W3C header is present, so a request entering through the load
-balancer still joins one trace. If a hop is missing from Cloud Trace, that hop's
-propagation broke: check `OTEL_ENABLED`, then look for `otel.export.error` in
-that service's logs.
+Span attributes carry counts, verdicts and identifiers — `placeholder_count`,
+`tokens_unknown`, `verdict`, `trust_tier`, `request_id` — and **never a PII
+value**. On failure, a span records `error.class` and an optional `error.code`
+attribute; it never calls `span.recordException()` (see §3).
+
+Propagation: the Gateway injects `traceparent` into both the A2A call to Core and
+the HTTP call to Synthesis. On Cloud Run, `X-Cloud-Trace-Context` is translated
+into a traceparent when no W3C header is present, so a request entering through
+the load balancer still joins one trace. If a hop is missing from Cloud Trace,
+that hop's propagation broke: check `OTEL_ENABLED`, then look for
+`otel.export.error` in that service's logs.
 
 The end-to-end test asserts this: one trace id across all hops, with the child
-spans parented to `request` (`agents/gateway/test/e2e.test.ts`).
+spans parented to `request` (`agents/gateway/test/e2e.test.ts`). That test does
+**not** cross real process boundaries: it mocks Core and the Gemma endpoint at
+the `fetch` layer, and runs Synthesis in-process against an in-memory vault, so
+its span tree — while structurally faithful — is not evidence of a live
+multi-service deployment.
 
 ## 6. Error codes
 
-| `error_code`              | HTTP | Meaning                                         | First place to look                              |
-| ------------------------- | ---- | ----------------------------------------------- | ------------------------------------------------ |
-| `invalid_request`         | 400  | the body failed its zod schema                  | the `message` field names the offending key      |
-| `outbound guard refused`  | 422  | raw PII survived masking; Core was never called | `guard.egress.blocked` and its `categories`      |
-| `downstream_agent_failed` | 502  | Core or Synthesis failed or was unreachable     | that service's logs for the same `request_id`    |
-| `internal_error`          | 500  | an unhandled failure in this service            | `error_message` on the `request.failed` line     |
-| `unknown session`         | 404  | no stored answer for that session               | vault/answer TTL — `stale_after` may have passed |
-| `config.invalid`          | —    | the process refused to start                    | `issues` in the log line                         |
+| `error_code`                | HTTP | Meaning                                                                         | First place to look                               |
+| --------------------------- | ---- | ------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `invalid_request`           | 400  | the body failed its zod schema (including a stray `session_id`)                 | the `message` field names the offending key       |
+| `reserved_syntax`           | 400  | the raw input used the reserved `⟦…⟧` delimiters                                | `request.refused` with `refusal: reserved_syntax` |
+| `extraction_unavailable`    | 502  | Gemma span extraction was unusable or unreachable; Core was never called        | `mask.gemma.unparseable` / `mask.gemma.failed`    |
+| `outbound_guard_refused`    | 422  | raw PII survived masking; Core was never called                                 | `guard.egress.blocked` and its `categories`       |
+| `vault_missing`             | 409  | no live token mapping for this `request_id`                                     | `release.refused` with `refusal: vault_missing`   |
+| `vault_expired`             | 410  | the token mapping existed but its TTL passed                                    | `release.refused` with `refusal: vault_expired`   |
+| `vault_generation_mismatch` | 409  | the mapping changed generation after this request was masked                    | `release.refused`, `vault_generation`             |
+| `invented_token`            | 409  | Core used a placeholder absent from the prompt                                  | `release.refused`, `invented_tokens`              |
+| `leak_check_failed`         | 422  | the deterministic leak check found raw PII in Core's response                   | `attest.verdict`, `findings`                      |
+| `judge_flagged`             | 422  | the Gemma judge returned `leak: true`                                           | `judge.gemma`                                     |
+| `judge_unavailable`         | 422  | the Gemma judge had no usable verdict (transport failure, timeout, unparseable) | `judge.gemma`                                     |
+| `unresolved_token`          | 409  | the response referenced a placeholder outside the known mapping                 | `release.refused`, `unresolved_tokens`            |
+| `rate_limited`              | 429  | the per-IP demo rate limit was exceeded                                         | `request.rate_limited`                            |
+| `payload_too_large`         | 413  | the body exceeded `MAX_BODY_BYTES` (64 KB)                                      | —                                                 |
+| `deadline_exceeded`         | 504  | the end-to-end deadline (`REQUEST_DEADLINE_SECONDS`, 60 s) passed               | `request.failed`                                  |
+| `downstream_agent_failed`   | 502  | Core or Synthesis failed or was unreachable                                     | that service's logs for the same `request_id`     |
+| `internal_error`            | 500  | an unhandled failure in this service                                            | `error_class` / `error_code` on `request.failed`  |
+| `config.invalid`            | —    | the process refused to start                                                    | `issues` in the log line                          |
+
+There is no `unknown session` / 404 code: there is no session lookup route.
+`GET /v1/requests/:id`, `GET /v1/requests/:id/masked-prompt.md` and
+`GET /v1/requests/:id/core-response.md` return a plain `404 unknown_request` when
+the evidence has expired or never existed.
 
 Every error response carries `request_id`, so the reporter's copy of it is enough
 to find the corresponding logs.

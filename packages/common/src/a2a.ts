@@ -11,10 +11,9 @@
  * inspects the RPC body can still join the trace.
  */
 
-import { GoogleAuth } from 'google-auth-library';
 import { randomUUID } from 'node:crypto';
+import { audienceFor, authorizedFetch } from './http_client.ts';
 import { AgentCardSchema, JsonRpcResponseSchema, type AgentCard } from './schema.ts';
-import { outboundTraceHeaders, REQUEST_ID_HEADER } from './telemetry.ts';
 
 /**
  * The A2A Agent Card path. Some implementations still serve the older
@@ -48,13 +47,15 @@ export async function fetchAgentCard(
   baseUrl: string,
   options: A2aClientOptions = {},
 ): Promise<AgentCard> {
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const headers = await buildHeaders(baseUrl, options);
   let lastError: unknown;
 
   for (const path of AGENT_CARD_PATHS) {
     try {
-      const response = await fetchImpl(agentCardUrl(baseUrl, path), { headers });
+      const response = await authorizedFetch(agentCardUrl(baseUrl, path), {
+        ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+        ...(options.requestId === undefined ? {} : { requestId: options.requestId }),
+        ...(options.useIdToken === undefined ? {} : { useIdToken: options.useIdToken }),
+      });
       if (response.status === 404) continue;
       if (!response.ok) {
         lastError = new Error(`agent card request failed with status ${response.status}`);
@@ -85,11 +86,10 @@ export async function sendMessage(
   text: string,
   options: A2aClientOptions = {},
 ): Promise<A2aReply> {
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   const requestId = options.requestId ?? randomUUID();
 
   const card = await fetchAgentCard(baseUrl, { ...options, requestId });
-  const rpcUrl = card.url ?? baseUrl;
+  const rpcUrl = resolveRpcUrl(baseUrl, card.url);
 
   const request = {
     jsonrpc: '2.0',
@@ -108,33 +108,76 @@ export async function sendMessage(
     },
   };
 
-  const headers = await buildHeaders(rpcUrl, { ...options, requestId });
-  const controller = new AbortController();
-  const timer = setTimeout(() => {
-    controller.abort();
-  }, options.timeoutMs ?? 120_000);
+  const response = await authorizedFetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+    requestId,
+    timeoutMs: options.timeoutMs ?? 120_000,
+    ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+    ...(options.useIdToken === undefined ? {} : { useIdToken: options.useIdToken }),
+  });
 
-  try {
-    const response = await fetchImpl(rpcUrl, {
-      method: 'POST',
-      headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify(request),
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      throw new Error(`remote agent returned status ${response.status}`);
-    }
-
-    const payload = JsonRpcResponseSchema.parse(await response.json());
-    if (payload.error !== undefined) {
-      throw new Error(`remote agent returned an error: ${JSON.stringify(payload.error)}`);
-    }
-
-    return { text: extractText(payload.result), requestId };
-  } finally {
-    clearTimeout(timer);
+  if (!response.ok) {
+    throw new Error(`remote agent returned status ${response.status}`);
   }
+
+  const payload = JsonRpcResponseSchema.parse(await response.json());
+  if (payload.error !== undefined) {
+    throw new Error(`remote agent returned an error: ${JSON.stringify(payload.error)}`);
+  }
+
+  return { text: extractText(payload.result), requestId };
+}
+
+/**
+ * Raised when an Agent Card's `url` points outside the configured service.
+ *
+ * Typed so a caller can log `a2a.card.origin_mismatch` without matching on a
+ * message string.
+ */
+export class AgentCardOriginError extends Error {
+  readonly event = 'a2a.card.origin_mismatch';
+  readonly expectedOrigin: string;
+  readonly cardUrl: string;
+
+  constructor(expectedOrigin: string, cardUrl: string) {
+    super(
+      `agent card advertises an rpc url outside the configured origin: ` +
+        `expected ${expectedOrigin}, got ${cardUrl}`,
+    );
+    this.name = 'AgentCardOriginError';
+    this.expectedOrigin = expectedOrigin;
+    this.cardUrl = cardUrl;
+  }
+}
+
+/**
+ * Constrain the card's advertised RPC url to the origin we already trust.
+ *
+ * The Agent Card is fetched from the callee, so its `url` is attacker-controlled
+ * the moment that callee is compromised or spoofed. Following it blindly would
+ * let the card redirect the masked prompt — and the ID token minted for this
+ * fleet — to an arbitrary host. The base URL comes from validated configuration,
+ * so it is the authority; the card may only refine the path.
+ *
+ * Why not simply ignore `card.url`: the A2A spec lets a service serve its RPC
+ * endpoint on a path other than the card's own, and honouring that within the
+ * configured origin costs nothing.
+ */
+export function resolveRpcUrl(baseUrl: string, cardUrl: string | undefined): string {
+  if (cardUrl === undefined || cardUrl === '') return baseUrl;
+
+  const expected = audienceFor(baseUrl);
+  let resolved: URL;
+  try {
+    resolved = new URL(cardUrl, baseUrl);
+  } catch {
+    throw new AgentCardOriginError(expected, cardUrl);
+  }
+
+  if (resolved.origin !== expected) throw new AgentCardOriginError(expected, cardUrl);
+  return resolved.toString();
 }
 
 /**
@@ -178,60 +221,6 @@ export function extractText(result: unknown): string {
   }
 
   return chunks.join('').trim();
-}
-
-/** Build the outbound headers: correlation, trace context and optional auth. */
-async function buildHeaders(
-  targetUrl: string,
-  options: A2aClientOptions,
-): Promise<Record<string, string>> {
-  const headers: Record<string, string> = {
-    ...outboundTraceHeaders(),
-  };
-  if (options.requestId !== undefined) headers[REQUEST_ID_HEADER] = options.requestId;
-
-  const wantsToken = options.useIdToken ?? targetUrl.startsWith('https://');
-  if (!wantsToken) return headers;
-
-  const token = await fetchIdToken(targetUrl);
-  if (token !== undefined) headers['authorization'] = `Bearer ${token}`;
-  return headers;
-}
-
-/** Cached per audience: minting an ID token is a metadata-server round trip. */
-const idTokenClients = new Map<string, Promise<string | undefined>>();
-
-/**
- * Mint a Google-signed ID token for `targetUrl`.
- *
- * The audience is the callee's base URL, which is what Cloud Run's IAM check
- * validates. Failure is not fatal here: a local or already-public endpoint needs
- * no token, and forcing one would make development require credentials.
- */
-async function fetchIdToken(targetUrl: string): Promise<string | undefined> {
-  const audience = new URL(targetUrl).origin;
-  const cached = idTokenClients.get(audience);
-  if (cached !== undefined) return cached;
-
-  const pending = (async (): Promise<string | undefined> => {
-    try {
-      const auth = new GoogleAuth();
-      const client = await auth.getIdTokenClient(audience);
-      const headers = await client.getRequestHeaders();
-      const authorization = new Headers(headers).get('authorization');
-      return authorization?.replace(/^Bearer\s+/iu, '');
-    } catch {
-      return undefined;
-    }
-  })();
-
-  idTokenClients.set(audience, pending);
-  return pending;
-}
-
-/** Clears the ID token cache. Test-only. */
-export function resetIdTokenCache(): void {
-  idTokenClients.clear();
 }
 
 function describeError(error: unknown): string {

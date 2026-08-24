@@ -9,6 +9,7 @@
  */
 
 import { LlmAgent } from '@google/adk';
+import { getTracer, SPAN, type TraceSpan } from '@privacy-gateway/common/telemetry';
 
 /** Model verified to exist on Vertex AI. Override with the GEMINI_MODEL env var. */
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
@@ -74,12 +75,34 @@ export const CORE_AGENT_NAME = 'core_agent';
 export function createCoreAgent(options: CreateCoreAgentOptions = {}): LlmAgent {
   const model = options.model ?? process.env['GEMINI_MODEL'] ?? DEFAULT_GEMINI_MODEL;
 
+  // The Gemini call is the one hop the fleet cannot see from the outside, and
+  // `docs/OBSERVABILITY.md` has always promised an `llm.gemini` span for it.
+  //
+  // Why start and end it across two callbacks rather than with `withSpan`: ADK
+  // owns the call between them, so there is no function to wrap. The handle is
+  // per-agent and a Core process serves one request per invocation, so the pair
+  // cannot interleave; a leftover handle from a call that never returned is
+  // simply ended when the next one starts.
+  let modelSpan: TraceSpan | undefined;
+
   return new LlmAgent({
     name: CORE_AGENT_NAME,
     description:
       'Reasoning, planning and code generation over de-identified text. Operates on ⟦TYPE_N⟧ placeholder tokens and has no access to the token vault.',
     model,
     instruction: CORE_SYSTEM_INSTRUCTION,
+    beforeModelCallback: () => {
+      modelSpan?.end();
+      // Attributes are the model id only: the request carries the masked prompt,
+      // and a span attribute is not the place for any prompt text.
+      modelSpan = getTracer().startSpan(SPAN.llmGemini, { attributes: { model } });
+      return undefined;
+    },
+    afterModelCallback: () => {
+      modelSpan?.end();
+      modelSpan = undefined;
+      return undefined;
+    },
     // No tools on purpose: the trust boundary assumes Core touches no external
     // resource of its own.
     tools: [],

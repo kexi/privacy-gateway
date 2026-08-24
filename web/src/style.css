@@ -118,11 +118,81 @@ button.secondary {
 }
 
 .verdict {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
   margin: 2rem 0 1rem;
-  flex-wrap: wrap;
+}
+
+/* Four dimensions side by side: never collapsed into one badge. */
+.dimensions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+
+.dimension {
+  display: grid;
+  gap: 0.2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top-width: 3px;
+  border-top-color: var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+}
+
+.dimension.good {
+  border-top-color: var(--pass);
+}
+
+.dimension .dim-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.dimension .dim-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.dimension .dim-detail {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.derived {
+  margin: 0.7rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* A refused request is an outcome to show, not an error to hide. */
+.blocked {
+  margin: 2rem 0 1rem;
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--fail) 45%, var(--border));
+  border-left-width: 4px;
+  border-left-color: var(--fail);
+  border-radius: 8px;
+  padding: 1rem 1.15rem;
+}
+
+.blocked h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+  color: var(--fail);
+}
+
+.blocked-reason {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+}
+
+.blocked-note {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
 }
 
 .badge {
@@ -201,6 +271,7 @@ button.secondary {
 }
 
 .findings,
+.withheld,
 .advisory {
   margin: 0;
   font-size: 0.82rem;

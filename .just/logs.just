@@ -27,12 +27,17 @@ logs-request request_id:
       --project "{{ PROJECT_ID }}" --freshness={{ log_freshness }} --order=asc --format=json \
       | jq -c '{{ _jq_fmt }}'
 
-# Show every log line for one session_id (multiple requests, approvals)
-logs-session session_id:
+# Show every refused release, optionally narrowed to one refusal reason
+logs-refusals reason="":
     #!/usr/bin/env bash
     set -euo pipefail
-    gcloud logging read \
-      'resource.type="cloud_run_revision" jsonPayload.session_id="{{ session_id }}"' \
+    # Refusals are the fleet working, not failing, so they get their own view:
+    # `refusal` names which gate stopped the request.
+    query='resource.type="cloud_run_revision" (jsonPayload.event="request.refused" OR jsonPayload.event="release.refused")'
+    if [ -n "{{ reason }}" ]; then
+      query="$query jsonPayload.refusal=\"{{ reason }}\""
+    fi
+    gcloud logging read "$query" \
       --project "{{ PROJECT_ID }}" --freshness={{ log_freshness }} --order=asc --format=json \
       | jq -c '{{ _jq_fmt }}'
 
@@ -105,3 +110,95 @@ agent-card service:
 # Filter a local `just dev` log file by request_id
 logs-local request_id file="/tmp/pgw-dev.log":
     jq -c 'select(.request_id=="{{ request_id }}")' {{ file }}
+
+# Prove IAM is enforced on the private services: 403 without a token, 200 with one
+verify-auth:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The submission gate asks for exactly this evidence: a private endpoint
+    # refuses an anonymous caller and accepts an authenticated one. Both halves
+    # matter — a 403 alone could just mean the service is broken.
+    #
+    # /healthz is probed rather than the Agent Card because every service has it,
+    # including gemma-serving, which speaks no A2A.
+    fail=0
+    for svc in core-agent synthesis-agent gemma-serving; do
+      url=$(gcloud run services describe "$svc" \
+        --project "{{ PROJECT_ID }}" --region "{{ REGION }}" \
+        --format='value(status.url)' 2>/dev/null || true)
+      if [ -z "$url" ]; then
+        printf '%-18s not deployed (skipped)\n' "$svc"
+        continue
+      fi
+
+      anon=$(curl -s -o /dev/null -w '%{http_code}' "${url}/healthz" || true)
+
+      # The audience must be the callee URL; a token minted for anything else is
+      # rejected even when the caller is an Owner.
+      token=$(gcloud auth print-identity-token --audiences="$url")
+      authed=$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${token}" "${url}/healthz" || true)
+
+      # gemma-serving is internal-ingress, so even a valid token is refused from
+      # a laptop: 403 both ways is the correct, expected result there.
+      if [ "$svc" = "gemma-serving" ]; then
+        expected="403/403 (internal ingress: unreachable from outside, as designed)"
+        [ "$anon" = "403" ] && [ "$authed" = "403" ] || fail=1
+      else
+        expected="403/200"
+        [ "$anon" = "403" ] && [ "$authed" = "200" ] || fail=1
+      fi
+      printf '%-18s no-auth=%s with-id-token=%s  expected %s\n' "$svc" "$anon" "$authed" "$expected"
+    done
+
+    url=$(gcloud run services describe gateway-agent \
+      --project "{{ PROJECT_ID }}" --region "{{ REGION }}" \
+      --format='value(status.url)' 2>/dev/null || true)
+    if [ -n "$url" ]; then
+      anon=$(curl -s -o /dev/null -w '%{http_code}' "${url}/healthz" || true)
+      # The Gateway is the one public door; an anonymous 200 here is correct.
+      printf '%-18s no-auth=%s              expected 200 (public entry point)\n' "gateway-agent" "$anon"
+      [ "$anon" = "200" ] || fail=1
+    fi
+
+    [ "$fail" -eq 0 ] && echo "OK: auth boundary behaves as designed" || { echo "FAIL: see above"; exit 1; }
+
+# Smoke-test the deployed Gateway end to end with a fixed PII sample
+smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Runs against the real deployment, so it exercises Cloud Run IAM, the VPC
+    # path to Gemma and the Firestore vault — none of which the mocked unit
+    # tests touch. This is the check that the submission gate's statement 1
+    # ("a public /v1/ask reaches real Gemma, Gemini and Synthesis") is true.
+    url=$(gcloud run services describe gateway-agent \
+      --project "{{ PROJECT_ID }}" --region "{{ REGION }}" \
+      --format='value(status.url)')
+
+    # Fixed sample so the expected placeholders are deterministic. The values are
+    # obviously synthetic; see .gitleaks.toml for the allow-list entry.
+    body='{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}'
+
+    response=$(mktemp)
+    trap 'rm -f "$response"' EXIT
+    code=$(curl -sS -o "$response" -w '%{http_code}' \
+      -X POST "${url}/v1/ask" \
+      -H 'Content-Type: application/json' \
+      -d "$body")
+
+    echo "POST ${url}/v1/ask -> HTTP ${code}"
+    jq . < "$response" || cat "$response"
+
+    [ "$code" = "200" ] || { echo "FAIL: expected HTTP 200"; exit 1; }
+
+    # The masked prompt Core saw must carry ⟦TYPE_N⟧ placeholders, never the raw
+    # values. Their presence is the privacy guarantee being observable from
+    # outside the boundary.
+    jq -e '(.masked_prompt // "") | test("⟦[A-Z_]+_[0-9]+⟧")' < "$response" >/dev/null \
+      || { echo "FAIL: no ⟦TYPE_N⟧ placeholder found in masked_prompt"; exit 1; }
+
+    # And the raw PII must not appear in the masked prompt at all.
+    jq -e '(.masked_prompt // "") | test("taro@example.com|090-1234-5678") | not' < "$response" >/dev/null \
+      || { echo "FAIL: raw PII survived into masked_prompt"; exit 1; }
+
+    echo "OK: 200, placeholders present, raw PII absent from the masked prompt"

@@ -9,8 +9,10 @@
  */
 
 export * from './a2a.ts';
+export * from './attestation.ts';
 export * from './config.ts';
 export * from './guard.ts';
+export * from './http_client.ts';
 export * from './logging.ts';
 export * from './request_id.ts';
 export * from './telemetry.ts';
@@ -25,6 +27,7 @@ export {
   addVerification,
   buildGatewayAnswer,
   dump,
+  freshness,
   GATEWAY_ANSWER_TYPE,
   GatewayAnswerFrontmatterSchema,
   isStale,
@@ -38,8 +41,10 @@ export {
   VerificationEventSchema,
 } from './okf.ts';
 export type {
+  AttestationEvidence,
   AttestationLike,
   BuildGatewayAnswerOptions,
+  Freshness,
   GatewayAnswerFrontmatter,
   OkfDocument,
   OkfMetadata,

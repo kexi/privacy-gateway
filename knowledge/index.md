@@ -13,5 +13,7 @@ enforces, and the attested computation that gates every response.
 - [Bundle history](/log.md)
 
 Per-request answers (`type: Gateway Answer`) are produced by the Synthesis Agent at
-runtime and stored in Firestore. They are not part of this bundle: they are session
-artifacts with their own `stale_after`, tied to the Token Vault expiry.
+runtime and stored in Firestore, keyed by request id. They are not part of this bundle:
+they are per-request artifacts with their own `stale_after`, tied to the Token Vault
+expiry, and they hold only masked text. Replay one with
+`just verify-answer <request_id>`.

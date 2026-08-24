@@ -3,12 +3,15 @@
  * the boundary.
  *
  * The centrepiece is the difference between the string Gemini actually received and the
- * string the user receives, annotated with the attestation and the trust tier.
+ * string the user receives, annotated with the four trust dimensions.
+ *
+ * There is no approve button. The gateway is public and authenticates nobody, so a
+ * "human reviewed this" claim minted from a click would name no one; review identity is
+ * therefore displayed, always, as `none`.
  */
 
 import {
   ApiError,
-  approve,
   ask,
   deriveTrustTier,
   extractVerified,
@@ -27,14 +30,6 @@ const SAMPLE = `Customer Taro Yamada (taro@example.co.jp, 090-1234-5678) reports
 
 Draft a polite reply and a Python snippet to update the customer record.`;
 
-const TIER_LABEL: Record<TrustTier, string> = {
-  unverified: 'unverified',
-  'machine-confirmed': 'machine-confirmed',
-  'human-reviewed': 'human-reviewed',
-};
-
-let current: AskResponse | null = null;
-
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
   if (!node) throw new Error(`missing element #${id}`);
@@ -43,13 +38,12 @@ function el<T extends HTMLElement>(id: string): T {
 
 const input = el<HTMLTextAreaElement>('input');
 const submit = el<HTMLButtonElement>('submit');
-const approveButton = el<HTMLButtonElement>('approve');
 const statusLine = el<HTMLParagraphElement>('status');
 const results = el<HTMLElement>('results');
+const blockedPane = el<HTMLElement>('blocked');
 const maskedPane = el<HTMLPreElement>('masked');
 const answerPane = el<HTMLPreElement>('answer');
-const tierBadge = el<HTMLSpanElement>('tier');
-const statusBadge = el<HTMLSpanElement>('doc-status');
+const dimensionsPane = el<HTMLDivElement>('dimensions');
 const attestationPane = el<HTMLDivElement>('attestation');
 const statsPane = el<HTMLDivElement>('stats');
 const okfPane = el<HTMLPreElement>('okf');
@@ -77,11 +71,55 @@ function highlightPlaceholders(text: string): string {
   return escapeHtml(text).replace(/⟦[A-Z_]+_\d+⟧/g, '<mark class="token">$&</mark>');
 }
 
-function renderBadges(tier: TrustTier, status: string): void {
-  tierBadge.textContent = TIER_LABEL[tier];
-  tierBadge.className = `badge tier-${tier}`;
-  statusBadge.textContent = status;
-  statusBadge.className = `badge status-${status}`;
+/**
+ * Render the four dimensions side by side.
+ *
+ * They are shown separately on purpose. Collapsed into a single badge, a
+ * deterministic pass and a model's dissent could both hide behind one green
+ * label; separate cells make each claim answerable on its own terms.
+ */
+function renderDimensions(response: AskResponse, tier: TrustTier): void {
+  const { dimensions } = response;
+  const cells = [
+    dimension('Policy verdict', dimensions.policy_verdict, dimensions.policy_verdict === 'pass', {
+      pass: 'the leak-policy check passed on the tokenized core response',
+      fail: 'the leak-policy check failed',
+    }),
+    dimension(
+      'Document status',
+      dimensions.document_status,
+      dimensions.document_status === 'stable',
+      {
+        stable: 'the OKF document is releasable',
+        draft: 'the OKF document records a failure',
+        deprecated: 'superseded',
+      },
+    ),
+    dimension('Freshness', dimensions.freshness, dimensions.freshness === 'fresh', {
+      fresh: 'the token mapping is still live',
+      stale: 'the token mapping has expired',
+      unknown: 'no usable stale_after; freshness cannot be asserted',
+    }),
+    dimension('Review identity', dimensions.review_identity, false, {
+      none: 'no authenticated principal exists on this gateway, so no human review is possible',
+    }),
+  ];
+  dimensionsPane.innerHTML = `<div class="dimensions-grid">${cells.join('')}</div>
+    <p class="derived">Derived trust tier: <code id="tier">${escapeHtml(tier)}</code>
+    <small>(from the OKF <code>verified</code> field, not from a stored score)</small></p>`;
+}
+
+function dimension(
+  label: string,
+  value: string,
+  positive: boolean,
+  detail: Record<string, string>,
+): string {
+  return `<div class="dimension ${positive ? 'good' : 'neutral'}">
+    <span class="dim-label">${escapeHtml(label)}</span>
+    <span class="dim-value">${escapeHtml(value)}</span>
+    <span class="dim-detail">${escapeHtml(detail[value] ?? '')}</span>
+  </div>`;
 }
 
 function renderAttestation(response: AskResponse): void {
@@ -90,7 +128,7 @@ function renderAttestation(response: AskResponse): void {
 
   rows.push(
     row(
-      'Leak check',
+      'Leak-policy check',
       attestation.ok,
       attestation.ok
         ? "no raw identifiers found in the model's tokenized answer"
@@ -114,11 +152,16 @@ function renderAttestation(response: AskResponse): void {
         .join(', ')}</p>`,
     );
   }
+  if (attestation.withheld && attestation.withheld.length > 0) {
+    rows.push(
+      `<p class="withheld">Withheld by the disclosure policy (left masked in the answer):
+        ${attestation.withheld.map((c) => `<code>${escapeHtml(c)}</code>`).join(', ')}</p>`,
+    );
+  }
   if (attestation.judge && typeof attestation.judge.leak === 'boolean') {
     rows.push(
-      `<p class="advisory">Gemma judge (advisory): ${
-        attestation.judge.leak ? 'flagged' : 'clear'
-      }</p>`,
+      `<p class="advisory">Gemma judge (probabilistic, can block but never vouches):
+        ${attestation.judge.leak ? 'flagged' : 'clear'}</p>`,
     );
   }
   attestationPane.innerHTML = rows.join('');
@@ -144,7 +187,7 @@ function renderStats(response: AskResponse): void {
       <div><dt>Model spans</dt><dd>${response.stats.unstructured_spans}</dd></div>
       <div><dt>Core actor</dt><dd><code>${escapeHtml(response.stats.core_actor)}</code></dd></div>
       <div><dt>Vault expires</dt><dd>${escapeHtml(response.stats.vault_expires_at)}</dd></div>
-      <div><dt>Session</dt><dd><code>${escapeHtml(response.session_id)}</code></dd></div>
+      <div><dt>Vault generation</dt><dd>${response.stats.vault_generation}</dd></div>
     </dl>`;
 }
 
@@ -154,21 +197,21 @@ function renderStats(response: AskResponse): void {
  * These are what turns a user's "it went wrong" into a single Logs Explorer
  * query, so they are surfaced in the UI rather than left in the response body.
  */
-function renderCorrelation(response: AskResponse): void {
+function renderCorrelation(requestId: string, traceId?: string): void {
   const rows: string[] = [
     idRow(
       'Request ID',
-      response.request_id,
-      GCP_PROJECT ? logsConsoleUrl(response.request_id, GCP_PROJECT) : undefined,
+      requestId,
+      GCP_PROJECT ? logsConsoleUrl(requestId, GCP_PROJECT) : undefined,
       'Logs',
     ),
   ];
-  if (response.trace_id) {
+  if (traceId) {
     rows.push(
       idRow(
         'Trace ID',
-        response.trace_id,
-        GCP_PROJECT ? traceConsoleUrl(response.trace_id, GCP_PROJECT) : undefined,
+        traceId,
+        GCP_PROJECT ? traceConsoleUrl(traceId, GCP_PROJECT) : undefined,
         'Trace',
       ),
     );
@@ -209,19 +252,44 @@ function idRow(label: string, value: string, href: string | undefined, linkLabel
 }
 
 function render(response: AskResponse): void {
-  current = response;
   // Re-derive the tier from the OKF verified field rather than trusting the server's
   // value (SPEC §5.3).
   const tier = deriveTrustTier(extractVerified(response.okf));
-  renderBadges(tier, response.status);
+  renderDimensions(response, tier);
   maskedPane.innerHTML = highlightPlaceholders(response.masked_prompt);
   answerPane.textContent = response.answer;
   okfPane.textContent = response.okf;
   renderAttestation(response);
   renderStats(response);
-  renderCorrelation(response);
-  approveButton.disabled = tier === 'human-reviewed';
+  renderCorrelation(response.request_id, response.trace_id);
+  blockedPane.hidden = true;
   results.hidden = false;
+}
+
+/**
+ * Show a refused request as a first-class outcome.
+ *
+ * A blocked request is the demo's most important frame: it is the moment the
+ * fleet refuses to hand back an answer. Hiding it behind an error string would
+ * make the guarantee invisible.
+ */
+function renderBlocked(error: ApiError): void {
+  const categories =
+    error.categories && error.categories.length > 0
+      ? `<p class="findings">Categories: ${error.categories
+          .map((c) => `<code>${escapeHtml(c)}</code>`)
+          .join(', ')}</p>`
+      : '';
+  blockedPane.innerHTML = `
+    <h2>Blocked — no answer was released</h2>
+    <p class="blocked-reason">${escapeHtml(error.message)}</p>
+    ${categories}
+    <p class="blocked-note">
+      Nothing was rehydrated, and no unmasked text was stored. HTTP ${error.status}.
+    </p>`;
+  if (error.requestId) renderCorrelation(error.requestId);
+  blockedPane.hidden = false;
+  results.hidden = true;
 }
 
 function setBusy(busy: boolean, message = ''): void {
@@ -244,31 +312,15 @@ submit.addEventListener('click', () => {
       return response;
     })
     .catch((error: unknown) => {
+      if (error instanceof ApiError) {
+        renderBlocked(error);
+        setBusy(false, `Refused (${error.status}).`);
+        statusLine.className = 'status error';
+        return;
+      }
       results.hidden = true;
-      const message =
-        error instanceof ApiError
-          ? `Refused: ${error.message}`
-          : `Request failed: ${String(error)}`;
-      setBusy(false, message);
-      statusLine.className = 'status error';
-    });
-});
-
-approveButton.addEventListener('click', () => {
-  const snapshot = current;
-  if (!snapshot) return;
-  approveButton.disabled = true;
-  approve(snapshot.session_id)
-    .then((response) => {
-      // Approval adds a human: actor to verified, so re-deriving yields human-reviewed.
-      render({ ...snapshot, okf: response.markdown });
-      statusLine.textContent = 'Approved. Trust tier raised to human-reviewed.';
-      statusLine.className = 'status ok';
-      return response;
-    })
-    .catch((error: unknown) => {
-      approveButton.disabled = false;
-      statusLine.textContent = `Approval failed: ${String(error)}`;
+      blockedPane.hidden = true;
+      setBusy(false, `Request failed: ${String(error)}`);
       statusLine.className = 'status error';
     });
 });

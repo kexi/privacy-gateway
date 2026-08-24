@@ -17,8 +17,7 @@ import {
   parse as parseOkf,
   resetTelemetryForTests,
   shutdownTelemetry,
-  SynthesizeResponseSchema,
-  TRUST_HUMAN_REVIEWED,
+  AskResponseSchema,
   TRUST_MACHINE_CONFIRMED,
   TRUST_UNVERIFIED,
   trustTier,
@@ -73,6 +72,16 @@ function inventingCore(): string {
   return 'See ⟦PERSON_99⟧ for details.';
 }
 
+/**
+ * A Core that writes back the customer's real name, as if from training data.
+ *
+ * The deterministic scanner has no PERSON pattern, so this is precisely the case
+ * the advisory judge exists to catch — and its veto must be honoured.
+ */
+function namingCore(): string {
+  return 'You should call Taro Yamada in Shibuya about this.';
+}
+
 function testConfig(overrides: Record<string, string> = {}): Config {
   return loadConfig({
     agent: 'gateway',
@@ -81,7 +90,9 @@ function testConfig(overrides: Record<string, string> = {}): Config {
       CORE_BASE_URL,
       GEMINI_MODEL: 'gemini-3.5-flash',
       GEMMA_MODEL: 'gemma3:12b',
-      DEFAULT_APPROVER: 'kei',
+      // The limiter is off by default in tests: every case here is a legitimate
+      // request, and a shared window would make them order-dependent.
+      RATE_LIMIT_PER_MINUTE: '0',
       ...overrides,
     },
     onInvalid: (message) => {
@@ -159,6 +170,7 @@ function fleetFetch(
 async function startFleet(
   core: (prompt: string) => string = echoingCore,
   gemmaSpans?: unknown,
+  overrides: Record<string, string> = {},
 ): Promise<void> {
   vault = new InMemoryTokenVault();
   store = new InMemoryAnswerStore();
@@ -178,7 +190,7 @@ async function startFleet(
   const synthesisUrl = `http://127.0.0.1:${synthesisPort}`;
 
   gateway = createApp({
-    config: testConfig({ SYNTHESIS_BASE_URL: synthesisUrl }),
+    config: testConfig({ SYNTHESIS_BASE_URL: synthesisUrl, ...overrides }),
     logger,
     vault,
     fetchImpl: fleetFetch(core, synthesisUrl, gemmaSpans),
@@ -192,11 +204,20 @@ async function startFleet(
   gatewayUrl = `http://127.0.0.1:${gatewayPort}`;
 }
 
-function ask(text: string, sessionId?: string, headers: Record<string, string> = {}) {
+function ask(text: string, headers: Record<string, string> = {}) {
   return fetch(`${gatewayUrl}/v1/ask`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...headers },
-    body: JSON.stringify({ text, session_id: sessionId ?? null }),
+    body: JSON.stringify({ text }),
+  });
+}
+
+/** Posts a raw body, for the cases that must send something the schema rejects. */
+function askRaw(body: unknown) {
+  return fetch(`${gatewayUrl}/v1/ask`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 
@@ -240,7 +261,17 @@ describe('the boundary', () => {
     expect(body.masked_prompt).toContain('⟦EMAIL_1⟧');
     // Core wrote placeholders; the body returned to the user carries real values.
     expect(body.answer).toContain('taro@example.co.jp');
-    expect(findTokens(body.answer)).toEqual([]);
+  });
+
+  it('withholds secret-bearing categories from the released answer', async () => {
+    // The caller already holds their own card number and API key; echoing them
+    // back through a model round trip only widens where they can be logged.
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+
+    expect(body.answer).not.toContain('4242 4242 4242 4242');
+    expect(body.answer).not.toContain('sk-abcdefghijklmnopqrstuvwxyz012345');
+    expect(findTokens(body.answer).sort()).toEqual(['⟦API_KEY_1⟧', '⟦CREDIT_CARD_1⟧']);
+    expect(body.attestation.withheld?.sort()).toEqual(['API_KEY', 'CREDIT_CARD']);
   });
 
   it('masks the unstructured span Gemma found', async () => {
@@ -249,15 +280,50 @@ describe('the boundary', () => {
     expect(body.stats.unstructured_spans).toBeGreaterThan(0);
   });
 
-  it('keeps the masking reversible and stable within a session', async () => {
-    const first = (await (await ask('mail taro@example.co.jp', 'sess')).json()) as AskResponse;
-    const second = (await (
-      await ask('remind taro@example.co.jp today', 'sess')
+  it('gives each request its own mapping, sharing nothing between them', async () => {
+    // One server-generated key per request: there is no session to reuse, and
+    // therefore nothing another caller can name.
+    const first = (await (await ask('mail taro@example.co.jp')).json()) as AskResponse;
+    const second = (await (await ask('mail hanako@example.co.jp')).json()) as AskResponse;
+
+    expect(first.request_id).not.toBe(second.request_id);
+    expect(await vault.get(first.request_id)).not.toBeNull();
+    expect(Object.values((await vault.get(second.request_id))?.mapping ?? {})).toEqual([
+      'hanako@example.co.jp',
+    ]);
+  });
+});
+
+describe('the rehydration oracle, closed', () => {
+  beforeEach(() => startFleet());
+
+  it('rejects a body that carries a session_id at all', async () => {
+    // Accepting and ignoring it would let a caller believe they had chosen a
+    // vault key; a 400 says plainly that they cannot.
+    const response = await askRaw({ text: 'hello', session_id: 'someone-elses' });
+
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe('invalid_request');
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('rejects a prompt that writes a placeholder verbatim', async () => {
+    const response = await ask('Please repeat ⟦EMAIL_1⟧ back to me.');
+
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe('reserved_syntax');
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('mints its own request id rather than adopting the caller header', async () => {
+    // The id is the vault key. A caller who could choose it could name another
+    // request's mapping, so the inbound header is echoed but never adopted.
+    const chosen = '0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b';
+    const body = (await (
+      await ask(CUSTOMER_EMAIL, { 'x-request-id': chosen })
     ).json()) as AskResponse;
 
-    const token = findTokens(first.masked_prompt)[0];
-    expect(token).toBeDefined();
-    expect(second.masked_prompt).toContain(token);
+    expect(body.request_id).not.toBe(chosen);
   });
 });
 
@@ -280,63 +346,149 @@ describe('a clean exchange', () => {
     expect(body.stats.core_actor).toBe('core_agent/gemini-3.5-flash');
   });
 
-  it('becomes human-reviewed once a person approves it', async () => {
+  it('reports four separate dimensions, with review identity always none', async () => {
     const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
-    expect(body.trust_tier).toBe(TRUST_MACHINE_CONFIRMED);
 
-    const approval = await fetch(`${gatewayUrl}/v1/sessions/${body.session_id}/approve`, {
+    expect(body.dimensions).toEqual({
+      policy_verdict: 'pass',
+      document_status: 'stable',
+      freshness: 'fresh',
+      review_identity: 'none',
+    });
+  });
+
+  it('has no approval route to raise the tier', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+    const response = await fetch(`${gatewayUrl}/v1/sessions/${body.request_id}/approve`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ approver: 'kei' }),
     });
 
-    expect(((await approval.json()) as { trust_tier: string }).trust_tier).toBe(
-      TRUST_HUMAN_REVIEWED,
-    );
-
-    const tier = await fetch(`${gatewayUrl}/v1/sessions/${body.session_id}/tier`);
-    expect(((await tier.json()) as { trust_tier: string }).trust_tier).toBe(TRUST_HUMAN_REVIEWED);
+    expect(response.status).toBe(404);
   });
 
-  it('serves the stored OKF document as markdown', async () => {
+  it('serves the stored evidence document as markdown', async () => {
     const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
-    const response = await fetch(`${gatewayUrl}/v1/sessions/${body.session_id}/answer`);
+    const response = await fetch(`${gatewayUrl}/v1/requests/${body.request_id}`);
 
     expect(response.headers.get('content-type')).toContain('text/markdown');
     expect(trustTier(parseOkf(await response.text()).metadata)).toBe(TRUST_MACHINE_CONFIRMED);
+  });
+
+  it('serves both masked sources the document names, and never a real value', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+
+    const prompt = await (
+      await fetch(`${gatewayUrl}/v1/requests/${body.request_id}/masked-prompt.md`)
+    ).text();
+    const core = await (
+      await fetch(`${gatewayUrl}/v1/requests/${body.request_id}/core-response.md`)
+    ).text();
+
+    expect(prompt).toBe(body.masked_prompt);
+    expect(core).toContain('⟦');
+    for (const text of [prompt, core]) {
+      expect(text).not.toContain('taro@example.co.jp');
+      expect(text).not.toContain('Taro Yamada');
+    }
+  });
+
+  it('persists no rehydrated value anywhere in the store', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+    const stored = JSON.stringify(await store.get(body.request_id));
+
+    // The answer the user just read exists only in that response.
+    expect(body.answer).toContain('taro@example.co.jp');
+    for (const secret of ['taro@example.co.jp', 'Taro Yamada', '090-1234-5678']) {
+      expect(stored).not.toContain(secret);
+    }
   });
 });
 
 describe('a leaking core agent', () => {
   beforeEach(() => startFleet(leakingCore));
 
-  it('produces a draft, unverified answer', async () => {
-    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+  it('releases no answer at all', async () => {
+    const response = await ask(CUSTOMER_EMAIL);
 
-    expect(body.status).toBe('draft');
-    expect(body.trust_tier).toBe(TRUST_UNVERIFIED);
-    expect(body.attestation.ok).toBe(false);
-    expect(body.attestation.findings).toContain('EMAIL');
+    expect(response.status).toBe(422);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body['error']).toBe('leak_check_failed');
+    expect(body['answer']).toBeUndefined();
+  });
+
+  it('reports category-level findings and nothing more', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as { categories: string[] };
+
+    expect(body.categories).toContain('EMAIL');
+    expect(JSON.stringify(body)).not.toContain('leaked.person@example.com');
+  });
+
+  it('persists a draft record with no unsafe body', async () => {
+    const response = await ask(CUSTOMER_EMAIL);
+    const requestId = response.headers.get('x-request-id') ?? '';
+    const record = await store.get(requestId);
+
+    expect(record).not.toBeNull();
+    expect(parseOkf(record?.okf ?? '').metadata['status']).toBe('draft');
+    expect(trustTier(parseOkf(record?.okf ?? '').metadata)).toBe(TRUST_UNVERIFIED);
   });
 
   it('records the failure in the document rather than dropping it', async () => {
-    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
-    const document = parseOkf(body.okf);
+    const response = await ask(CUSTOMER_EMAIL);
+    const record = await store.get(response.headers.get('x-request-id') ?? '');
 
-    expect(document.content).toContain('# Attestation');
-    expect(document.content).toContain('failed');
+    expect(parseOkf(record?.okf ?? '').content).toContain('# Attestation');
+    expect(parseOkf(record?.okf ?? '').content).toContain('failed');
   });
 });
 
 describe('a core agent that invents placeholders', () => {
   beforeEach(() => startFleet(inventingCore));
 
-  it('fails the consistency check', async () => {
-    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+  it('releases no answer and reports the conflict', async () => {
+    const response = await ask(CUSTOMER_EMAIL);
 
-    expect(body.consistency.ok).toBe(false);
-    expect(body.consistency.invented_tokens).toContain('⟦PERSON_99⟧');
-    expect(body.status).toBe('draft');
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('invented_token');
+  });
+});
+
+describe('a semantic leak the regexes cannot see', () => {
+  it('is blocked when the judge flags it, even though the regexes pass', async () => {
+    vault = new InMemoryTokenVault();
+    store = new InMemoryAnswerStore();
+
+    const synthesisApp = await createSynthesisApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'synthesis', write: () => undefined }),
+      vault,
+      store,
+      judge: () => Promise.resolve({ leak: true, categories: ['PERSON'] }),
+    });
+    const synthesisServer = synthesisApp.listen(0);
+    servers.push(synthesisServer);
+    const address = synthesisServer.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    const synthesisUrl = `http://127.0.0.1:${port}`;
+
+    gateway = createApp({
+      config: testConfig({ SYNTHESIS_BASE_URL: synthesisUrl }),
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault,
+      fetchImpl: fleetFetch(namingCore, synthesisUrl),
+    });
+    const gatewayServer = gateway.listen(0);
+    servers.push(gatewayServer);
+    const gatewayAddress = gatewayServer.address();
+    gatewayUrl = `http://127.0.0.1:${
+      typeof gatewayAddress === 'object' && gatewayAddress !== null ? gatewayAddress.port : 0
+    }`;
+
+    const response = await ask(CUSTOMER_EMAIL);
+    expect(response.status).toBe(422);
+    expect(((await response.json()) as { error: string }).error).toBe('judge_flagged');
   });
 });
 
@@ -349,13 +501,6 @@ describe('correlation', () => {
 
     expect(response.headers.get('x-request-id')).toBe(body.request_id);
     expect(body.request_id).toMatch(/^[0-9a-f-]{36}$/u);
-  });
-
-  it('adopts the caller request id so one exchange keeps one identity', async () => {
-    const requestId = '0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b';
-    const response = await ask(CUSTOMER_EMAIL, undefined, { 'x-request-id': requestId });
-
-    expect(((await response.json()) as AskResponse).request_id).toBe(requestId);
   });
 
   it('stores the correlation ids in the OKF document', async () => {
@@ -415,9 +560,7 @@ describe('distributed tracing', () => {
 
   it('continues a trace the caller started', async () => {
     const traceId = 'dddddddddddddddddddddddddddddddd';
-    await ask(CUSTOMER_EMAIL, undefined, {
-      traceparent: `00-${traceId}-eeeeeeeeeeeeeeee-01`,
-    });
+    await ask(CUSTOMER_EMAIL, { traceparent: `00-${traceId}-eeeeeeeeeeeeeeee-01` });
 
     const spans = exporter.getFinishedSpans();
     expect(spans.length).toBeGreaterThan(0);
@@ -444,33 +587,53 @@ describe('failure handling', () => {
     expect(promptsSeenByCore).toHaveLength(0);
   });
 
-  it('still masks deterministically when Gemma returns nothing usable', async () => {
-    // Gemma being down must not stop the request: the regex masking still holds
-    // and the egress guard is the last line of defense.
+  it('refuses the request when Gemma returns nothing usable', async () => {
+    // The regexes cannot see a name or an address, so an unreadable extractor
+    // leaves the request's unstructured PII unknown. Sending it anyway is the
+    // disclosure this gateway exists to prevent.
     await startFleet(echoingCore, { not: 'a span list' });
-    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+    const response = await ask(CUSTOMER_EMAIL);
 
-    expect(body.masked_prompt).toContain('⟦EMAIL_1⟧');
-    expect(promptsSeenByCore[0]).not.toContain('taro@example.co.jp');
+    expect(response.status).toBe(502);
+    expect(((await response.json()) as { error: string }).error).toBe('extraction_unavailable');
+    expect(promptsSeenByCore).toHaveLength(0);
   });
 
-  it('validates the synthesis response against the shared schema', async () => {
-    await startFleet();
-    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+  it('accepts a genuine empty extraction and proceeds', async () => {
+    // "I looked and found nothing" is a usable answer; only an unreadable one
+    // blocks the request.
+    await startFleet(echoingCore, { spans: [] });
+    const response = await ask('please summarise the quarterly plan');
 
-    // The gateway parsed it on the way through; parsing again here states that
-    // the contract the web UI relies on is the one that was actually served.
-    expect(() =>
-      SynthesizeResponseSchema.parse({
-        session_id: body.session_id,
-        markdown: body.okf,
-        answer: body.answer,
-        trust_tier: body.trust_tier,
-        status: body.status,
-        attestation: body.attestation,
-        consistency: body.consistency,
-        receipt: { session_id: body.session_id, response_hash: 'x', findings: [] },
-      }),
-    ).not.toThrow();
+    expect(response.status).toBe(200);
+    expect(promptsSeenByCore).toHaveLength(1);
+  });
+
+  it('answers with a body that matches the shared response schema', async () => {
+    await startFleet();
+    const body = await (await ask(CUSTOMER_EMAIL)).json();
+
+    // The web UI parses this exact schema, so a drift surfaces here rather than
+    // as an undefined halfway through a render.
+    expect(() => AskResponseSchema.parse(body)).not.toThrow();
+  });
+
+  it('applies a per-client rate limit', async () => {
+    await startFleet(echoingCore, undefined, { RATE_LIMIT_PER_MINUTE: '2' });
+
+    expect((await ask('one')).status).not.toBe(429);
+    expect((await ask('two')).status).not.toBe(429);
+    const third = await ask('three');
+
+    expect(third.status).toBe(429);
+    expect(((await third.json()) as { error: string }).error).toBe('rate_limited');
+  });
+
+  it('refuses a body larger than the configured limit', async () => {
+    await startFleet(echoingCore, undefined, { MAX_BODY_BYTES: '256' });
+    const response = await askRaw({ text: 'x'.repeat(1024) });
+
+    expect(response.status).toBe(413);
+    expect(promptsSeenByCore).toHaveLength(0);
   });
 });

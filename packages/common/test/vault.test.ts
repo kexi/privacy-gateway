@@ -1,6 +1,6 @@
 /**
- * What the Token Vault guarantees: per-session storage, merging on append, and
- * blocking access once expired.
+ * What the Token Vault guarantees: per-request storage, merging on append, a
+ * monotonic generation counter, and blocking access once expired.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -64,6 +64,24 @@ describe('in-memory vault', () => {
     expect(entry.expiresAt.getTime()).toBeGreaterThan(Date.now());
     expect(entry.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 3601 * 1000);
     expect(isExpired(entry)).toBe(false);
+  });
+
+  it('starts at generation 1 and advances on every allocating write', async () => {
+    // Synthesis refuses to rehydrate against any generation but the one the
+    // gateway wrote, so the counter must move whenever the mapping does.
+    const vault = new InMemoryTokenVault();
+    expect((await vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60)).generation).toBe(1);
+    expect((await vault.put('r1', { '⟦PHONE_1⟧': '090-1234-5678' }, 60)).generation).toBe(2);
+    expect((await vault.get('r1'))?.generation).toBe(2);
+  });
+
+  it('restarts the generation after expiry rather than continuing it', async () => {
+    // The old entry is gone, so a delayed answer holding generation 1 cannot
+    // match: it sees a fresh generation 1 over a different mapping and the
+    // caller's own generation check is what stops it.
+    const vault = new InMemoryTokenVault();
+    await vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 0);
+    expect((await vault.put('r1', { '⟦EMAIL_1⟧': 'c@d.co' }, 60)).generation).toBe(1);
   });
 });
 

@@ -92,13 +92,38 @@ variable "vpc_network" {
 }
 
 variable "vpc_subnet" {
-  description = "Subnetwork used for Direct VPC egress. Must be /26 or larger; the default subnet is /20."
+  description = <<-EOT
+    Subnetwork created for Direct VPC egress (infra/terraform/network.tf).
+
+    A dedicated subnet, not the project's `default`: it must have
+    private_ip_google_access enabled for internal-ingress gemma-serving to be
+    reachable, and turning that on for the default subnet would be a
+    project-wide side effect on a resource Terraform does not own.
+  EOT
   type        = string
-  default     = "default"
+  default     = "agentic-fleet-us-central1"
+}
+
+variable "vpc_subnet_cidr" {
+  description = <<-EOT
+    IPv4 range of the Direct VPC egress subnet. Must be /26 or larger.
+
+    Cloud Run reserves IPs in blocks of 16 and uses roughly 2x the instance
+    count at steady state, so /24 leaves headroom for revision overlap during a
+    deploy. Pick a range that does not collide with the default subnets.
+  EOT
+  type        = string
+  default     = "10.60.0.0/24"
 }
 
 variable "otel_enabled" {
   description = "Whether the agents export OpenTelemetry spans to Cloud Trace."
   type        = bool
   default     = true
+}
+
+variable "answers_collection" {
+  description = "Firestore collection holding masked per-request evidence (OKF documents)."
+  type        = string
+  default     = "gateway_answers"
 }

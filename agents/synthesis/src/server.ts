@@ -5,25 +5,26 @@
  * member of the fleet; the HTTP routes are the path the Gateway actually uses,
  * because there must always be one route that retrieves the audit artifact
  * without an LLM regenerating it.
+ *
+ * The routes are keyed by `request_id`, and the only artifacts they return are
+ * masked. A rehydrated answer exists solely inside the `/v1/synthesize` response
+ * that produced it.
  */
 
 import { toA2a } from '@google/adk';
 import { AGENT_CARD_PATH, type AgentCard } from '@a2a-js/sdk';
 import {
-  addVerification,
   buildVault,
   contextFromHeaders,
   createLogger,
   currentTraceId,
-  dump,
   initTelemetry,
   loadConfig,
-  parse as parseOkf,
   REQUEST_ID_HEADER,
   resolveRequestId,
   SPAN,
   SynthesizeRequestSchema,
-  trustTier,
+  vaultTtlSeconds,
   withContext,
   withSpan,
   type Config,
@@ -34,8 +35,14 @@ import {
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { pathToFileURL } from 'node:url';
 import { buildSynthesisAgent, createLeakJudge, SYNTHESIS_AGENT_NAME } from './agent.ts';
-import { actor, synthesize, type LeakJudge } from './pipeline.ts';
-import { buildAnswerStore, type AnswerStore } from './store.ts';
+import {
+  ReleaseRefusedError,
+  synthesize,
+  type LeakJudge,
+  type RefusalWithEvidence,
+  type SynthesisResult,
+} from './pipeline.ts';
+import { buildAnswerStore, type AnswerStore, type EvidenceRecord } from './store.ts';
 
 /** Cloud Run injects PORT. Locally 8083 follows gateway (8081) and core (8082). */
 const DEFAULT_PORT = 8083;
@@ -59,7 +66,7 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
   const judge = options.judge;
 
   const app = express();
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: config.maxBodyBytes }));
 
   app.use((req, res, next) => {
     const requestId = resolveRequestId(req.headers[REQUEST_ID_HEADER]);
@@ -75,13 +82,41 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     void handleSynthesize(req, res, next);
   });
 
-  app.get('/v1/sessions/:id/answer', (req, res, next) => {
-    void handleAnswer(req, res, next);
+  app.get('/v1/requests/:id/evidence', (req, res, next) => {
+    void handleEvidence(req, res, next);
   });
 
-  app.post('/v1/sessions/:id/approve', (req, res, next) => {
-    void handleApprove(req, res, next);
+  app.get('/v1/requests/:id/masked-prompt.md', (req, res, next) => {
+    void handleArtifact(req, res, next, 'maskedPrompt');
   });
+
+  app.get('/v1/requests/:id/core-response.md', (req, res, next) => {
+    void handleArtifact(req, res, next, 'coreResponse');
+  });
+
+  /** Persist the masked evidence. Called on release and on refusal alike. */
+  async function persist(
+    requestId: string,
+    result: SynthesisResult,
+    maskedPrompt: string,
+    coreResponse: string,
+    scoped: Logger,
+  ): Promise<void> {
+    await withSpan(SPAN.persist, { request_id: requestId }, async () => {
+      const record: EvidenceRecord = {
+        requestId,
+        okf: result.markdown,
+        maskedPrompt,
+        coreResponse,
+        expiresAt: new Date(Date.now() + vaultTtlSeconds() * 1000),
+      };
+      await store.put(record);
+      scoped.event('okf.persist', {
+        document_status: result.dimensions.document_status,
+        verdict: result.dimensions.policy_verdict,
+      });
+    });
+  }
 
   async function handleSynthesize(req: Request, res: Response, next: NextFunction): Promise<void> {
     const parsed = SynthesizeRequestSchema.safeParse(req.body);
@@ -96,122 +131,149 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     }
 
     const input = parsed.data;
-    const requestId = resolveRequestId(input.request_id ?? req.headers[REQUEST_ID_HEADER]);
-    const scoped = logger.child({ request_id: requestId, session_id: input.session_id });
+    const requestId = input.request_id;
+    const scoped = logger.child({ request_id: requestId });
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
 
     try {
       const result = await withContext(parentContext, () =>
-        withSpan(
-          'synthesize',
-          { request_id: requestId, session_id: input.session_id },
-          async () => {
-            const startedAt = Date.now();
-            scoped.event('request.start', { method: 'POST', path: '/v1/synthesize' });
+        withSpan('synthesize', { request_id: requestId }, async () => {
+          const startedAt = Date.now();
+          scoped.event('request.start', { method: 'POST', path: '/v1/synthesize' });
 
-            const outcome = await synthesize({
-              sessionId: input.session_id,
-              maskedPrompt: input.masked_prompt,
-              coreAnswer: input.core_answer,
-              vault,
-              generatedBy: input.generated_by,
-              logger: scoped,
-              requestId,
-              ...(judge !== undefined ? { judge } : {}),
-              verifiedBy: actor(config.GEMMA_MODEL),
-            });
+          const outcome = await synthesize({
+            requestId,
+            maskedPrompt: input.masked_prompt,
+            coreAnswer: input.core_answer,
+            knownTokens: input.known_tokens,
+            vaultGeneration: input.vault_generation,
+            vault,
+            generatedBy: input.generated_by,
+            logger: scoped,
+            ...(judge !== undefined ? { judge } : {}),
+          });
 
-            await withSpan(SPAN.persist, { session_id: input.session_id }, async () => {
-              await store.put(input.session_id, outcome.markdown);
-              scoped.event('okf.persist', {
-                session_id: input.session_id,
-                status: outcome.document.metadata['status'] as string,
-              });
-            });
+          await persist(requestId, outcome, input.masked_prompt, input.core_answer, scoped);
 
-            scoped.event('request.end', {
-              duration_ms: Date.now() - startedAt,
-              status: outcome.document.metadata['status'] as string,
-              trust_tier: outcome.trustTier,
-            });
-            return outcome;
-          },
-        ),
+          scoped.event('request.end', {
+            duration_ms: Date.now() - startedAt,
+            document_status: outcome.dimensions.document_status,
+            trust_tier: outcome.trustTier,
+          });
+          return outcome;
+        }),
       );
 
       const payload: SynthesizeResponse = {
-        session_id: input.session_id,
         request_id: requestId,
         markdown: result.markdown,
         answer: result.answer,
         trust_tier: result.trustTier,
-        status: (result.document.metadata['status'] as SynthesizeResponse['status']) ?? 'draft',
+        status: result.dimensions.document_status,
+        dimensions: result.dimensions,
         attestation: result.attestation,
         consistency: result.consistency,
         receipt: result.receipt,
       };
       res.json(payload);
     } catch (error) {
-      scoped.event(
-        'request.failed',
-        { error_message: error instanceof Error ? error.message : String(error) },
-        'ERROR',
-      );
-      next(error);
+      await handleRefusal(error, res, requestId, input, scoped, next);
     }
   }
 
-  async function handleAnswer(req: Request, res: Response, next: NextFunction): Promise<void> {
+  /**
+   * Turn a refused release into a status and an audit record.
+   *
+   * The evidence document is persisted even though nothing is returned: a
+   * blocked request is exactly the one an auditor will ask about later. What is
+   * never persisted or returned is the Core body in any rehydrated form.
+   */
+  async function handleRefusal(
+    error: unknown,
+    res: Response,
+    requestId: string,
+    input: { masked_prompt: string; core_answer: string },
+    scoped: Logger,
+    next: NextFunction,
+  ): Promise<void> {
+    if (!(error instanceof ReleaseRefusedError)) {
+      scoped.event(
+        'request.failed',
+        { error_class: error instanceof Error ? error.name : 'unknown' },
+        'ERROR',
+      );
+      next(error);
+      return;
+    }
+
+    const evidence = (error as RefusalWithEvidence).evidence as SynthesisResult | undefined;
+    if (evidence !== undefined) {
+      try {
+        await persist(requestId, evidence, input.masked_prompt, input.core_answer, scoped);
+      } catch {
+        // A store failure must not turn a clean refusal into a 500 that leaks
+        // less information than the refusal itself would have.
+        scoped.event('okf.persist.failed', { refusal: error.kind }, 'ERROR');
+      }
+    }
+
+    scoped.event(
+      'request.refused',
+      { refusal: error.kind, categories: [...error.categories] },
+      'ERROR',
+    );
+    res.status(error.status).json({
+      error: error.kind,
+      message: error.message,
+      request_id: requestId,
+      categories: [...error.categories],
+      status_code: error.status,
+    });
+  }
+
+  /** Serve the stored OKF evidence document; never a rehydrated answer. */
+  async function handleEvidence(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
-      const markdown = await store.get(sessionParam(req));
-      if (markdown === null) {
-        res.status(404).json({ error: 'unknown session' });
+      const record = await store.get(requestParam(req));
+      if (record === null) {
+        res.status(404).json({ error: 'unknown request' });
         return;
       }
-      res.type('text/markdown; charset=utf-8').send(markdown);
+      res.type('text/markdown; charset=utf-8').send(record.okf);
     } catch (error) {
       next(error);
     }
   }
 
-  /** Adds a human approval to `verified`, raising the tier to human-reviewed. */
-  async function handleApprove(req: Request, res: Response, next: NextFunction): Promise<void> {
-    const sessionId = sessionParam(req);
+  /**
+   * Serve one of the two masked source artifacts the OKF `sources` name.
+   *
+   * Without these the provenance entries would be dangling links, and a reader
+   * could not re-derive `masked_prompt_sha256` or `core_response_sha256`.
+   */
+  async function handleArtifact(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+    field: 'maskedPrompt' | 'coreResponse',
+  ): Promise<void> {
     try {
-      const markdown = await store.get(sessionId);
-      if (markdown === null) {
-        res.status(404).json({ error: 'unknown session' });
+      const record = await store.get(requestParam(req));
+      if (record === null) {
+        res.status(404).json({ error: 'unknown request' });
         return;
       }
-
-      const body = (req.body ?? {}) as { approver?: unknown };
-      const approver =
-        typeof body.approver === 'string' && body.approver.trim() !== ''
-          ? body.approver.trim()
-          : config.DEFAULT_APPROVER;
-      // SPEC §7: a human actor is `human:<id>`; the prefix is what the trust-tier
-      // derivation keys on, so it is normalized here rather than trusted.
-      const actorId = approver.startsWith('human:') ? approver : `human:${approver}`;
-
-      const document = addVerification(parseOkf(markdown), actorId);
-      const updated = dump(document);
-      await store.put(sessionId, updated);
-
-      const tier = trustTier(document.metadata);
-      logger.event('approve.done', { session_id: sessionId, trust_tier: tier });
-      res.json({ session_id: sessionId, trust_tier: tier, markdown: updated });
+      res.type('text/markdown; charset=utf-8').send(record[field]);
     } catch (error) {
       next(error);
     }
   }
 
   app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
-    logger.event(
-      'request.failed',
-      { error_code: error.name, error_message: error.message },
-      'ERROR',
-    );
-    res.status(500).json({ error: 'internal_error', message: error.message });
+    logger.event('request.failed', { error_class: error.name, error_code: error.name }, 'ERROR');
+    // The message is the error class, not `error.message`: an exception message
+    // can carry a fragment of the body that caused it.
+    res.status(500).json({ error: 'internal_error', message: error.name });
   });
 
   if (options.withA2a === true) {
@@ -224,7 +286,7 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
  * The `:id` path segment. Present by construction: the handler only runs when
  * its route matched.
  */
-function sessionParam(req: Request): string {
+function requestParam(req: Request): string {
   return (req.params as Record<string, string | undefined>)['id'] ?? '';
 }
 
@@ -238,9 +300,12 @@ export function buildAgentCard(rpcBase: string): AgentCard {
   return {
     protocolVersion: '0.3.0',
     name: SYNTHESIS_AGENT_NAME,
+    // The card describes the A2A surface, which acknowledges an exchange. The
+    // verification and release pipeline is the HTTP route, so advertising it as
+    // an A2A skill would promise something this endpoint does not do.
     description:
-      'Verifies a tokenized answer for leaks, rehydrates it from the token vault and ' +
-      'packages it as an attested OKF v0.2 document.',
+      'Acknowledges a gateway exchange over A2A. Leak checking, release and OKF ' +
+      'assembly run on this service’s HTTP routes, not through this agent.',
     version: '0.1.0',
     url: `${rpcBase}/jsonrpc`,
     preferredTransport: 'JSONRPC',
@@ -253,12 +318,12 @@ export function buildAgentCard(rpcBase: string): AgentCard {
     defaultOutputModes: ['text'],
     skills: [
       {
-        id: 'verify_and_rehydrate',
-        name: 'Leak check, rehydration and attestation',
+        id: 'acknowledge_exchange',
+        name: 'Acknowledge a gateway exchange',
         description:
-          'Runs a deterministic leak check over a tokenized answer, restores the original ' +
-          'values from the token vault, and emits an OKF Gateway Answer carrying the verdict.',
-        tags: ['privacy', 'attestation', 'okf'],
+          'Accepts a description of one gateway exchange and acknowledges it. It performs ' +
+          'no verification, rehydration or attestation; those run on POST /v1/synthesize.',
+        tags: ['privacy', 'okf'],
       },
     ],
   };
@@ -319,6 +384,7 @@ export async function main(): Promise<void> {
       baseUrl: config.GEMMA_BASE_URL,
       model: config.GEMMA_MODEL,
       apiKey: config.GEMMA_API_KEY,
+      ...(config.GEMMA_AUTH === undefined ? {} : { auth: config.GEMMA_AUTH }),
       logger,
     }),
   });

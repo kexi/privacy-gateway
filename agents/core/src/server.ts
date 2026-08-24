@@ -59,8 +59,13 @@ function collectText(body: unknown): string {
   return chunks.join('\n');
 }
 
-/** Pulls the session/context id out of an A2A request, for log correlation. */
-function findSessionId(body: unknown): string | undefined {
+/**
+ * Pulls the A2A `contextId` out of a request, for log correlation.
+ *
+ * The Gateway sets it to the same server-generated request id it puts on the
+ * header, so this is a fallback for the same value rather than a second identity.
+ */
+function findContextId(body: unknown): string | undefined {
   let found: string | undefined;
   const walk = (node: unknown, depth: number): void => {
     if (found !== undefined || depth > 8 || node === null || typeof node !== 'object') return;
@@ -95,7 +100,6 @@ export function guardMiddleware(req: Request, res: Response, next: NextFunction)
     return;
   }
 
-  const sessionId = findSessionId(req.body);
   const text = collectText(req.body);
   if (text.length === 0) {
     next();
@@ -104,11 +108,8 @@ export function guardMiddleware(req: Request, res: Response, next: NextFunction)
 
   // The Gateway propagates its id on the header and inside the message metadata;
   // either one keeps this hop on the caller's request in Logs Explorer.
-  const requestId = headerRequestId(req) ?? findRequestId(req.body);
-  const scoped = logger.child({
-    ...(requestId !== undefined ? { request_id: requestId } : {}),
-    ...(sessionId !== undefined ? { session_id: sessionId } : {}),
-  });
+  const requestId = headerRequestId(req) ?? findRequestId(req.body) ?? findContextId(req.body);
+  const scoped = requestId === undefined ? logger : logger.child({ request_id: requestId });
   if (requestId !== undefined) res.setHeader('X-Request-ID', requestId);
 
   const result = inspect(text);
@@ -143,7 +144,6 @@ export function guardMiddleware(req: Request, res: Response, next: NextFunction)
       SPAN.a2aReceive,
       {
         ...(requestId !== undefined ? { request_id: requestId } : {}),
-        ...(sessionId !== undefined ? { session_id: sessionId } : {}),
         placeholder_count: extractPlaceholders(text).length,
       },
       () => {

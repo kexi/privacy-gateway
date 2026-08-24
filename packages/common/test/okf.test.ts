@@ -5,6 +5,7 @@ import {
   addVerification,
   buildGatewayAnswer,
   dump,
+  freshness,
   GATEWAY_ANSWER_TYPE,
   isStale,
   nowIso,
@@ -13,8 +14,20 @@ import {
   TRUST_MACHINE_CONFIRMED,
   TRUST_UNVERIFIED,
   trustTier,
+  type AttestationEvidence,
   type AttestationLike,
 } from '../src/okf.ts';
+
+const REQUEST_ID = '01920000-0000-7000-8000-000000000001';
+
+const EVIDENCE: AttestationEvidence = {
+  computation: '/computations/leak-check.md',
+  computationSha256: 'c'.repeat(64),
+  attesterSha256: 'a'.repeat(64),
+  maskedPromptSha256: 'm'.repeat(64),
+  coreResponseSha256: 'r'.repeat(64),
+  checkedAt: new Date('2026-08-24T10:00:00Z'),
+};
 
 const PASSING_ATTESTATION: AttestationLike = { ok: true, reason: null, findings: [] };
 const FAILING_ATTESTATION: AttestationLike = {
@@ -30,12 +43,14 @@ function staleAfter(): Date {
 
 function answer(attestation: AttestationLike = PASSING_ATTESTATION) {
   return buildGatewayAnswer({
-    sessionId: 's1',
-    answerBody: 'Here is the reply.',
-    generatedBy: 'core_agent/gemini-3.5-flash',
-    verifiedBy: 'synthesis_agent/gemma3:12b',
+    requestId: REQUEST_ID,
+    maskedAnswerBody: 'Here is the reply about ⟦PERSON_1⟧.',
+    coreActor: 'core_agent/gemini-3.5-flash',
+    generatedBy: 'synthesis_agent/0.1.0',
+    verifiedBy: 'process:leak-check@aaaaaaaaaaaa',
     staleAfter: staleAfter(),
     attestation,
+    evidence: EVIDENCE,
   });
 }
 
@@ -74,6 +89,28 @@ describe('trust tier (SPEC §5.3)', () => {
   it('treats an empty verified list as unverified', () => {
     expect(trustTier({ verified: [] })).toBe(TRUST_UNVERIFIED);
   });
+
+  it('does not let an entry without an actor claim machine confirmation', () => {
+    // A `verified` entry naming nobody verified nothing; counting it would let
+    // `verified: [{}]` manufacture a trust tier.
+    expect(trustTier({ verified: [{}] })).toBe(TRUST_UNVERIFIED);
+    expect(trustTier({ verified: [{ at: nowIso() }] })).toBe(TRUST_UNVERIFIED);
+    expect(trustTier({ verified: [{ by: '   ' }] })).toBe(TRUST_UNVERIFIED);
+  });
+
+  it('ignores malformed entries but still counts the well-formed ones', () => {
+    // §11: the malformed value is preserved in the document; it just does not vote.
+    expect(trustTier({ verified: [{}, { by: 'process:leak-check@abc' }] })).toBe(
+      TRUST_MACHINE_CONFIRMED,
+    );
+  });
+
+  it('does not reject a document that carries a malformed verified field', () => {
+    const source = '---\ntype: Gateway Answer\nverified: "not a mapping"\n---\n\nBody.\n';
+    const document = parse(source);
+    expect(document.metadata['verified']).toBe('not a mapping');
+    expect(trustTier(document.metadata)).toBe(TRUST_UNVERIFIED);
+  });
 });
 
 describe('staleness (SPEC §5.5)', () => {
@@ -85,13 +122,26 @@ describe('staleness (SPEC §5.5)', () => {
     expect(isStale({ stale_after: nowIso(new Date(Date.now() + 3600 * 1000)) })).toBe(false);
   });
 
-  it('is never stale without stale_after', () => {
-    expect(isStale({ type: 'Policy' })).toBe(false);
+  it('reports unknown freshness without stale_after', () => {
+    expect(freshness({ type: 'Policy' })).toBe('unknown');
   });
 
-  it('does not become stale from an unparseable stale_after', () => {
-    // §11: a consumer must not reject a concept because of a malformed field.
-    expect(isStale({ stale_after: 'sometime next week' })).toBe(false);
+  it('reports unknown freshness for an unparseable stale_after', () => {
+    // §11: the document is still readable, but a value that cannot be read must
+    // not be reported as fresh.
+    expect(freshness({ stale_after: 'sometime next week' })).toBe('unknown');
+  });
+
+  it('distinguishes fresh from stale from unknown', () => {
+    expect(freshness({ stale_after: nowIso(new Date(Date.now() + 3600_000)) })).toBe('fresh');
+    expect(freshness({ stale_after: nowIso(new Date(Date.now() - 3600_000)) })).toBe('stale');
+    expect(freshness({})).toBe('unknown');
+  });
+
+  it('treats unknown freshness as stale for the yes/no question', () => {
+    // isStale fails closed: a caller that only asks "may I use this" gets no.
+    expect(isStale({ type: 'Policy' })).toBe(true);
+    expect(isStale({ stale_after: 'sometime next week' })).toBe(true);
   });
 });
 
@@ -139,9 +189,69 @@ describe('Gateway Answer assembly', () => {
     expect(document.metadata['type']).toBe(GATEWAY_ANSWER_TYPE);
     expect(document.metadata['status']).toBe('stable');
     expect(trustTier(document.metadata)).toBe(TRUST_MACHINE_CONFIRMED);
-    expect((document.metadata['generated'] as { by: string }).by).toBe(
-      'core_agent/gemini-3.5-flash',
-    );
+  });
+
+  it('attributes generation to the agent that assembled the document', () => {
+    // Core supplies tokenized prose; Synthesis assembles the concept, and §7
+    // attributes a document to whoever wrote it.
+    expect((answer().metadata['generated'] as { by: string }).by).toBe('synthesis_agent/0.1.0');
+  });
+
+  it('attributes the core invocation as provenance, not as the generator', () => {
+    const sources = answer().metadata['sources'] as Array<{ id: string; author?: string }>;
+    const core = sources.find((source) => source.id === 'core-response');
+    expect(core?.author).toBe('core_agent/gemini-3.5-flash');
+  });
+
+  it('names a process actor as the verifier, never an LLM', () => {
+    // TypeScript regex code decides the verdict; Gemma only advises.
+    const verified = answer().metadata['verified'] as Array<{ by: string }>;
+    expect(verified[0]?.by).toMatch(/^process:leak-check@/u);
+  });
+
+  it('carries a replayable attestation block', () => {
+    const block = answer().metadata['attestation'] as Record<string, unknown>;
+    expect(block['computation']).toBe('/computations/leak-check.md');
+    expect(block['computation_sha256']).toBe(EVIDENCE.computationSha256);
+    expect(block['attester_sha256']).toBe(EVIDENCE.attesterSha256);
+    expect(block['masked_prompt_sha256']).toBe(EVIDENCE.maskedPromptSha256);
+    expect(block['core_response_sha256']).toBe(EVIDENCE.coreResponseSha256);
+    expect(block['verdict']).toBe('pass');
+    expect(block['checked_at']).toBe('2026-08-24T10:00:00Z');
+    expect(block['request_id']).toBe(REQUEST_ID);
+  });
+
+  it('records a fail verdict in the attestation block when the check failed', () => {
+    const block = answer(FAILING_ATTESTATION).metadata['attestation'] as Record<string, unknown>;
+    expect(block['verdict']).toBe('fail');
+  });
+
+  it('stores only the masked answer body', () => {
+    // The rehydrated form is returned to the caller and never persisted.
+    const document = answer();
+    expect(document.content).toContain('⟦PERSON_1⟧');
+    expect(document.content).toContain('not stored');
+  });
+
+  it('lists withheld categories when the disclosure policy kept some masked', () => {
+    const document = buildGatewayAnswer({
+      requestId: REQUEST_ID,
+      maskedAnswerBody: 'Key ⟦API_KEY_1⟧ was used.',
+      coreActor: 'core_agent/gemini-3.5-flash',
+      generatedBy: 'synthesis_agent/0.1.0',
+      verifiedBy: 'process:leak-check@aaaaaaaaaaaa',
+      staleAfter: staleAfter(),
+      attestation: PASSING_ATTESTATION,
+      evidence: { ...EVIDENCE, withheld: ['API_KEY'] },
+    });
+    const block = document.metadata['attestation'] as { withheld?: string[] };
+    expect(block.withheld).toEqual(['API_KEY']);
+    expect(document.content).toContain('API_KEY');
+  });
+
+  it('never uses the word signed', () => {
+    // There is no signature and no MAC; claiming one would be a false assurance.
+    expect(dump(answer()).toLowerCase()).not.toContain('signed');
   });
 
   it('makes a failing attestation a draft', () => {
@@ -160,27 +270,33 @@ describe('Gateway Answer assembly', () => {
     expect(document.content).toContain('EMAIL');
   });
 
-  it('cites the masked prompt and the policy', () => {
+  it('cites both masked artifacts and the policy, at paths the gateway serves', () => {
     const sources = answer().metadata['sources'] as Array<{ resource: string }>;
     const resources = sources.map((source) => source.resource);
-    expect(resources).toContain('/sessions/s1/masked-prompt.md');
+    expect(resources).toContain(`/requests/${REQUEST_ID}/masked-prompt.md`);
+    expect(resources).toContain(`/requests/${REQUEST_ID}/core-response.md`);
     expect(resources).toContain('/policies/pii-masking.md');
   });
 
   it('mirrors the vault expiry in stale_after', () => {
     const expiry = staleAfter();
     const document = buildGatewayAnswer({
-      sessionId: 's1',
-      answerBody: 'Reply.',
-      generatedBy: 'core_agent/gemini-3.5-flash',
-      verifiedBy: 'synthesis_agent/gemma3:12b',
+      requestId: REQUEST_ID,
+      maskedAnswerBody: 'Reply.',
+      coreActor: 'core_agent/gemini-3.5-flash',
+      generatedBy: 'synthesis_agent/0.1.0',
+      verifiedBy: 'process:leak-check@aaaaaaaaaaaa',
       staleAfter: expiry,
       attestation: PASSING_ATTESTATION,
+      evidence: EVIDENCE,
     });
     expect(document.metadata['stale_after']).toBe(nowIso(expiry));
   });
 
-  it('raises a machine-confirmed answer to human-reviewed on approval', () => {
+  it('the library can still add a human verifier, though the product never does', () => {
+    // The derivation stays generic: OKF is a general format and other consumers
+    // do have authenticated reviewers. This fleet simply never mints a human:
+    // actor, because it authenticates nobody.
     const document = answer();
     expect(trustTier(document.metadata)).toBe(TRUST_MACHINE_CONFIRMED);
 
@@ -191,22 +307,26 @@ describe('Gateway Answer assembly', () => {
 
   it('stores the correlation ids as top-level extension keys', () => {
     const document = buildGatewayAnswer({
-      sessionId: 's1',
-      answerBody: 'Reply.',
-      generatedBy: 'core_agent/gemini-3.5-flash',
-      verifiedBy: 'synthesis_agent/gemma3:12b',
+      requestId: REQUEST_ID,
+      maskedAnswerBody: 'Reply.',
+      coreActor: 'core_agent/gemini-3.5-flash',
+      generatedBy: 'synthesis_agent/0.1.0',
+      verifiedBy: 'process:leak-check@aaaaaaaaaaaa',
       staleAfter: staleAfter(),
       attestation: PASSING_ATTESTATION,
-      requestId: '01920000-0000-7000-8000-000000000001',
+      evidence: EVIDENCE,
       traceId: 'abcdef00000000000000000000000001',
     });
 
-    expect(document.metadata['request_id']).toBe('01920000-0000-7000-8000-000000000001');
+    expect(document.metadata['request_id']).toBe(REQUEST_ID);
     expect(document.metadata['trace_id']).toBe('abcdef00000000000000000000000001');
     // They must survive the round trip so the stored document stays searchable.
-    expect(parse(dump(document)).metadata['request_id']).toBe(
-      '01920000-0000-7000-8000-000000000001',
-    );
+    expect(parse(dump(document)).metadata['request_id']).toBe(REQUEST_ID);
+  });
+
+  it('survives a round trip with the attestation block intact', () => {
+    const reparsed = parse(dump(answer()));
+    expect(reparsed.metadata['attestation']).toEqual(answer().metadata['attestation']);
   });
 });
 

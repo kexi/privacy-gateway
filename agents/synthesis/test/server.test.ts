@@ -1,7 +1,7 @@
 /**
- * What the Synthesis HTTP surface guarantees: the OKF document is stored and
- * returned verbatim, approval raises the trust tier, and an invalid request is
- * rejected before any work is done.
+ * What the Synthesis HTTP surface guarantees: a released answer comes back once
+ * and is never stored, a refused release returns its own status with no body,
+ * and every stored artifact is masked.
  */
 
 import {
@@ -9,8 +9,8 @@ import {
   loadConfig,
   InMemoryTokenVault,
   parse as parseOkf,
-  TRUST_HUMAN_REVIEWED,
   TRUST_MACHINE_CONFIRMED,
+  TRUST_UNVERIFIED,
   trustTier,
   type Config,
 } from '@privacy-gateway/common';
@@ -20,17 +20,19 @@ import { createApp } from '../src/server.ts';
 import { InMemoryAnswerStore } from '../src/store.ts';
 
 const MASKED_PROMPT = 'Reply to ⟦PERSON_1⟧ at ⟦EMAIL_1⟧';
+const REQUEST_ID = '01920000-0000-7000-8000-000000000001';
 
 let app: express.Application;
 let vault: InMemoryTokenVault;
 let store: InMemoryAnswerStore;
 let baseUrl: string;
 let server: ReturnType<express.Application['listen']>;
+let generation: number;
 
 function testConfig(): Config {
   return loadConfig({
     agent: 'synthesis',
-    env: { VAULT_BACKEND: 'memory', DEFAULT_APPROVER: 'kei' },
+    env: { VAULT_BACKEND: 'memory' },
     onInvalid: (message) => {
       throw new Error(message);
     },
@@ -40,7 +42,12 @@ function testConfig(): Config {
 beforeEach(async () => {
   vault = new InMemoryTokenVault();
   store = new InMemoryAnswerStore();
-  await vault.put('s1', { '⟦PERSON_1⟧': 'Taro Yamada', '⟦EMAIL_1⟧': 'taro@example.co.jp' }, 3600);
+  const entry = await vault.put(
+    REQUEST_ID,
+    { '⟦PERSON_1⟧': 'Taro Yamada', '⟦EMAIL_1⟧': 'taro@example.co.jp' },
+    3600,
+  );
+  generation = entry.generation;
 
   app = await createApp({
     config: testConfig(),
@@ -69,12 +76,17 @@ function synthesize(body: Record<string, unknown>) {
   });
 }
 
-const CLEAN_REQUEST = {
-  session_id: 's1',
-  masked_prompt: MASKED_PROMPT,
-  core_answer: 'Dear ⟦PERSON_1⟧, we will write to ⟦EMAIL_1⟧.',
-  generated_by: 'core_agent/gemini-3.5-flash',
-};
+function cleanRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    request_id: REQUEST_ID,
+    masked_prompt: MASKED_PROMPT,
+    core_answer: 'Dear ⟦PERSON_1⟧, we will write to ⟦EMAIL_1⟧.',
+    generated_by: 'core_agent/gemini-3.5-flash',
+    known_tokens: ['⟦PERSON_1⟧', '⟦EMAIL_1⟧'],
+    vault_generation: generation,
+    ...overrides,
+  };
+}
 
 describe('health', () => {
   it('reports which agent answered', async () => {
@@ -85,113 +97,158 @@ describe('health', () => {
 
 describe('POST /v1/synthesize', () => {
   it('returns the rehydrated answer and its OKF document', async () => {
-    const response = await synthesize(CLEAN_REQUEST);
+    const response = await synthesize(cleanRequest());
     expect(response.status).toBe(200);
 
     const body = (await response.json()) as {
       answer: string;
       markdown: string;
       trust_tier: string;
+      dimensions: Record<string, string>;
     };
     expect(body.answer).toContain('Taro Yamada');
     expect(body.trust_tier).toBe(TRUST_MACHINE_CONFIRMED);
     expect(body.markdown).toContain('type: Gateway Answer');
+    expect(body.dimensions.review_identity).toBe('none');
   });
 
   it('echoes the request id it was given', async () => {
-    const requestId = '0192a3b4-c5d6-7e8f-8a9b-0c1d2e3f4a5b';
-    const response = await synthesize({ ...CLEAN_REQUEST, request_id: requestId });
-
+    const response = await synthesize(cleanRequest());
     const body = (await response.json()) as { request_id: string };
-    expect(body.request_id).toBe(requestId);
+    expect(body.request_id).toBe(REQUEST_ID);
     expect(response.headers.get('x-request-id')).toBeTruthy();
   });
 
-  it('persists the document for later retrieval', async () => {
-    await synthesize(CLEAN_REQUEST);
-    expect(await store.get('s1')).toContain('type: Gateway Answer');
+  it('persists masked artifacts and never the rehydrated answer', async () => {
+    await synthesize(cleanRequest());
+    const record = await store.get(REQUEST_ID);
+
+    expect(record?.okf).toContain('type: Gateway Answer');
+    expect(record?.maskedPrompt).toBe(MASKED_PROMPT);
+    expect(record?.coreResponse).toContain('⟦PERSON_1⟧');
+
+    const stored = JSON.stringify(record);
+    expect(stored).not.toContain('Taro Yamada');
+    expect(stored).not.toContain('taro@example.co.jp');
+  });
+
+  it('gives the stored record an expiry so the TTL policy can sweep it', async () => {
+    await synthesize(cleanRequest());
+    const record = await store.get(REQUEST_ID);
+    expect(record?.expiresAt.getTime()).toBeGreaterThan(Date.now());
   });
 
   it('rejects a request missing required fields', async () => {
-    const response = await synthesize({ session_id: 's1' });
+    const response = await synthesize({ request_id: REQUEST_ID });
     expect(response.status).toBe(400);
 
     const body = (await response.json()) as { error: string; message: string };
     expect(body.error).toBe('invalid_request');
     expect(body.message).toContain('masked_prompt');
   });
+});
 
-  it('marks a leaking answer draft', async () => {
-    const response = await synthesize({
-      ...CLEAN_REQUEST,
-      core_answer: 'Write to leaked.person@example.com instead.',
-    });
+describe('a refused release', () => {
+  it('returns 422 with no answer when Core leaked raw PII', async () => {
+    const response = await synthesize(
+      cleanRequest({ core_answer: 'Write to leaked.person@example.com instead.' }),
+    );
 
-    const body = (await response.json()) as { status: string; attestation: { ok: boolean } };
-    expect(body.status).toBe('draft');
-    expect(body.attestation.ok).toBe(false);
+    expect(response.status).toBe(422);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body['error']).toBe('leak_check_failed');
+    expect(body['categories']).toContain('EMAIL');
+    expect(body['answer']).toBeUndefined();
+  });
+
+  it('does not echo the unsafe body back to the caller', async () => {
+    const response = await synthesize(
+      cleanRequest({ core_answer: 'Write to leaked.person@example.com instead.' }),
+    );
+    expect(await response.text()).not.toContain('leaked.person@example.com');
+  });
+
+  it('persists a draft evidence record carrying no released answer', async () => {
+    // A blocked request is exactly the one an auditor asks about later, so the
+    // masked record is still written.
+    await synthesize(cleanRequest({ core_answer: 'Write to leaked.person@example.com.' }));
+    const record = await store.get(REQUEST_ID);
+
+    expect(record).not.toBeNull();
+    const metadata = parseOkf(record?.okf ?? '').metadata;
+    expect(metadata['status']).toBe('draft');
+    expect(trustTier(metadata)).toBe(TRUST_UNVERIFIED);
+  });
+
+  it('returns 409 when Core invented a placeholder', async () => {
+    const response = await synthesize(cleanRequest({ core_answer: 'See ⟦PERSON_99⟧.' }));
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('invented_token');
+  });
+
+  it('returns 409 when the vault generation no longer matches', async () => {
+    const response = await synthesize(cleanRequest({ vault_generation: generation + 1 }));
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('vault_generation_mismatch');
   });
 });
 
-describe('GET /v1/sessions/:id/answer', () => {
+describe('GET /v1/requests/:id/evidence', () => {
   it('returns the stored document as markdown', async () => {
-    await synthesize(CLEAN_REQUEST);
-    const response = await fetch(`${baseUrl}/v1/sessions/s1/answer`);
+    await synthesize(cleanRequest());
+    const response = await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/evidence`);
 
     expect(response.headers.get('content-type')).toContain('text/markdown');
     expect(await response.text()).toContain('type: Gateway Answer');
   });
 
-  it('reports an unknown session as 404', async () => {
-    const response = await fetch(`${baseUrl}/v1/sessions/nope/answer`);
+  it('never serves a rehydrated value', async () => {
+    await synthesize(cleanRequest());
+    const body = await (await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/evidence`)).text();
+    expect(body).not.toContain('Taro Yamada');
+  });
+
+  it('reports an unknown request as 404', async () => {
+    const response = await fetch(`${baseUrl}/v1/requests/nope/evidence`);
     expect(response.status).toBe(404);
   });
 });
 
-describe('POST /v1/sessions/:id/approve', () => {
-  it('raises the tier to human-reviewed', async () => {
-    await synthesize(CLEAN_REQUEST);
-    const response = await fetch(`${baseUrl}/v1/sessions/s1/approve`, {
+describe('the masked source artifacts', () => {
+  it('serves the masked prompt the OKF sources name', async () => {
+    // Without this route the `sources[]` entry would be a dangling link and the
+    // recorded digest could not be re-derived.
+    await synthesize(cleanRequest());
+    const response = await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/masked-prompt.md`);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(MASKED_PROMPT);
+  });
+
+  it('serves the tokenized core response', async () => {
+    await synthesize(cleanRequest());
+    const body = await (
+      await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/core-response.md`)
+    ).text();
+
+    expect(body).toContain('⟦PERSON_1⟧');
+    expect(body).not.toContain('Taro Yamada');
+  });
+
+  it('reports an unknown request as 404', async () => {
+    const response = await fetch(`${baseUrl}/v1/requests/nope/masked-prompt.md`);
+    expect(response.status).toBe(404);
+  });
+});
+
+describe('routes that no longer exist', () => {
+  it('has no approval route', async () => {
+    // Approval was removed: the gateway authenticates nobody, so a `human:`
+    // actor minted from a click would name no one.
+    const response = await fetch(`${baseUrl}/v1/sessions/${REQUEST_ID}/approve`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ approver: 'kei' }),
-    });
-
-    const body = (await response.json()) as { trust_tier: string; markdown: string };
-    expect(body.trust_tier).toBe(TRUST_HUMAN_REVIEWED);
-    expect(trustTier(parseOkf(body.markdown).metadata)).toBe(TRUST_HUMAN_REVIEWED);
-  });
-
-  it('normalizes a bare approver id to the human: actor form', async () => {
-    // SPEC §7: the prefix is what the trust-tier derivation keys on.
-    await synthesize(CLEAN_REQUEST);
-    const response = await fetch(`${baseUrl}/v1/sessions/s1/approve`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ approver: 'alice' }),
-    });
-
-    const body = (await response.json()) as { markdown: string };
-    const verified = parseOkf(body.markdown).metadata['verified'] as Array<{ by: string }>;
-    expect(verified.some((entry) => entry.by === 'human:alice')).toBe(true);
-  });
-
-  it('keeps the approval in the stored document', async () => {
-    await synthesize(CLEAN_REQUEST);
-    await fetch(`${baseUrl}/v1/sessions/s1/approve`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-
-    expect(trustTier(parseOkf((await store.get('s1')) ?? '').metadata)).toBe(TRUST_HUMAN_REVIEWED);
-  });
-
-  it('reports an unknown session as 404', async () => {
-    const response = await fetch(`${baseUrl}/v1/sessions/nope/approve`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({}),
     });
     expect(response.status).toBe(404);
   });

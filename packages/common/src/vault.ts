@@ -1,11 +1,17 @@
 /**
- * Token Vault: holds the placeholder -> raw PII mapping for one session.
+ * Token Vault: holds the placeholder -> raw PII mapping for one request.
  *
  * Only components inside the trust boundary (Gateway / Synthesis) touch it. The
  * Core Agent is structured so that it never depends on this module, which is the
  * first layer of the guarantee that "Core cannot read the vault" — Core imports
  * only the `/logging`, `/config`, `/schema` and `/telemetry` subpaths, none of
  * which reach here.
+ *
+ * One entry per request. The gateway mints the request id server-side, so two
+ * concurrent requests can never contend for the same document; the `generation`
+ * counter and the Firestore transaction below exist so that a delayed answer
+ * from a previous generation cannot resolve against a newer mapping even if a
+ * caller replays an id.
  *
  * The implementation is selected by the `VAULT_BACKEND` environment variable:
  *   - `memory` … an in-process map, for local development and tests
@@ -18,11 +24,20 @@ import { DEFAULT_VAULT_TTL_SECONDS } from './config.ts';
 
 export { DEFAULT_VAULT_TTL_SECONDS };
 
-/** The vault record for one session. */
+/** The vault record for one request. */
 export interface VaultEntry {
-  readonly sessionId: string;
+  readonly requestId: string;
   readonly mapping: Record<string, string>;
   readonly expiresAt: Date;
+  /**
+   * Incremented on every allocating write.
+   *
+   * Synthesis is handed the generation the gateway wrote and refuses to
+   * rehydrate against any other one, so a mapping that was replaced between the
+   * Core call and the release cannot silently resolve tokens to different
+   * values.
+   */
+  readonly generation: number;
 }
 
 /** True once the entry's absolute expiry has passed. */
@@ -32,16 +47,16 @@ export function isExpired(entry: VaultEntry, now: Date = new Date()): boolean {
 
 /** Interface of the Token Vault. */
 export interface TokenVault {
-  /** Store the session mapping, merging into any existing one without extending it. */
+  /** Store the request mapping, merging into any existing one without extending it. */
   put(
-    sessionId: string,
+    requestId: string,
     mapping: Readonly<Record<string, string>>,
     ttlSeconds?: number,
   ): Promise<VaultEntry>;
-  /** Return the session mapping, or `null` if it has expired. */
-  get(sessionId: string): Promise<VaultEntry | null>;
-  /** Discard the session. */
-  delete(sessionId: string): Promise<void>;
+  /** Return the request mapping, or `null` if it is absent or has expired. */
+  get(requestId: string): Promise<VaultEntry | null>;
+  /** Discard the entry. */
+  delete(requestId: string): Promise<void>;
 }
 
 /** In-process map implementation. */
@@ -49,11 +64,11 @@ export class InMemoryTokenVault implements TokenVault {
   private readonly entries = new Map<string, VaultEntry>();
 
   put(
-    sessionId: string,
+    requestId: string,
     mapping: Readonly<Record<string, string>>,
     ttlSeconds: number = DEFAULT_VAULT_TTL_SECONDS,
   ): Promise<VaultEntry> {
-    const existing = this.entries.get(sessionId);
+    const existing = this.entries.get(requestId);
     const live = existing !== undefined && !isExpired(existing);
 
     const merged = { ...(live ? existing.mapping : {}), ...mapping };
@@ -61,37 +76,54 @@ export class InMemoryTokenVault implements TokenVault {
     // move stale_after and contradict the freshness claim made in the OKF
     // document.
     const expiresAt = live ? existing.expiresAt : new Date(Date.now() + ttlSeconds * 1000);
+    const generation = (live ? existing.generation : 0) + 1;
 
-    const entry: VaultEntry = { sessionId, mapping: merged, expiresAt };
-    this.entries.set(sessionId, entry);
+    const entry: VaultEntry = { requestId, mapping: merged, expiresAt, generation };
+    this.entries.set(requestId, entry);
     return Promise.resolve(entry);
   }
 
-  get(sessionId: string): Promise<VaultEntry | null> {
-    const entry = this.entries.get(sessionId);
+  get(requestId: string): Promise<VaultEntry | null> {
+    const entry = this.entries.get(requestId);
     if (entry === undefined) return Promise.resolve(null);
     if (isExpired(entry)) {
-      this.entries.delete(sessionId);
+      this.entries.delete(requestId);
       return Promise.resolve(null);
     }
     return Promise.resolve(entry);
   }
 
-  delete(sessionId: string): Promise<void> {
-    this.entries.delete(sessionId);
+  delete(requestId: string): Promise<void> {
+    this.entries.delete(requestId);
     return Promise.resolve();
   }
 }
 
+/** One Firestore document reference, narrowed to what this module uses. */
+export interface FirestoreDocLike {
+  get(): Promise<{ exists: boolean; data(): Record<string, unknown> | undefined }>;
+  set(data: Record<string, unknown>): Promise<unknown>;
+  delete(): Promise<unknown>;
+}
+
+/** The transaction surface `runTransaction` hands the callback. */
+export interface FirestoreTransactionLike {
+  get(doc: FirestoreDocLike): Promise<{
+    exists: boolean;
+    data(): Record<string, unknown> | undefined;
+  }>;
+  set(doc: FirestoreDocLike, data: Record<string, unknown>): unknown;
+}
+
 /** The Firestore surface this module uses; narrowed so tests can supply a double. */
 export interface FirestoreLike {
-  collection(name: string): {
-    doc(id: string): {
-      get(): Promise<{ exists: boolean; data(): Record<string, unknown> | undefined }>;
-      set(data: Record<string, unknown>): Promise<unknown>;
-      delete(): Promise<unknown>;
-    };
-  };
+  collection(name: string): { doc(id: string): FirestoreDocLike };
+  /**
+   * Optional so an older double still type-checks; when it is absent the vault
+   * falls back to a plain read-modify-write, which is correct for the
+   * single-writer-per-request model but loses the concurrency guarantee.
+   */
+  runTransaction?<T>(fn: (transaction: FirestoreTransactionLike) => Promise<T>): Promise<T>;
 }
 
 export interface FirestoreVaultOptions {
@@ -124,38 +156,74 @@ export class FirestoreTokenVault implements TokenVault {
     return this.client;
   }
 
-  private async doc(sessionId: string) {
+  private async doc(requestId: string): Promise<FirestoreDocLike> {
     const client = await this.resolveClient();
-    return client.collection(this.collectionName).doc(sessionId);
+    return client.collection(this.collectionName).doc(requestId);
   }
 
+  /**
+   * Allocate inside a transaction.
+   *
+   * Why not a plain read-modify-write: two writers that both read an empty
+   * document would each allocate generation 1 and the later `set` would silently
+   * discard the earlier mapping, cross-wiring one caller's placeholders onto
+   * another caller's values.
+   */
   async put(
-    sessionId: string,
+    requestId: string,
     mapping: Readonly<Record<string, string>>,
     ttlSeconds: number = DEFAULT_VAULT_TTL_SECONDS,
   ): Promise<VaultEntry> {
-    const doc = await this.doc(sessionId);
-    const snapshot = await doc.get();
+    const client = await this.resolveClient();
+    const doc = client.collection(this.collectionName).doc(requestId);
 
-    let merged: Record<string, string> = {};
-    let expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+    const apply = (
+      existing: Record<string, unknown> | undefined,
+    ): { entry: VaultEntry; payload: Record<string, unknown> } => {
+      let merged: Record<string, string> = {};
+      let expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+      let generation = 0;
 
-    if (snapshot.exists) {
-      const data = snapshot.data() ?? {};
-      const storedExpiry = asDate(data['expires_at']);
-      if (storedExpiry !== null && storedExpiry.getTime() > Date.now()) {
-        merged = { ...asMapping(data['mapping']) };
-        expiresAt = storedExpiry;
+      if (existing !== undefined) {
+        const storedExpiry = asDate(existing['expires_at']);
+        const isLive = storedExpiry !== null && storedExpiry.getTime() > Date.now();
+        if (isLive) {
+          merged = { ...asMapping(existing['mapping']) };
+          expiresAt = storedExpiry;
+          generation = asGeneration(existing['generation']);
+        }
       }
-    }
-    merged = { ...merged, ...mapping };
+      merged = { ...merged, ...mapping };
+      generation += 1;
 
-    await doc.set({ mapping: merged, expires_at: expiresAt, session_id: sessionId });
-    return { sessionId, mapping: merged, expiresAt };
+      return {
+        entry: { requestId, mapping: merged, expiresAt, generation },
+        payload: {
+          mapping: merged,
+          expires_at: expiresAt,
+          request_id: requestId,
+          generation,
+        },
+      };
+    };
+
+    if (typeof client.runTransaction === 'function') {
+      return client.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(doc);
+        const { entry, payload } = apply(snapshot.exists ? snapshot.data() : undefined);
+        transaction.set(doc, payload);
+        return entry;
+      });
+    }
+
+    const snapshot = await doc.get();
+    const { entry, payload } = apply(snapshot.exists ? snapshot.data() : undefined);
+    await doc.set(payload);
+    return entry;
   }
 
-  async get(sessionId: string): Promise<VaultEntry | null> {
-    const doc = await this.doc(sessionId);
+  async get(requestId: string): Promise<VaultEntry | null> {
+    const doc = await this.doc(requestId);
     const snapshot = await doc.get();
     if (!snapshot.exists) return null;
 
@@ -164,16 +232,17 @@ export class FirestoreTokenVault implements TokenVault {
     if (expiresAt === null) return null;
 
     const entry: VaultEntry = {
-      sessionId,
+      requestId,
       mapping: asMapping(data['mapping']) ?? {},
       expiresAt,
+      generation: asGeneration(data['generation']),
     };
     // TTL policy deletions lag behind, so the reader checks the expiry as well.
     return isExpired(entry) ? null : entry;
   }
 
-  async delete(sessionId: string): Promise<void> {
-    const doc = await this.doc(sessionId);
+  async delete(requestId: string): Promise<void> {
+    const doc = await this.doc(requestId);
     await doc.delete();
   }
 }
@@ -190,6 +259,12 @@ function asDate(value: unknown): Date | null {
     return converted instanceof Date ? converted : null;
   }
   return null;
+}
+
+/** A missing or malformed generation reads as 0, so the next write becomes 1. */
+function asGeneration(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) return 0;
+  return value;
 }
 
 function asMapping(value: unknown): Record<string, string> | null {

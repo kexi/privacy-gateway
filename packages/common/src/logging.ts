@@ -1,23 +1,26 @@
 /**
- * Structured JSON logging that never emits raw PII.
+ * Structured JSON logging that cannot emit raw PII.
  *
  * One JSON object per line, in the shape Cloud Logging ingests directly:
  * `severity` / `message` / `time` plus a flat jsonPayload. Trace correlation
  * fields (`logging.googleapis.com/trace`, `.../spanId`) are filled from the
  * active OpenTelemetry span so Logs Explorer and Cloud Trace cross-link.
  *
- * Every string value is passed through the tokenizer before serialization, so
- * even if a caller accidentally hands over a raw value only the placeholder ends
- * up in the log.
+ * Fields are filtered against a **typed allowlist** rather than scrubbed. Why
+ * not scrub: masking runs the same regexes the tokenizer does, so it never saw a
+ * personal name or an address, and an exception message or a truncated response
+ * body could carry either straight into the log. Only the fields named below —
+ * hashes, counts, enums, internal UUIDs — are emitted at all; anything else is
+ * dropped, and the dropped key names are recorded so a missing field is visible
+ * rather than silently absent.
  *
  * Why not pino or winston? On Cloud Run a single-line JSON object on stdout is
  * already a structured log entry, so a dependency would buy nothing and would
- * add a second place where PII could escape masking.
+ * add a second place where a value could escape the allowlist.
  */
 
 import { trace } from '@opentelemetry/api';
 import type { AgentName } from './config.ts';
-import { maskForLogging } from './tokenizer.ts';
 
 export type Severity = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
 
@@ -28,52 +31,132 @@ const SEVERITY_ORDER: Record<Severity, number> = {
   ERROR: 40,
 };
 
+/** How an allowed field's value is coerced before it is written. */
+type FieldKind = 'id' | 'enum' | 'number' | 'boolean' | 'string_list' | 'count_map' | 'hash';
+
 /**
- * Keys whose values pass through unmasked: identifiers, verdicts and counts,
- * none of which can carry PII, and all of which become useless if masked.
+ * Every field a log line may carry, and the shape it is forced into.
+ *
+ * `id` values are internal UUIDs and span/trace ids, all minted server-side.
+ * `enum` values are drawn from closed sets in the code (verdicts, tiers, HTTP
+ * methods, error class names). Nothing here is caller-controlled free text.
  */
-const PASSTHROUGH_KEYS = new Set([
-  'agent',
-  'event',
-  'severity',
-  'session_id',
-  'request_id',
-  'trace_id',
-  'span_id',
-  'model',
-  'status',
-  'verdict',
-  'trust_tier',
-  'hop',
-  'path',
-  'method',
-  'error_code',
-  'time',
-]);
+const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
+  agent: 'enum',
+  event: 'enum',
+  severity: 'enum',
+  request_id: 'id',
+  trace_id: 'id',
+  span_id: 'id',
+  model: 'enum',
+  status: 'enum',
+  verdict: 'enum',
+  trust_tier: 'enum',
+  document_status: 'enum',
+  freshness: 'enum',
+  hop: 'enum',
+  path: 'enum',
+  method: 'enum',
+  error_code: 'enum',
+  error_class: 'enum',
+  refusal: 'enum',
+  vault_backend: 'enum',
+  time: 'enum',
+  duration_ms: 'number',
+  attempt: 'number',
+  port: 'number',
+  placeholder_count: 'number',
+  masked_count: 'number',
+  unstructured_spans: 'number',
+  span_count: 'number',
+  tokens_resolved: 'number',
+  tokens_unknown: 'number',
+  withheld_count: 'number',
+  vault_generation: 'number',
+  body_bytes: 'number',
+  finding_count: 'number',
+  text_length: 'number',
+  tokens_withheld: 'number',
+  finding_kinds: 'string_list',
+  ok: 'boolean',
+  leak: 'boolean',
+  stale: 'boolean',
+  categories: 'string_list',
+  findings: 'string_list',
+  withheld: 'string_list',
+  unresolved_tokens: 'string_list',
+  invented_tokens: 'string_list',
+  issues: 'string_list',
+  counts_by_category: 'count_map',
+  response_hash: 'hash',
+  masked_prompt_hash: 'hash',
+  attester_sha256: 'hash',
+  computation_sha256: 'hash',
+};
 
 /** Fields every log line may carry; `event` is the searchable discriminator. */
 export interface LogFields {
   readonly event?: string;
-  readonly session_id?: string | undefined;
   readonly request_id?: string | undefined;
   readonly duration_ms?: number | undefined;
   readonly [key: string]: unknown;
 }
 
-/** Recursively masks a value, leaving identifier-like keys intact. */
-function scrub(value: unknown, key?: string): unknown {
-  if (typeof value === 'string') {
-    return key !== undefined && PASSTHROUGH_KEYS.has(key) ? value : maskForLogging(value);
+/** Coerce one allowed value into its declared shape, or drop it. */
+function coerce(kind: FieldKind, value: unknown): unknown {
+  if (value === undefined || value === null) return undefined;
+
+  switch (kind) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+    case 'boolean':
+      return typeof value === 'boolean' ? value : undefined;
+    case 'id':
+    case 'enum':
+    case 'hash':
+      // Bounded so an inbound header that slipped through validation cannot
+      // become an unbounded log line.
+      return typeof value === 'string' ? value.slice(0, 128) : undefined;
+    case 'string_list':
+      return Array.isArray(value)
+        ? value
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.slice(0, 128))
+        : undefined;
+    case 'count_map': {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      const counts: Record<string, number> = {};
+      for (const [key, count] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof count === 'number' && Number.isFinite(count)) counts[key.slice(0, 64)] = count;
+      }
+      return counts;
+    }
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => scrub(item));
+}
+
+/**
+ * Keep only the allowlisted fields.
+ *
+ * Dropped keys are reported by name (never by value) under `dropped_fields`, so
+ * a developer who adds a field and forgets the allowlist sees it immediately
+ * instead of debugging an absent log line.
+ */
+function selectFields(fields: LogFields): Record<string, unknown> {
+  const selected: Record<string, unknown> = {};
+  const dropped: string[] = [];
+
+  for (const [key, value] of Object.entries(fields)) {
+    const kind = ALLOWED_FIELDS[key];
+    if (kind === undefined) {
+      if (value !== undefined) dropped.push(key);
+      continue;
+    }
+    const coerced = coerce(kind, value);
+    if (coerced !== undefined) selected[key] = coerced;
   }
-  if (value !== null && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, scrub(v, k)]),
-    );
-  }
-  return value;
+
+  if (dropped.length > 0) selected['dropped_fields'] = dropped.sort();
+  return selected;
 }
 
 export interface LoggerOptions {
@@ -141,10 +224,13 @@ export class Logger {
     const merged = { ...this.bound, ...fields };
     const entry: Record<string, unknown> = {
       severity,
-      message: scrub(message),
+      // The message is always a literal at the call site (an event name or a
+      // fixed sentence), never interpolated user text; bounding it keeps that
+      // true even if someone breaks the convention.
+      message: message.slice(0, 256),
       time: new Date().toISOString(),
       agent: this.options.agent,
-      ...(scrub(merged) as Record<string, unknown>),
+      ...selectFields(merged),
     };
 
     // Correlate with Cloud Trace. Without the project id the fully-qualified
@@ -182,15 +268,15 @@ export function createLogger(options: LoggerOptions): Logger {
 /**
  * Normalize a thrown value into log-safe fields.
  *
- * Exception messages can contain PII, so the message goes through the same
- * masking path as everything else (`scrub` is applied by `Logger.log`).
+ * The message is deliberately absent. An exception message routinely embeds the
+ * value that caused it — a response body, a prompt fragment, a header — and no
+ * masking pass can be trusted to catch a name or an address inside one. The
+ * class and an optional code are enough to locate the throw site, and the
+ * request id ties it to the rest of the request.
  */
 export function errorFields(error: unknown, code?: string): LogFields {
   if (error instanceof Error) {
-    return {
-      error_code: code ?? error.name,
-      error_message: error.message,
-    };
+    return { error_class: error.name, error_code: code ?? error.name };
   }
-  return { error_code: code ?? 'unknown_error', error_message: String(error) };
+  return { error_class: 'unknown_error', error_code: code ?? 'unknown_error' };
 }

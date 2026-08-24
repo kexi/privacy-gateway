@@ -37,11 +37,38 @@ reproducible. Unstructured entities (names, addresses) are extracted by the self
 Gemma model, which never leaves the boundary. Where the two disagree on an overlapping
 span, the deterministic detector wins.
 
+# What this is, and is not
+
+The mechanism is **pseudonymization**, not anonymization. A placeholder discloses its
+category, and equal values share a placeholder, so a reader of the masked prompt learns
+that two mentions refer to the same person even without learning who. Employer, location,
+date, role and event context survive masking untouched, and enough of it can identify a
+person. Contextual re-identification is a disclosed residual risk, not a solved problem.
+
 # Placeholder stability
 
-Within a session, the same source value must always map to the same placeholder, so that
-the Core Agent can reason about `⟦PERSON_1⟧` coherently across a multi-turn exchange. The
-mapping lives in the Token Vault, keyed by session, and expires with it.
+Within one request, the same source value always maps to the same placeholder, so the
+Core Agent can reason about `⟦PERSON_1⟧` coherently within an answer. The mapping lives
+in the Token Vault keyed by the **server-generated request id**, and expires with it.
+
+There is deliberately no cross-request stability and no caller-supplied key. A caller who
+can name a vault key can ask the fleet to resolve placeholders belonging to that key, and
+validating the key does not remove that; one key per request removes it structurally.
+
+# Reserved syntax
+
+The delimiters `⟦` and `⟧` are reserved to the gateway. A request containing either
+character is rejected with 400 before masking: only the tokenizer may mint a placeholder,
+and text that arrives already looking like one is a probe at the vault, not data.
+
+# Disclosure policy on release
+
+Secret-bearing categories — `API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD`, `MY_NUMBER` — are
+**not** restored into a released answer by default. The caller already holds those values,
+and echoing them back through a model round trip only widens where they can be logged or
+screenshotted. The placeholder stays in place and the withheld categories are listed in
+the answer's `attestation.withheld`. `REHYDRATE_ALLOW_CATEGORIES` can re-enable specific
+categories for a deployment with a stated purpose.
 
 # Egress guard
 
@@ -53,15 +80,33 @@ behaving correctly.
 
 # Response requirements
 
-A response may be rehydrated and presented to a user only when the leak check attests
-cleanly — see [the leak-check computation](/computations/leak-check.md). The check runs on
-the core agent's tokenized answer, before rehydration, and asks whether the model
-introduced any raw identifier of its own beyond the placeholders it was given. A response
-containing any such identifier is recorded as `status: draft` with the failure surfaced,
-never silently dropped and never presented as verified.
+A response may be rehydrated and presented to a user only when **every** gate passes —
+see [the leak-check computation](/computations/leak-check.md). The gates, all of which run
+before any rehydration:
+
+1. The token mapping exists, is live, and is the exact generation the gateway wrote.
+2. The core agent used only placeholders it was given; an invented one fails.
+3. The deterministic leak check finds no raw identifier in the tokenized answer.
+4. The advisory Gemma judge did not flag a leak and did answer. Its influence is
+   asymmetric: `leak: true` or no usable verdict blocks the release, `leak: false` adds no
+   trust at all. A probabilistic model may veto; it may never vouch.
+5. Every placeholder in the answer resolved (or was deliberately withheld).
+
+A failure at any gate returns no answer body. The exchange is still recorded: the masked
+prompt, the tokenized core response, the hashes and the category-level findings are
+persisted as `status: draft` with `verified` omitted, so the refusal is auditable. The
+failure is surfaced, never silently dropped and never presented as verified.
+
+# What is persisted
+
+Only masked artifacts, keyed by request id: the masked prompt, the core agent's tokenized
+response, the OKF document (whose body holds the masked answer), hashes, and
+`expires_at`. The rehydrated answer is returned in one API response and never stored.
 
 # Vault lifetime
 
-Token Vault entries carry an absolute expiry. The `stale_after` of every answer produced
-from a session equals that expiry: once the mapping is gone, the answer can no longer be
-re-derived or re-audited, so it must not be treated as fresh.
+Token Vault entries carry an absolute expiry and a `generation` counter. The `stale_after`
+of every answer equals that expiry: once the mapping is gone, the answer can no longer be
+re-derived or re-audited, so it must not be treated as fresh. A response whose generation
+no longer matches the one the gateway wrote is refused rather than resolved against the
+newer mapping.

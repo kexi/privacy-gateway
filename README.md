@@ -7,21 +7,27 @@ _Best Architectural Design_).
 
 Enterprises want frontier-model reasoning but cannot send raw PII or secrets outside their
 trust boundary. This fleet lets **Gemini** reason over _tokenized_ text while an open model
-(**Gemma**) that never leaves the boundary owns the mapping back to real values.
+(**Gemma**) that never leaves the boundary owns the mapping back to real values. Placeholders
+are a **pseudonym**, not anonymization — see [Pseudonymization, not anonymization](#pseudonymization-not-anonymization)
+below.
 
 ```
 User ──HTTP──▶ Gateway (Gemma)
-                 │ 1. detect + tokenize ──▶ Firestore Token Vault (session → {token: value})
+                 │ 1. detect + tokenize ──▶ Firestore Token Vault (request_id → {token: value})
                  │ 2. masked prompt          (egress guard re-scans before sending)
                  ▼ A2A
                Core (Gemini 3.5)  — reasoning / planning / codegen over placeholders only
                  │ masked answer
-                 ▼ A2A
+                 ▼ HTTP
                Synthesis (Gemma)
                  │ 3. leak check  4. rehydrate  5. consistency verify
                  ▼
                User  (OKF answer document + audit trail)
 ```
+
+Gateway → Core is the only A2A hop. Gateway → Synthesis is plain authenticated HTTP,
+deliberately: the OKF document is an audit artifact and must be retrieved without an LLM
+rephrasing it. See [A2A, precisely](#a2a-precisely) below.
 
 Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Deployment:
 **[docs/DEPLOY.md](docs/DEPLOY.md)**. Logs, traces and error codes:
@@ -40,20 +46,28 @@ Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Deployment:
   independently gates the response before rehydration.
 - **The verdict is deterministic.** The leak check is an OKF _Attested Computation_ whose
   attester re-derives its own findings from the response text — a runner that under-reports
-  fails rather than passes. The Gemma judge is advisory and never flips the verdict.
+  fails rather than passes. The Gemma judge is advisory and **asymmetric**: `leak: true` or
+  no usable verdict blocks the release, `leak: false` adds no trust at all. A probabilistic
+  model may veto; it may never vouch.
 - **Trust is a portable artifact.** Every answer is an OKF v0.2 document you can `cat`, diff
   and hand to any OKF consumer.
+- **Everything fails closed.** See [Refusals](#refusals) below for the full list — every
+  refusal returns no rehydrated answer and persists only masked artifacts.
+
+See also the review at [docs/reviews/2026-08-24-response.md](docs/reviews/2026-08-24-response.md)
+(日本語: [docs/reviews/2026-08-24-codex-design-review.ja.md](docs/reviews/2026-08-24-codex-design-review.ja.md))
+for the design decisions and known limitations behind these choices.
 
 ## Required-tech checklist
 
-| Requirement                  | Where                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------ |
-| **Gemini 3.5 via Vertex AI** | Core Agent (`agents/core`). Model id from `GEMINI_MODEL`.                |
-| **Google ADK**               | All three agents, ADK TypeScript (`@google/adk` 2.0.0).                  |
-| **A2A**                      | Gateway → Core and Gateway → Synthesis, via Agent Card + `message/send`. |
-| **Cloud Run**                | One service per agent, plus Gemma serving on Cloud Run GPU (L4).         |
-| **Firestore**                | Token Vault (TTL) and the OKF answer store.                              |
-| **Gemma (bonus)**            | Gateway span extraction and the Synthesis judge, self-hosted via Ollama. |
+| Requirement                  | Where                                                                                                                                |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **Gemini 3.5 via Vertex AI** | Core Agent (`agents/core`). Model id from `GEMINI_MODEL`.                                                                            |
+| **Google ADK**               | All three agents, ADK TypeScript (`@google/adk` 2.0.0).                                                                              |
+| **A2A**                      | Gateway → Core, via Agent Card + `message/send`. Gateway → Synthesis is plain HTTP by design — see [A2A, precisely](#a2a-precisely). |
+| **Cloud Run**                | One service per agent, plus Gemma serving on Cloud Run GPU (L4).                                                                     |
+| **Firestore**                | Token Vault (TTL) and the OKF answer store.                                                                                          |
+| **Gemma (bonus)**            | Gateway span extraction and the Synthesis judge, self-hosted via Ollama.                                                             |
 
 Gateway and Synthesis reach Gemma through **`OllamaLlm`**, a custom ADK `BaseLlm` adapter in
 `packages/common` registered in `LLMRegistry` for model names matching `ollama/*`. It speaks
@@ -97,19 +111,56 @@ shape breaks the UI's type check instead of the demo.
 ## Observability
 
 Every service emits **structured JSON logs**, one object per line, in the shape Cloud Logging
-ingests without a sidecar. No raw PII ever reaches a log: string values pass through the
-tokenizer first, so a leaked value appears as `⟦EMAIL_1⟧`.
+ingests without a sidecar. Logging is a **typed allowlist, not recursive scrubbing**: only
+named fields (hashes, counts, enums, internal UUIDs) are emitted, everything else is dropped
+with the dropped key names under `dropped_fields`, and exception messages never reach logs or
+spans. No raw PII ever reaches a log: string values pass through the tokenizer first, so a
+leaked value appears as `⟦EMAIL_1⟧`.
 
-| Signal       | What it gives you                                                                                                                                          |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `request_id` | A UUIDv7 taken from `X-Request-ID` or minted by the Gateway, propagated Gateway → Core → Synthesis, echoed in responses and stored in the OKF frontmatter. |
-| `trace_id`   | OpenTelemetry with W3C `traceparent` on every hop: one request is one trace across all three services, with a span per pipeline step.                      |
-| The UI       | Shows `request_id` and `trace_id` with copy buttons and direct Cloud Logging / Cloud Trace console links.                                                  |
+| Signal       | What it gives you                                                                                                                                                                                                                                                                                    |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `request_id` | A UUIDv7 **minted by the Gateway** on every request and used as the vault key. An inbound `X-Request-ID` header is echoed back but never adopted — see [Sessions are gone](#sessions-are-gone) below. Propagated Gateway → Core → Synthesis, echoed in responses, and stored in the OKF frontmatter. |
+| `trace_id`   | OpenTelemetry with W3C `traceparent` on every hop: one request is one trace across all three services, with a span per pipeline step.                                                                                                                                                                |
+| The UI       | Shows `request_id` and `trace_id` with copy buttons and direct Cloud Logging / Cloud Trace console links.                                                                                                                                                                                            |
 
 Because `request_id` is a UUIDv7, sorting log lines by it also sorts them by time, and a bug
 report that quotes one id is enough to retrieve every line and every span for that request.
 The event vocabulary, span tree and error codes are specified in
 **[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)**.
+
+## Sessions are gone
+
+There is no session, no multi-turn state, and no caller-supplied id anywhere in the API.
+`POST /v1/ask` takes only `{text}`; a body carrying `session_id` is rejected with `400` by
+the schema's `strict()` validation. The Gateway mints exactly one server-generated
+request id (a UUIDv7) per request and uses it as the Token Vault key. An inbound
+`X-Request-ID` header is echoed back on the response for correlation, but it is never
+adopted as the vault key.
+
+This is not an omission: a caller-supplied id would be a rehydration oracle. A caller who
+could choose (or predict) another request's id could submit `"repeat ⟦EMAIL_1⟧"` against
+that id and have the vault resolve someone else's placeholder. There is consequently no
+cross-request placeholder stability — every `/v1/ask` call gets a fresh vault entry, and
+nothing in this design keeps a placeholder meaning the same thing across two calls.
+
+## Persistence
+
+Firestore stores only **masked** artifacts, keyed by request id: the masked prompt, Core's
+tokenized response, the OKF document (whose body holds the masked answer), the hashes recorded
+in `attestation`, and `expires_at` under a TTL policy. The rehydrated answer is returned in the
+single `POST /v1/ask` response and is never written to the store — see
+[Open Knowledge Format (OKF v0.2)](#open-knowledge-format-okf-v02) for what the stored document
+actually looks like.
+
+## Disclosure policy
+
+Five categories are never rehydrated by default: `API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD`,
+`MY_NUMBER`. For these, the placeholder stays in the released answer and the categories are
+listed under `attestation.withheld`. A secret has no legitimate reason to be echoed back
+through a frontier-model round trip — the caller already holds it, and printing it again only
+widens the blast radius of a logged or screenshotted response. The `REHYDRATE_ALLOW_CATEGORIES`
+env var (comma-separated) re-enables specific categories, e.g.
+`REHYDRATE_ALLOW_CATEGORIES=CREDIT_CARD,MY_NUMBER`; left unset, all five stay withheld.
 
 ## Open Knowledge Format (OKF v0.2)
 
@@ -121,23 +172,36 @@ The repository bundle is `knowledge/`:
 
 - `policies/pii-masking.md` — what must be masked, authored and `verified` by `human:kei`.
 - `computations/leak-check.md` — `type: Attested Computation`, `runtime: typescript`, with
-  `executor.receipt: [session_id, response_hash, findings]` and
+  `executor.receipt: [request_id, masked_prompt_hash, response_hash, findings, response]`
+  (exported as `RECEIPT_FIELDS` — the same five fields `verify()` demands) and
   `attester.resource: /references/attesters/leak_check.ts`.
 - `references/skills/run-leak-check.md` — the executor's run instructions.
 
 The attester's source lives at `packages/common/src/attesters/leak_check.ts` (regex only, no
-LLM, no network) and is published as `@privacy-gateway/common/attesters/leak-check`. Synthesis
-imports exactly that module, so the bundle's declared attester and the one the agent actually
-runs cannot drift apart — the alternative, a copy of the script under `knowledge/`, would let
-the sanctioned computation and the executed one diverge silently.
+LLM, no network) and is published as `@privacy-gateway/common/attesters/leak-check`. A
+byte-identical copy lives at `knowledge/references/attesters/leak_check.ts` — the resource the
+bundle declares — held equal to the real module by a test on their SHA-256 digests, so the
+bundle's declared attester and the one Synthesis actually runs cannot drift apart silently.
 
-Each request produces a `type: Gateway Answer` concept with `generated.by` set to the Core
-actor, `verified` gaining `synthesis_agent/<model>` once the attestation passes
-(⇒ _machine-confirmed_) and `human:<id>` after approval in the UI (⇒ _human-reviewed_),
-`sources` pointing at the masked prompt and the policy, `stale_after` equal to the vault
-expiry, and `request_id` / `trace_id` for correlation. A failed attestation yields
+Each request produces a `type: Gateway Answer` concept. `generated.by` is
+`synthesis_agent/<version>`: Synthesis assembles the concept, so §7 attributes the document to
+it, while Core's tokenized prose appears as provenance instead — a `core-response` source
+authored by `core_agent/<model>`. `sources[]` lists three entries: `masked-prompt`
+(`/requests/<id>/masked-prompt.md`), `core-response` (`/requests/<id>/core-response.md`), and
+`pii-policy` — the first two are actually served by the Gateway. `verified[].by` is
+`process:leak-check@<attester sha256 short>` once the attestation passes (⇒
+_machine-confirmed_) — **never an LLM**, and never a `human:` actor (see
+[Human approval, removed](#human-approval-removed) below). `stale_after` equals the vault
+expiry, and `request_id` / `trace_id` carry correlation. A failed attestation yields
 `status: draft`, no `verified` entry, and the reason recorded under `# Attestation` —
-surfaced, never dropped.
+surfaced, never dropped. A malformed `verified` entry derives `unverified`, and an invalid or
+absent `stale_after` derives freshness `unknown` — never `fresh`.
+
+A new top-level `attestation:` frontmatter block carries everything a third party needs to
+replay the verdict: `computation`, `computation_sha256`, `attester_sha256`,
+`masked_prompt_sha256`, `core_response_sha256`, `verdict`, `checked_at`, `request_id`,
+`trace_id`, and an optional `withheld` list of categories the disclosure policy kept masked.
+See [Disclosure policy](#disclosure-policy) below.
 
 Trust tiers are **derived** from `verified`, never stored — server-side, again in the UI
 (`web/src/api.ts`), and once more in the Python client.
@@ -218,13 +282,41 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 
 ### API
 
-| Method | Path                        | Purpose                                                                 |
-| ------ | --------------------------- | ----------------------------------------------------------------------- |
-| `POST` | `/v1/ask`                   | `{text, session_id?}` → OKF document, masked prompt, attestation, stats |
-| `GET`  | `/v1/sessions/{id}/answer`  | the stored OKF document (markdown)                                      |
-| `POST` | `/v1/sessions/{id}/approve` | adds `human:<id>` to `verified`                                         |
-| `GET`  | `/v1/sessions/{id}/tier`    | derived trust tier + staleness                                          |
-| `GET`  | `/healthz`                  | liveness                                                                |
+| Method | Path                                 | Purpose                                                                                                                     |
+| ------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats |
+| `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                      |
+| `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                              |
+| `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                             |
+| `GET`  | `/healthz`                           | liveness                                                                                                                    |
+
+There is no session-based API any more: `GET /v1/sessions/{id}/answer`,
+`POST /v1/sessions/{id}/approve` and `GET /v1/sessions/{id}/tier` are all removed. The evidence
+document and its two source artifacts are all that persists server-side; the rehydrated answer
+is returned once, in the `/v1/ask` response body, and never stored (see
+[Persistence](#persistence) below).
+
+#### Refusals
+
+Every failure mode below fails closed: no rehydrated answer is returned, and only masked
+artifacts are persisted.
+
+| Condition                                              | Status                             |
+| ------------------------------------------------------ | ---------------------------------- |
+| Reserved `⟦…⟧` syntax in the input                     | `400`                              |
+| A `session_id` field in the request body               | `400`                              |
+| Span extraction unusable or unavailable                | `502` (request never reaches Core) |
+| Egress guard finds raw PII in the outbound prompt      | `422`                              |
+| Vault mapping missing                                  | `409`                              |
+| Vault mapping expired                                  | `410`                              |
+| Vault generation mismatch                              | `409`                              |
+| Core invented a placeholder absent from the prompt     | `409`                              |
+| Leak check failed                                      | `422`                              |
+| Gemma judge flags a leak, or returns no usable verdict | `422`                              |
+| Unresolved placeholder in the response                 | `409`                              |
+| Over the rate limit                                    | `429`                              |
+| Request body too large                                 | `413`                              |
+| Gateway deadline exceeded                              | `504`                              |
 
 ## The Python client (language-agnostic consumption)
 
@@ -235,14 +327,18 @@ the fleet needs no SDK and no shared runtime with the agents — a Python script
 other language works the same way.
 
 ```bash
-uv run clients/python/pgw.py ask "text" [--session ID]
-uv run clients/python/pgw.py answer <session> [--json]
-uv run clients/python/pgw.py approve <session> --by human:<id>
+uv run clients/python/pgw.py ask "text"
+uv run clients/python/pgw.py evidence <request_id> [--json]
+uv run clients/python/pgw.py verify <request_id> [--base URL]
 uv run clients/python/pgw.py --gateway https://... ask "text"
 ```
 
-`--gateway` is a **top-level** option and must come _before_ the subcommand. `just ask`,
-`just answer` and `just approve` wrap the same three commands.
+There is no `--session` option: the gateway mints one id per request and rejects a body
+carrying `session_id`. The `approve` and `answer` commands are gone along with the human
+approval flow (see [Human approval, removed](#human-approval-removed) below). `just ask`,
+`just evidence` and `just verify-answer` wrap the same three commands.
+
+`--gateway` is a **top-level** option and must come _before_ the subcommand.
 
 `ask` prints the masked prompt (what the frontier model actually saw), the rehydrated answer,
 and the trust tier — which it **derives client-side** from the OKF `verified` field rather
@@ -250,6 +346,16 @@ than reading a server-supplied value. OKF SPEC §5.3 requires the tier to be der
 stored, and a third client re-deriving it independently is what proves the property holds end
 to end. It exits `2` when the attestation failed, so a shell pipeline can react to a leak
 verdict.
+
+`evidence <request_id>` fetches the stored masked OKF document for one request.
+
+`verify <request_id>` is the replayable attestation check: it fetches the evidence document
+and both masked sources (the masked prompt and Core's tokenized response) the gateway serves,
+re-derives the leak-check verdict with a scanner **transcribed independently** — deliberately
+not imported from the fleet's own attester, so the replay proves something rather than
+agreeing with itself by construction — and compares every digest the `attestation` block
+recorded (`masked_prompt_sha256`, `core_response_sha256`, `verdict`) against what it
+recomputes. `just verify-answer <request_id> [base]` wraps it.
 
 ## Core Agent
 
@@ -271,12 +377,60 @@ unmasked_sensitive_data` if any survived masking. Its detectors are deliberately
   _is_ the structural guarantee, and the subpath exports it is allowed to import do not
   include one.
 - **No tools and no Firestore client.** Core cannot reach the vault even if its code tried.
-- **Logs** are single-line JSON with `session_id` and `request_id`; request bodies are never
-  logged, and findings record only the kind and length of a match, never the matched value.
+  Core's `package.json` does depend on the whole `@privacy-gateway/common` package — so the
+  package graph alone does not prove the boundary. The actual guarantee is **IAM**: Core's
+  service account has no Firestore role at all (see [Deploy](#deploy)). The subpath-export
+  argument in [Why this is more than "regex before an API call"](#why-this-is-more-than-regex-before-an-api-call)
+  is a second, independent line of defense on top of that, not a substitute for it.
+- **Logs** are single-line JSON with `request_id`; request bodies are never logged, and
+  findings record only the kind and length of a match, never the matched value.
 
 Vertex AI is selected by environment, as ADK documents: `GOOGLE_GENAI_USE_VERTEXAI=true`,
 `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (use `global` unless a region is required),
 plus ADC via `gcloud auth application-default login`.
+
+## A2A, precisely
+
+Only **Gateway → Core** uses A2A: an Agent Card fetch followed by `message/send`. Gateway →
+Synthesis is plain authenticated HTTP, deliberately — the OKF document Synthesis returns is an
+audit artifact, and it must be retrievable without an LLM rephrasing it anywhere on the way
+back. Not all three agents are "connected via A2A" in the same sense:
+
+- **Gateway** exposes no Agent Card of its own. It only ever discovers Core's.
+- **Core** is the one real A2A server in the fleet: it serves an Agent Card and answers
+  `message/send`.
+- **Synthesis** mounts an A2A surface, but that surface only acknowledges an exchange — it does
+  not perform leak checking, release or OKF assembly over A2A. Those happen over the plain HTTP
+  route the Gateway actually calls.
+
+## Human approval, removed
+
+The `DEFAULT_APPROVER` env var and the whole human-approval flow (`POST
+/v1/sessions/{id}/approve`, the `human:<id>` actor it minted) are gone. The public gateway
+authenticates nobody, so a `human:<id>` actor minted from a UI click would name no one — and
+publishing it into `verified` would devalue the OKF `human-reviewed` tier, which is supposed to
+mean an identified person looked at the answer. The `packages/common` OKF library still
+supports the generic trust-tier derivation (any `human:`-prefixed `verified.by` entry yields
+`human-reviewed`), because that derivation is part of the OKF contract itself — this product
+simply never mints a `human:` actor. The UI's review-identity dimension always shows **"review
+identity: none"**.
+
+The UI shows **four separate dimensions**, never a single collapsed badge: policy verdict,
+document status, freshness, and review identity (always `none`). Collapsing them into one badge
+is what previously let "PASS" and "Gemma flagged" appear to agree when they did not; each is
+derived independently and displayed on its own. A blocked request is shown as its own outcome —
+not hidden behind a generic error string.
+
+## Pseudonymization, not anonymization
+
+Nothing this fleet does is anonymization or de-identification. Placeholders are a
+**pseudonym**: `⟦EMAIL_1⟧` discloses that a value exists, its category, and its equality with
+every other `⟦EMAIL_1⟧` in the same document — an attacker who already suspects the underlying
+value can often confirm it from that alone. Beyond that, the masked text still carries
+surviving quasi-identifiers the tokenizer does not touch — employer, location, date, role —
+and that residual context can permit contextual re-identification even though every detected
+identifier was replaced before the prompt left the trust boundary. Treat every masked document
+as pseudonymous, not anonymous.
 
 ## Deploy
 
@@ -307,31 +461,34 @@ uses internal-only ingress; service-to-service calls authenticate with ID tokens
 Every variable below is validated with zod at startup (`packages/common/src/config.ts`); an
 invalid value stops the process rather than failing mid-request.
 
-| Variable                    | Default                     | Purpose                                              |
-| --------------------------- | --------------------------- | ---------------------------------------------------- |
-| `GOOGLE_CLOUD_PROJECT`      | —                           | GCP project for Vertex AI and Firestore              |
-| `GOOGLE_CLOUD_LOCATION`     | `us-central1`               | Vertex AI region                                     |
-| `GOOGLE_GENAI_USE_VERTEXAI` | `1`                         | route the Gemini SDK through Vertex AI               |
-| `GEMINI_MODEL`              | `gemini-3.5-flash`          | Core's model id — **see the note below**             |
-| `GEMMA_BASE_URL`            | `http://localhost:11434/v1` | OpenAI-compatible Gemma endpoint                     |
-| `GEMMA_MODEL`               | `gemma3:12b`                | Gemma model tag                                      |
-| `GEMMA_API_KEY`             | `ollama`                    | placeholder key for the OpenAI-compatible API        |
-| `CORE_BASE_URL`             | `http://localhost:8082`     | Core service base URL (Agent Card resolved under it) |
-| `SYNTHESIS_BASE_URL`        | `http://localhost:8083`     | Synthesis service base URL                           |
-| `A2A_TIMEOUT_SECONDS`       | `120`                       | per-hop timeout                                      |
-| `A2A_PUBLIC_URL`            | —                           | public base URL written into the Agent Card          |
-| `A2A_HOST` / `A2A_PROTOCOL` | `localhost` / `http`        | host and scheme used when no public URL is set       |
-| `VAULT_BACKEND`             | `memory`                    | `memory` or `firestore`                              |
-| `VAULT_COLLECTION`          | `token_vault`               | Firestore collection for the vault                   |
-| `ANSWER_COLLECTION`         | `gateway_answers`           | Firestore collection for OKF answers                 |
-| `VAULT_TTL_SECONDS`         | `3600`                      | vault lifetime; equals each answer's `stale_after`   |
-| `WEB_DIR`                   | `./web/dist`                | built SPA served by the Gateway                      |
-| `PORT`                      | `8081`                      | injected by Cloud Run                                |
-| `LOG_LEVEL`                 | `INFO`                      | structured JSON logs, always PII-masked              |
-| `DEFAULT_APPROVER`          | `kei`                       | approver id used by the UI's approve button          |
-| `OTEL_ENABLED`              | `0`                         | export OpenTelemetry spans (Cloud Trace, or console) |
-| `OTEL_SERVICE_NAME`         | per-agent                   | overrides the service name on spans                  |
-| `VITE_GCP_PROJECT`          | —                           | project id baked into the UI's console links         |
+| Variable                     | Default                     | Purpose                                                                                             |
+| ---------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------- |
+| `GOOGLE_CLOUD_PROJECT`       | —                           | GCP project for Vertex AI and Firestore                                                             |
+| `GOOGLE_CLOUD_LOCATION`      | `us-central1`               | Vertex AI region                                                                                    |
+| `GOOGLE_GENAI_USE_VERTEXAI`  | `1`                         | route the Gemini SDK through Vertex AI                                                              |
+| `GEMINI_MODEL`               | `gemini-3.5-flash`          | Core's model id — **see the note below**                                                            |
+| `GEMMA_BASE_URL`             | `http://localhost:11434/v1` | OpenAI-compatible Gemma endpoint                                                                    |
+| `GEMMA_MODEL`                | `gemma3:12b`                | Gemma model tag                                                                                     |
+| `GEMMA_API_KEY`              | `ollama`                    | placeholder key for the OpenAI-compatible API                                                       |
+| `CORE_BASE_URL`              | `http://localhost:8082`     | Core service base URL (Agent Card resolved under it)                                                |
+| `SYNTHESIS_BASE_URL`         | `http://localhost:8083`     | Synthesis service base URL                                                                          |
+| `A2A_TIMEOUT_SECONDS`        | `120`                       | per-hop timeout                                                                                     |
+| `A2A_PUBLIC_URL`             | —                           | public base URL written into the Agent Card                                                         |
+| `A2A_HOST` / `A2A_PROTOCOL`  | `localhost` / `http`        | host and scheme used when no public URL is set                                                      |
+| `VAULT_BACKEND`              | `memory`                    | `memory` or `firestore`                                                                             |
+| `VAULT_COLLECTION`           | `token_vault`               | Firestore collection for the vault                                                                  |
+| `ANSWER_COLLECTION`          | `gateway_answers`           | Firestore collection for OKF answers                                                                |
+| `VAULT_TTL_SECONDS`          | `3600`                      | vault lifetime; equals each answer's `stale_after`                                                  |
+| `MAX_BODY_BYTES`             | `65536`                     | max request body (was a 10 MB literal; a prompt is prose)                                           |
+| `REQUEST_DEADLINE_SECONDS`   | `60`                        | end-to-end deadline for one `/v1/ask`                                                               |
+| `RATE_LIMIT_PER_MINUTE`      | `20`                        | per-IP quota; `0` disables it                                                                       |
+| `REHYDRATE_ALLOW_CATEGORIES` | unset (withhold all)        | comma-separated categories re-enabled for rehydration — see [Disclosure policy](#disclosure-policy) |
+| `WEB_DIR`                    | `./web/dist`                | built SPA served by the Gateway                                                                     |
+| `PORT`                       | `8081`                      | injected by Cloud Run                                                                               |
+| `LOG_LEVEL`                  | `INFO`                      | structured JSON logs, always PII-masked                                                             |
+| `OTEL_ENABLED`               | `0`                         | export OpenTelemetry spans (Cloud Trace, or console)                                                |
+| `OTEL_SERVICE_NAME`          | per-agent                   | overrides the service name on spans                                                                 |
+| `VITE_GCP_PROJECT`           | —                           | project id baked into the UI's console links                                                        |
 
 > **Note on `GEMINI_MODEL`.** The hackathon requires "Gemini 3.5 or newer". Model id strings
 > change as versions reach GA, and the id is therefore never hard-coded in agent code — it is

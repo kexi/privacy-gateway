@@ -9,9 +9,11 @@ Privacy-preserving multi-agent gateway for the All Things Agentic Hackathon (Dev
 Deadline: **2026-08-31 17:00 PDT**. Category: Fortified Enterprise Fleet.
 Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. Dev setup: `docs/DEVELOPMENT.md`.
 
-- All three agents are **ADK TypeScript** (`@google/adk` 2.x): Gateway (Gemma via `OllamaLlm`) → A2A → Core (Gemini 3.5 on Vertex AI, `gemini-3.5-flash`) → Synthesis (Gemma). A single-file Python client (`clients/python/pgw.py`, PEP 723) demonstrates language-agnostic consumption.
-- Token Vault: Firestore. Core has **no** Firestore access — this is a structural guarantee; never add it.
-- Every final answer is an **OKF v0.2** document (`type: Gateway Answer`). See `skills/okf/`.
+- All three agents are **ADK TypeScript** (`@google/adk` 2.x): Gateway (Gemma via `OllamaLlm`) → **A2A** → Core (Gemini 3.5 on Vertex AI, `gemini-3.5-flash`) → **authenticated HTTP** → Synthesis (Gemma). Only the Gateway → Core hop uses A2A; Synthesis is reached over HTTP on purpose, because the OKF document is an audit artifact and must be retrieved without an LLM rephrasing it. Do not claim the fleet is all-A2A. A single-file Python client (`clients/python/pgw.py`, PEP 723) demonstrates language-agnostic consumption.
+- Token Vault: Firestore, **one entry per request** keyed by a server-generated UUIDv7. There are no sessions and no caller-supplied ids: a caller who can name a vault key can make the fleet resolve someone else's placeholders. Core has **no** Firestore access — enforced by IAM (Core's service account holds no Firestore role), not by the package graph; never grant it.
+- Every final answer is an **OKF v0.2** document (`type: Gateway Answer`) whose body holds the **masked** answer. See `skills/okf/`. `generated.by` is the Synthesis agent, the Core invocation is provenance in `sources[]`, and `verified[].by` is `process:leak-check@<digest>` — never an LLM actor, because TypeScript regex code decides the verdict.
+- The masking is **pseudonymization, not anonymization**: placeholders disclose category and equality, and surviving quasi-identifiers permit contextual re-identification. Say so; do not overclaim.
+- Human review is **out of scope**: the public gateway authenticates nobody, so nothing can name a reviewer. Never mint a `human:` OKF actor in this product.
 - Google Cloud project: `all-thinkgs`, region `us-central1` (Cloud Run GPU availability).
 
 ## Language policy
@@ -24,7 +26,8 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 ## Writing conventions
 
 - Code explains **How**. Tests state **What** is guaranteed. Commit messages give **Why**. Code comments give **Why not** (alternatives rejected).
-- Never log or persist raw PII. Log only masked text (`⟦TYPE_N⟧` placeholders) and hashes.
+- Never log or persist raw PII. Persist only masked artifacts keyed by `request_id`; the rehydrated answer is returned in one API response and never stored.
+- **Fail closed.** Every safety gate that cannot produce a trustworthy result refuses the request rather than degrading. There is deliberately no path that sends or releases "anyway" — see `docs/ARCHITECTURE.md` for the gate list and status codes.
 
 ## Toolchain
 
@@ -55,8 +58,8 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 ## Runtime conventions
 
 - **zod at every boundary**: HTTP request/response, A2A payloads, LLM JSON outputs, env config (fail fast at startup), OKF frontmatter. Shared schemas live in `packages/common`; `web` derives its types from them.
-- **Structured logs**: one JSON object per line, Cloud Logging compatible (`severity`, `message`, `time`, `event`, `agent`, `request_id`, `session_id`, `duration_ms`, `logging.googleapis.com/trace`, `logging.googleapis.com/spanId`). Never log raw PII.
-- **Request ID propagation**: `X-Request-ID` (UUIDv7 if absent) flows Gateway → Core → Synthesis via headers and A2A metadata, is echoed in responses, and is stored in the OKF `Gateway Answer` as `request_id` / `trace_id`.
+- **Structured logs**: one JSON object per line, Cloud Logging compatible (`severity`, `message`, `time`, `event`, `agent`, `request_id`, `duration_ms`, `logging.googleapis.com/trace`, `logging.googleapis.com/spanId`). Fields pass a **typed allowlist** in `packages/common/src/logging.ts` — an unlisted field is dropped, not masked, and its key name is recorded under `dropped_fields`. Adding a log field means adding it to that allowlist. Never log an exception message: `error_class` and `error_code` only, in logs and in spans alike.
+- **Request ID propagation**: the Gateway mints a UUIDv7 per request and **never adopts the inbound `X-Request-ID`** — the id is the vault key. It flows Gateway → Core → Synthesis via headers and A2A metadata, is echoed in responses, and is stored in the OKF `Gateway Answer` as `request_id` / `trace_id`.
 - **Distributed tracing**: OpenTelemetry with W3C `traceparent` propagated across every hop; one request = one Cloud Trace trace with parent/child spans per agent step. Logs carry `trace_id`/`span_id` so Cloud Logging and Cloud Trace cross-link. Span attributes never contain PII values. See `docs/OBSERVABILITY.md`.
 
 ## Skills

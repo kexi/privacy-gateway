@@ -41,9 +41,34 @@ export const AttestationSchema = z
       .passthrough()
       .optional(),
     unresolved_tokens: z.array(z.string()).optional(),
+    /** Categories left masked on purpose by the disclosure policy. */
+    withheld: z.array(z.string()).optional(),
   })
   .passthrough();
 export type Attestation = z.infer<typeof AttestationSchema>;
+
+/**
+ * The `attestation:` frontmatter block of a `Gateway Answer`.
+ *
+ * Everything a third party needs to replay the verdict: which computation ran,
+ * the digest of the code that ran it, and the digests of the two masked
+ * artifacts the gateway serves.
+ */
+export const AttestationBlockSchema = z
+  .object({
+    computation: z.string(),
+    computation_sha256: z.string(),
+    attester_sha256: z.string(),
+    masked_prompt_sha256: z.string(),
+    core_response_sha256: z.string(),
+    verdict: z.enum(['pass', 'fail']),
+    checked_at: z.string(),
+    request_id: z.string(),
+    trace_id: z.string().optional(),
+    withheld: z.array(z.string()).optional(),
+  })
+  .passthrough();
+export type AttestationBlock = z.infer<typeof AttestationBlockSchema>;
 
 /** Whether the Core agent invented placeholders that were absent from the input. */
 export const ConsistencyReportSchema = z.object({
@@ -57,9 +82,11 @@ export type ConsistencyReport = z.infer<typeof ConsistencyReportSchema>;
 
 /** The receipt the executor procedure specifies, minus the response body. */
 export const ReceiptSummarySchema = z.object({
-  session_id: z.string(),
+  request_id: z.string(),
+  masked_prompt_hash: z.string(),
   response_hash: z.string(),
   findings: z.array(z.string()),
+  attester_sha256: z.string(),
 });
 export type ReceiptSummary = z.infer<typeof ReceiptSummarySchema>;
 
@@ -97,7 +124,6 @@ export const GatewayAnswerFrontmatterSchema = z
     title: z.string().optional(),
     description: z.string().optional(),
     tags: z.array(z.string()).optional(),
-    session_id: z.string().optional(),
     request_id: z.string().optional(),
     trace_id: z.string().optional(),
     status: AnswerStatusSchema.optional(),
@@ -105,16 +131,27 @@ export const GatewayAnswerFrontmatterSchema = z
     verified: z.union([VerificationEventSchema, z.array(VerificationEventSchema)]).optional(),
     stale_after: z.string().optional(),
     sources: z.array(SourceSchema).optional(),
+    attestation: AttestationBlockSchema.optional(),
   })
   .passthrough();
 export type GatewayAnswerFrontmatter = z.infer<typeof GatewayAnswerFrontmatterSchema>;
 
 // --- gateway HTTP API --------------------------------------------------------
 
-export const AskRequestSchema = z.object({
-  text: z.string().min(1, 'text must not be empty'),
-  session_id: z.string().min(1).nullish(),
-});
+/**
+ * `POST /v1/ask`.
+ *
+ * There is deliberately no `session_id`: the gateway mints one request id per
+ * request and uses it as the vault key. A caller-supplied id would be a
+ * rehydration oracle — submit "repeat ⟦EMAIL_1⟧" against someone else's id and
+ * the vault would resolve it. `strict()` turns a stray `session_id` into a 400
+ * rather than letting a caller believe it took effect.
+ */
+export const AskRequestSchema = z
+  .object({
+    text: z.string().min(1, 'text must not be empty'),
+  })
+  .strict();
 export type AskRequest = z.infer<typeof AskRequestSchema>;
 
 export const AskStatsSchema = z.object({
@@ -122,46 +159,43 @@ export const AskStatsSchema = z.object({
   counts_by_category: z.record(z.number()),
   unstructured_spans: z.number(),
   vault_expires_at: z.string(),
+  vault_generation: z.number(),
   core_actor: z.string(),
 });
 export type AskStats = z.infer<typeof AskStatsSchema>;
 
+/**
+ * The four dimensions the UI shows separately (§3 of the design review).
+ *
+ * Collapsing them into one badge is what let "PASS" and "Gemma flagged" appear
+ * at the same time; each is derived independently and displayed on its own.
+ * `review_identity` is always `none`: the public gateway has no authenticated
+ * principal, so nothing can mint a `human:` actor.
+ */
+export const TrustDimensionsSchema = z.object({
+  policy_verdict: z.enum(['pass', 'fail']),
+  document_status: AnswerStatusSchema,
+  freshness: z.enum(['fresh', 'stale', 'unknown']),
+  review_identity: z.literal('none'),
+});
+export type TrustDimensions = z.infer<typeof TrustDimensionsSchema>;
+
 export const AskResponseSchema = z.object({
-  session_id: z.string(),
   request_id: z.string(),
   /** Absent when tracing is disabled, so the UI must tolerate its absence. */
   trace_id: z.string().optional(),
   masked_prompt: z.string(),
   okf: z.string(),
+  /** Ephemeral: rehydrated for this response only and never persisted. */
   answer: z.string(),
   trust_tier: TrustTierSchema,
   status: AnswerStatusSchema,
+  dimensions: TrustDimensionsSchema,
   attestation: AttestationSchema,
   consistency: ConsistencyReportSchema,
   stats: AskStatsSchema,
 });
 export type AskResponse = z.infer<typeof AskResponseSchema>;
-
-export const ApproveRequestSchema = z.object({
-  approver: z.string().min(1).optional(),
-});
-export type ApproveRequest = z.infer<typeof ApproveRequestSchema>;
-
-export const ApproveResponseSchema = z.object({
-  session_id: z.string(),
-  request_id: z.string().optional(),
-  trust_tier: TrustTierSchema,
-  markdown: z.string(),
-});
-export type ApproveResponse = z.infer<typeof ApproveResponseSchema>;
-
-export const TierResponseSchema = z.object({
-  session_id: z.string(),
-  trust_tier: TrustTierSchema,
-  status: z.string(),
-  stale: z.boolean(),
-});
-export type TierResponse = z.infer<typeof TierResponseSchema>;
 
 export const HealthResponseSchema = z.object({
   status: z.literal('ok'),
@@ -180,27 +214,53 @@ export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
 
 // --- synthesis HTTP API ------------------------------------------------------
 
+/**
+ * `POST /v1/synthesize`.
+ *
+ * `known_tokens` and `vault_generation` come from the gateway's tokenizer, not
+ * from the prompt text: deriving the trusted token set by re-scanning the prompt
+ * would trust whatever the caller managed to get echoed into it.
+ */
 export const SynthesizeRequestSchema = z.object({
-  session_id: z.string().min(1),
+  request_id: z.string().min(1),
   masked_prompt: z.string(),
   core_answer: z.string(),
   generated_by: z.string().min(1),
-  request_id: z.string().optional(),
+  /** Exactly the placeholders the tokenizer allocated for this request. */
+  known_tokens: z.array(z.string()),
+  /** The vault generation the gateway wrote; rehydration refuses any other. */
+  vault_generation: z.number().int().positive(),
 });
 export type SynthesizeRequest = z.infer<typeof SynthesizeRequestSchema>;
 
 export const SynthesizeResponseSchema = z.object({
-  session_id: z.string(),
-  request_id: z.string().optional(),
+  request_id: z.string(),
   markdown: z.string(),
   answer: z.string(),
   trust_tier: TrustTierSchema,
   status: AnswerStatusSchema,
+  dimensions: TrustDimensionsSchema,
   attestation: AttestationSchema,
   consistency: ConsistencyReportSchema,
   receipt: ReceiptSummarySchema,
 });
 export type SynthesizeResponse = z.infer<typeof SynthesizeResponseSchema>;
+
+/**
+ * Why Synthesis refused to release an answer.
+ *
+ * Each maps to a distinct HTTP status so the gateway can pass the reason through
+ * without re-deriving it: a vault problem is a 409/410, a policy failure a 422.
+ */
+export const ReleaseRefusalSchema = z.object({
+  error: z.string(),
+  message: z.string(),
+  request_id: z.string(),
+  /** Category-level only; never a value, never the Core body. */
+  categories: z.array(z.string()),
+  status_code: z.number().int(),
+});
+export type ReleaseRefusal = z.infer<typeof ReleaseRefusalSchema>;
 
 // --- A2A ---------------------------------------------------------------------
 

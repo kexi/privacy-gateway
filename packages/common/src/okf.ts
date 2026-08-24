@@ -93,19 +93,27 @@ export function dump(document: OkfDocument): string {
   return `---\n${front}\n---\n\n${body}\n`;
 }
 
-/** Normalize `verified`. A bare mapping is treated as a one-element list (§5.2). */
+/**
+ * Normalize `verified`, keeping only entries that carry a usable actor.
+ *
+ * §11 says a malformed field must not make the document unreadable, so the raw
+ * value stays in `metadata` untouched; what this returns is the subset the trust
+ * derivation is allowed to count. An entry without a string `by` names nobody,
+ * and counting it would let `verified: [{}]` claim machine confirmation.
+ */
 function verifiedEntries(metadata: OkfMetadata): VerificationEvent[] {
   const verified = metadata['verified'];
   if (verified === undefined || verified === null) return [];
 
-  if (Array.isArray(verified)) {
-    return verified.filter(
-      (entry): entry is VerificationEvent =>
-        entry !== null && typeof entry === 'object' && !Array.isArray(entry),
-    );
-  }
-  if (typeof verified === 'object') return [verified as VerificationEvent];
-  return [];
+  const candidates: unknown[] = Array.isArray(verified) ? verified : [verified];
+  return candidates.filter(
+    (entry): entry is VerificationEvent =>
+      entry !== null &&
+      typeof entry === 'object' &&
+      !Array.isArray(entry) &&
+      typeof (entry as { by?: unknown }).by === 'string' &&
+      (entry as { by: string }).by.trim() !== '',
+  );
 }
 
 /** Derive the §5.3 trust tier. The score is never stored; it is always derived here. */
@@ -113,17 +121,37 @@ export function trustTier(metadata: OkfMetadata): TrustTier {
   const entries = verifiedEntries(metadata);
   if (entries.length === 0) return TRUST_UNVERIFIED;
 
-  const hasHuman = entries.some(
-    (entry) => typeof entry.by === 'string' && entry.by.startsWith('human:'),
-  );
+  const hasHuman = entries.some((entry) => entry.by.startsWith('human:'));
   return hasHuman ? TRUST_HUMAN_REVIEWED : TRUST_MACHINE_CONFIRMED;
 }
 
-/** Stale when `now >= stale_after` (§5.5). Without `stale_after` it is never stale. */
+/** How fresh a document is, with "cannot tell" kept distinct from "fresh". */
+export type Freshness = 'fresh' | 'stale' | 'unknown';
+
+/**
+ * Derive freshness from `stale_after` (§5.5).
+ *
+ * An absent or unparseable value yields `unknown`, never `fresh`: a document
+ * whose expiry cannot be read is exactly the one whose freshness must not be
+ * asserted.
+ */
+export function freshness(metadata: OkfMetadata, now: Date = new Date()): Freshness {
+  const raw = metadata['stale_after'];
+  if (raw === undefined || raw === null) return 'unknown';
+
+  const staleAfter = parseDate(raw);
+  if (staleAfter === null) return 'unknown';
+  return now.getTime() >= staleAfter.getTime() ? 'stale' : 'fresh';
+}
+
+/**
+ * Stale when `now >= stale_after` (§5.5).
+ *
+ * `unknown` counts as stale here, so a caller that only asks the yes/no question
+ * fails closed; a caller that needs the distinction calls `freshness`.
+ */
 export function isStale(metadata: OkfMetadata, now: Date = new Date()): boolean {
-  const staleAfter = parseDate(metadata['stale_after']);
-  if (staleAfter === null) return false;
-  return now.getTime() >= staleAfter.getTime();
+  return freshness(metadata, now) !== 'fresh';
 }
 
 function parseDate(value: unknown): Date | null {
@@ -160,50 +188,85 @@ export interface AttestationLike {
   readonly [key: string]: unknown;
 }
 
+/** The replayable evidence written into the `attestation:` block. */
+export interface AttestationEvidence {
+  readonly computation: string;
+  readonly computationSha256: string;
+  readonly attesterSha256: string;
+  readonly maskedPromptSha256: string;
+  readonly coreResponseSha256: string;
+  readonly checkedAt: Date;
+  /** Categories the disclosure policy kept masked in the released answer. */
+  readonly withheld?: readonly string[] | undefined;
+}
+
 export interface BuildGatewayAnswerOptions {
-  readonly sessionId: string;
-  readonly answerBody: string;
+  readonly requestId: string;
+  /**
+   * The **masked** answer body.
+   *
+   * The rehydrated text is returned to the caller ephemerally and never reaches
+   * this function: a stored document containing real values would be exactly the
+   * indefinite PII persistence the design forbids.
+   */
+  readonly maskedAnswerBody: string;
+  /** The Core model actor, recorded as the author of the response *source*. */
+  readonly coreActor: string;
+  /** The document generator: this fleet's Synthesis agent, which assembled it. */
   readonly generatedBy: string;
+  /** The actor that decided the verdict; a `process:` id, never an LLM. */
   readonly verifiedBy?: string | undefined;
   readonly staleAfter: Date;
   readonly attestation: AttestationLike;
-  readonly maskedPromptResource?: string | undefined;
+  readonly evidence: AttestationEvidence;
   readonly title?: string | undefined;
   readonly generatedAt?: Date | undefined;
-  /** Correlation ids, stored as top-level extension keys for log/trace lookup. */
-  readonly requestId?: string | undefined;
   readonly traceId?: string | undefined;
 }
 
 /**
  * Assemble the Synthesis Agent final output (`type: Gateway Answer`).
  *
- * When the leak check passes, the Synthesis actor is added to `verified` so the
- * document becomes machine-confirmed. When it fails, the document is marked
- * `status: draft` and the failure reason is kept in the `# Attestation` section
- * of the body (§10.5: a failed attestation must not be silently dropped).
+ * `generated.by` names Synthesis: Core supplies tokenized prose, but this fleet
+ * assembles the concept, and §7 attributes a document to whoever wrote it. The
+ * Core invocation appears as provenance instead — a `core-response` source
+ * authored by the Core model — so the reader can see both without either being
+ * misattributed.
+ *
+ * When the leak check passes, the deterministic attester is added to `verified`
+ * so the document becomes machine-confirmed. When it fails, the document is
+ * marked `status: draft`, `verified` is omitted, and the failure is kept in the
+ * `# Attestation` section (§10.5: a failed attestation must not be dropped).
  */
 export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocument {
   const passed = options.attestation.ok === true;
-  const maskedResource =
-    options.maskedPromptResource ?? `/sessions/${options.sessionId}/masked-prompt.md`;
   const generatedAt = options.generatedAt ?? new Date();
+  const { requestId, evidence } = options;
 
   const metadata: OkfMetadata = {
     type: GATEWAY_ANSWER_TYPE,
-    title: options.title ?? `Gateway answer for session ${options.sessionId}`,
-    description: 'Rehydrated answer produced by the privacy-preserving gateway fleet.',
+    title: options.title ?? `Gateway answer for request ${requestId}`,
+    description:
+      'Masked evidence for one gateway exchange. The rehydrated answer is returned to the ' +
+      'caller in the response body only and is not stored here.',
     tags: ['gateway', 'pii', 'attested'],
-    session_id: options.sessionId,
+    request_id: requestId,
     status: passed ? 'stable' : 'draft',
     generated: { by: options.generatedBy, at: nowIso(generatedAt) },
     stale_after: nowIso(options.staleAfter),
     sources: [
       {
         id: 'masked-prompt',
-        resource: maskedResource,
+        resource: `/requests/${requestId}/masked-prompt.md`,
         title: 'Masked prompt sent to the core agent',
         author: 'gateway_agent/tokenizer',
+        last_modified: nowIso(generatedAt),
+      },
+      {
+        id: 'core-response',
+        resource: `/requests/${requestId}/core-response.md`,
+        title: 'Tokenized response returned by the core agent',
+        author: options.coreActor,
         last_modified: nowIso(generatedAt),
       },
       {
@@ -213,16 +276,29 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
         author: 'human:kei',
       },
     ],
+    attestation: {
+      computation: evidence.computation,
+      computation_sha256: evidence.computationSha256,
+      attester_sha256: evidence.attesterSha256,
+      masked_prompt_sha256: evidence.maskedPromptSha256,
+      core_response_sha256: evidence.coreResponseSha256,
+      verdict: passed ? 'pass' : 'fail',
+      checked_at: nowIso(evidence.checkedAt),
+      request_id: requestId,
+      ...(options.traceId !== undefined ? { trace_id: options.traceId } : {}),
+      ...(evidence.withheld !== undefined && evidence.withheld.length > 0
+        ? { withheld: [...evidence.withheld] }
+        : {}),
+    },
   };
 
-  // Correlation ids are extension keys rather than sources: they identify the
-  // execution that produced this document, not a body of knowledge it drew on.
-  if (options.requestId !== undefined) metadata['request_id'] = options.requestId;
+  // The trace id is also a top-level extension key so a log query can find the
+  // document without parsing the attestation block.
   if (options.traceId !== undefined) metadata['trace_id'] = options.traceId;
 
   // Omitting verified on failure is what drops the trust tier to unverified.
   if (passed && options.verifiedBy !== undefined) {
-    metadata['verified'] = [{ by: options.verifiedBy, at: nowIso() }];
+    metadata['verified'] = [{ by: options.verifiedBy, at: nowIso(evidence.checkedAt) }];
   }
 
   const findings = options.attestation.findings ?? [];
@@ -231,26 +307,42 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
     findings.length > 0
       ? findings.map((finding) => `- \`${finding}\``).join('\n')
       : '- (no findings)';
+  const withheldBlock =
+    evidence.withheld !== undefined && evidence.withheld.length > 0
+      ? `\nThe disclosure policy kept these categories masked in the released answer: ` +
+        `${evidence.withheld.map((category) => `\`${category}\``).join(', ')}.\n`
+      : '';
 
-  const content = `# Answer
+  const content = `# Answer (masked)
 
-${options.answerBody.trim()}
+${options.maskedAnswerBody.trim()}
 
+The rehydrated form of this answer was returned to the caller in the API response and is
+deliberately not stored. Only the masked text above, the hashes below, and the category
+counts are retained.
+${withheldBlock}
 # Attestation
 
-Leak check ${verdictLine}. The deterministic attester
-([leak-check computation](/computations/leak-check.md)) inspected the receipt for
-session \`${options.sessionId}\`.
+Leak-policy check ${verdictLine}. It confirms only that the core agent's tokenized
+response carried no raw identifier of its own; it is not a factual validation of the
+answer. The verdict was decided by the deterministic attester named in
+\`attestation.attester_sha256\`, following
+[the leak-check computation](/computations/leak-check.md), over the masked prompt and
+core response whose digests are recorded in the \`attestation\` block.
 
 Findings:
 
 ${findingsBlock}
 
+Replay it with \`just verify-answer ${requestId}\`.
+
 The answer was produced from a masked prompt in which every detected identifier was
-replaced by an opaque placeholder before it left the trust boundary.[^masked-prompt]
-Masking follows the repository PII masking policy.[^pii-policy]
+replaced by an opaque placeholder before it left the trust boundary.[^masked-prompt] The
+core agent's tokenized response is the input the check ran over.[^core-response] Masking
+follows the repository PII masking policy.[^pii-policy]
 
 [^masked-prompt]: Masked prompt sent to the core agent
+[^core-response]: Tokenized response returned by the core agent
 [^pii-policy]: PII masking policy
 `;
 

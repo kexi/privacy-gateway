@@ -109,12 +109,21 @@ resource "google_cloud_run_v2_service" "agents" {
   location = var.region
   name     = each.key
 
-  # Ingress stays open on all three. Core and Synthesis are private by IAM (no
-  # allUsers invoker), not by ingress; the Gateway needs public ingress because
-  # it is the entry point. Why not internal-and-cloud-load-balancing on
-  # Core/Synthesis: there is no load balancer in front of them, so it would only
-  # add a failure mode without changing who can actually invoke them.
-  ingress = "INGRESS_TRAFFIC_ALL"
+  # The Gateway is the public entry point and must accept internet traffic.
+  # Core and Synthesis are only ever called by the Gateway, which now routes all
+  # of its egress through the VPC (see below), so they can be closed to the
+  # internet as well as protected by IAM. Defence in depth: IAM already denies
+  # an unauthenticated caller, and internal ingress means such a caller cannot
+  # even reach the service to be denied.
+  #
+  # This is the same rule gemma-serving follows, and it holds for the same
+  # reason: caller egress = ALL_TRAFFIC plus Private Google Access on the
+  # subnet (network.tf) is what makes a run.app request count as internal.
+  #
+  # Why not internal-and-cloud-load-balancing: there is no load balancer in
+  # front of these services, so that mode would reject the very traffic it is
+  # meant to admit.
+  ingress = each.value.ingress
 
   deletion_protection = false
 
@@ -129,23 +138,32 @@ resource "google_cloud_run_v2_service" "agents" {
     max_instance_request_concurrency = 40
     timeout                          = "300s"
 
-    # Direct VPC egress, for the callers of internal-ingress gemma-serving.
-    # Cloud Run's default egress does not traverse a VPC, so without this a
-    # Cloud Run -> internal-ingress Cloud Run call is rejected with 403.
-    # PRIVATE_RANGES_ONLY keeps external destinations (Vertex AI, Firestore) on
-    # the normal path.
+    # Direct VPC egress, for every caller of an internal-ingress service.
+    #
+    # ALL_TRAFFIC, not PRIVATE_RANGES_ONLY. The callees are addressed by their
+    # public run.app URLs, and Cloud Run only honours internal ingress when the
+    # request actually traversed the VPC. PRIVATE_RANGES_ONLY routes just
+    # RFC1918 destinations through the network, so a run.app address took the
+    # ordinary internet path and was rejected with 403 — see the reasoning
+    # block in network.tf, which also enables Private Google Access on the
+    # subnet this attaches to. The two settings only work as a pair.
+    #
     # Why not a Serverless VPC Access connector: it bills a connector VM around
     # the clock and takes minutes to provision. Direct VPC egress needs no extra
-    # resources.
+    # resources beyond the subnet.
+    #
+    # Cost note: ALL_TRAFFIC also sends Vertex AI and Firestore traffic through
+    # the VPC. Private Google Access keeps that on Google's internal network
+    # rather than pushing it out through a NAT, so no Cloud NAT is required.
     dynamic "vpc_access" {
       for_each = each.value.vpc_egress ? [1] : []
 
       content {
-        egress = "PRIVATE_RANGES_ONLY"
+        egress = "ALL_TRAFFIC"
 
         network_interfaces {
           network    = var.vpc_network
-          subnetwork = var.vpc_subnet
+          subnetwork = google_compute_subnetwork.fleet.name
         }
       }
     }

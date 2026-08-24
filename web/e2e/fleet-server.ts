@@ -4,11 +4,12 @@
  * Gateway and Synthesis are the real implementations against an in-memory vault;
  * only Core (over A2A) and Gemma (over the OpenAI-compatible API) are mocked, at
  * the fetch layer — the same seam the vitest E2E uses. Everything the UI
- * exercises, from masking through attestation to approval, is therefore the
- * production code path.
+ * exercises, from masking through attestation to a refused release, is therefore
+ * the production code path.
  *
- * The Core behaviour is selected per session id, so one server can serve the
- * clean, leaking and inventing scenarios without a restart.
+ * The Core behaviour is selected by a marker in the prompt text rather than by a
+ * session id: sessions no longer exist, so a spec picks its scenario by what it
+ * types into the textarea.
  */
 
 import { createApp as createGatewayApp } from '@privacy-gateway/gateway/server';
@@ -22,15 +23,20 @@ const SYNTHESIS_PORT = Number(process.env['E2E_SYNTHESIS_PORT'] ?? 8183);
 const SYNTHESIS_URL = `http://127.0.0.1:${SYNTHESIS_PORT}`;
 
 /**
- * Sessions whose id carries a marker get the matching misbehaving Core, so a
- * test picks its scenario purely by choosing a session id.
+ * Markers a spec can put in its request text to select a misbehaving Core.
+ *
+ * They survive masking (they carry no PII), so the mock can read them out of the
+ * masked prompt it receives.
  */
-function coreReply(prompt: string, sessionId: string): string {
-  if (sessionId.includes('leak')) {
+const LEAK_MARKER = 'SCENARIO-LEAK';
+const INVENT_MARKER = 'SCENARIO-INVENT';
+
+function coreReply(prompt: string): string {
+  if (prompt.includes(LEAK_MARKER)) {
     // A Core that emits a raw address of its own, as if from training data.
     return 'Contact them directly at leaked.person@example.com.';
   }
-  if (sessionId.includes('invent')) {
+  if (prompt.includes(INVENT_MARKER)) {
     return 'See ⟦PERSON_99⟧ for details.';
   }
 
@@ -52,7 +58,9 @@ function config(overrides: Record<string, string> = {}) {
       CORE_BASE_URL,
       GEMINI_MODEL: 'gemini-3.5-flash',
       GEMMA_MODEL: 'gemma3:12b',
-      DEFAULT_APPROVER: 'kei',
+      // Playwright fires several requests from one address in quick succession;
+      // the limiter is exercised by the vitest suite instead.
+      RATE_LIMIT_PER_MINUTE: '0',
       WEB_DIR: new URL('../dist', import.meta.url).pathname,
       ...overrides,
     },
@@ -73,10 +81,9 @@ function fleetFetch(): typeof fetch {
     if (url.origin === CORE_BASE_URL && url.pathname === '/jsonrpc') {
       const body = JSON.parse(String(init?.body)) as {
         id: string;
-        params: { message: { parts: Array<{ text?: string }>; contextId?: string } };
+        params: { message: { parts: Array<{ text?: string }> } };
       };
       const prompt = body.params.message.parts.map((part) => part.text ?? '').join('');
-      const sessionId = body.params.message.contextId ?? '';
 
       return Promise.resolve(
         Response.json({
@@ -84,7 +91,7 @@ function fleetFetch(): typeof fetch {
           id: body.id,
           result: {
             role: 'agent',
-            parts: [{ kind: 'text', text: coreReply(prompt, sessionId) }],
+            parts: [{ kind: 'text', text: coreReply(prompt) }],
             messageId: 'reply-1',
           },
         }),

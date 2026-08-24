@@ -10,43 +10,123 @@ outside their trust boundary. This system lets a commercial LLM reason over
 _tokenized_ data while an open model (Gemma) that never leaves the boundary owns the
 sensitive mapping.
 
-## 2. Agents (all Google ADK, connected via A2A)
+## 2. Agents
 
-| Agent               | Model                  | Runtime            | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------- | ---------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Gateway Agent**   | Gemma 3 (self-hosted)  | Cloud Run          | ADK TypeScript. Receives user request. Detects PII/secrets (hybrid: deterministic regex + Gemma span extraction), replaces with stable tokens `⟦PERSON_1⟧`, `⟦EMAIL_1⟧`, `⟦SECRET_1⟧`. Stores mapping in **Token Vault** (Firestore, per-session, TTL). Forwards _masked_ prompt to Core via A2A. Serves the demo UI and the HTTP API from one origin.                                                                                                           |
-| **Core Agent**      | Gemini 3.5 (Vertex AI) | Cloud Run          | Pure reasoning / planning / code generation over masked input. ADK TypeScript (`@google/adk`), served via `toA2a`; Agent Card at `/.well-known/agent-card.json`, RPC at `/jsonrpc` and `/rest`. Model id from `GEMINI_MODEL` (default `gemini-3.5-flash`, verified on Vertex AI). An inbound guard rejects any payload still containing raw PII. Has **no** vault dependency — not by convention but because the package depends on nothing that could reach it. |
-| **Synthesis Agent** | Gemma 3 (self-hosted)  | Cloud Run          | ADK TypeScript, exposed via `toA2a` and over HTTP. Receives Core's output. (a) **Leak check**: verifies the response contains no raw PII (regex + Gemma judge). (b) **Rehydration**: maps tokens back using the vault. (c) **Consistency check**: deterministically verifies that Core invented no placeholder absent from the prompt. Produces the final answer + audit record.                                                                                 |
-| **Gemma Serving**   | gemma3 via Ollama      | Cloud Run (GPU L4) | OpenAI-compatible endpoint consumed by Gateway/Synthesis through `OllamaLlm`, an ADK `BaseLlm` adapter registered for `ollama/*` model names. Ingress: internal only.                                                                                                                                                                                                                                                                                            |
+Only Gateway → Core uses A2A. Gateway → Synthesis is plain authenticated HTTP,
+deliberately: the OKF document is an audit artifact and must be retrieved without an
+LLM rephrasing it along the way. The Gateway exposes no Agent Card of its own and
+discovers only Core by card. Synthesis's A2A surface merely acknowledges a gateway
+exchange — its card says so explicitly — while the verification/release pipeline that
+actually gates a release runs on its HTTP routes.
+
+| Agent               | Model                  | Runtime            | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------- | ---------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Gateway Agent**   | Gemma 3 (self-hosted)  | Cloud Run          | ADK TypeScript. Receives the user request (`{text}` only) and mints one server-generated `request_id` (UUIDv7) that also serves as the Token Vault key. Detects PII/secrets (hybrid: deterministic regex + Gemma span extraction), replaces with stable tokens `⟦PERSON_1⟧`, `⟦EMAIL_1⟧`, `⟦SECRET_1⟧`. Stores the mapping in the **Token Vault** (Firestore, per-request, TTL). Forwards the _masked_ prompt to Core via A2A; reaches Synthesis over plain HTTP. Serves the demo UI and the HTTP API from one origin.                                                           |
+| **Core Agent**      | Gemini 3.5 (Vertex AI) | Cloud Run          | Pure reasoning / planning / code generation over masked input. ADK TypeScript (`@google/adk`), served via `toA2a`; Agent Card at `/.well-known/agent-card.json`, RPC at `/jsonrpc` and `/rest`. Model id from `GEMINI_MODEL` (default `gemini-3.5-flash`, verified on Vertex AI). An inbound guard rejects any payload still containing raw PII. Has **no** vault dependency — its package installs the whole `@privacy-gateway/common` package, so it is IAM (Core's service account has no Firestore role), not the dependency graph, that is the actual structural guarantee. |
+| **Synthesis Agent** | Gemma 3 (self-hosted)  | Cloud Run          | ADK TypeScript, exposed via `toA2a` (acknowledgement only) and over HTTP (the real pipeline). Receives Core's output. (a) **Leak check**: a deterministic regex re-scan of the masked response, plus an advisory Gemma judge. (b) **Consistency check**: deterministically verifies Core invented no placeholder absent from the prompt. (c) **Rehydration**: restores tokens from the vault, applying the disclosure policy. Assembles the OKF document; only masked artifacts are ever persisted.                                                                              |
+| **Gemma Serving**   | gemma3 via Ollama      | Cloud Run (GPU L4) | OpenAI-compatible endpoint consumed by Gateway/Synthesis through `OllamaLlm`, an ADK `BaseLlm` adapter registered for `ollama/*` model names. Ingress: internal only.                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 Trust boundary: `Gateway`, `Synthesis`, `Gemma Serving`, `Firestore` are **inside**.
-Only masked text crosses to `Core` (and therefore to Gemini). This is enforced
-structurally: Core's service account has no Firestore role, and A2A messages to Core
-are validated by a PII scanner before egress (defense in depth).
+Only masked text crosses to `Core` (and therefore to Gemini). Core's service account
+has no Firestore role — that IAM fact is what actually keeps Core off the vault, since
+Core's package installs the whole `@privacy-gateway/common` package and the dependency
+graph alone does not enforce anything. A2A messages to Core are additionally validated
+by a PII scanner before egress (defense in depth).
+
+### Sessions are gone
+
+There is no caller-supplied session and no multi-turn state. One HTTP request gets
+exactly one server-generated `request_id` (UUIDv7), minted by the Gateway and used as
+the Token Vault key. `POST /v1/ask` accepts only `{text}`; a body carrying `session_id`
+is rejected with 400. An inbound `X-Request-ID` header is echoed back to the caller for
+correlation but is **never adopted** as the vault key — a caller who could choose that
+id could name another request's mapping and resolve its placeholders. There is
+consequently no placeholder stability across requests.
+
+### Human approval is out of scope
+
+There is no approval step and no `human:` OKF actor anywhere in this system. The public
+gateway authenticates nobody, so nothing can name a reviewer; an unauthenticated
+`human:<id>` actor would make the OKF human-reviewed trust tier meaningless, since
+anyone could claim any identity. The OKF trust-tier derivation itself stays generic in
+`packages/common` — other consumers of the library do have authenticated reviewers —
+this product simply never mints a `human:` actor. The UI always shows review identity
+as "none".
 
 ## 3. Flow
 
 ```
 User ──HTTP──▶ Gateway (Gemma)
-                 │ 1. detect + tokenize  ──▶ Firestore Token Vault (session_id → {token: value})
-                 │ 2. masked prompt
+                 │ 0. reject ⟦…⟧ reserved syntax          (400 reserved_syntax)
+                 │ 1. detect + tokenize  ──▶ Firestore Token Vault (request_id → {token: value})
+                 │ 2. egress guard re-scan                (422 outbound_guard_refused)
                  ▼ A2A
                Core (Gemini 3.5)  — reasoning/planning/codegen on tokens
                  │ masked answer
-                 ▼ A2A
+                 ▼ HTTP (authenticated)
                Synthesis (Gemma)
-                 │ 3. leak check  4. rehydrate from vault  5. consistency verify
+                 │ 3. vault lookup + generation check      (409/410)
+                 │ 4. consistency check                    (409 invented_token)
+                 │ 5. leak check                           (422 leak_check_failed)
+                 │ 6. Gemma judge (advisory, asymmetric)    (422 judge_flagged / judge_unavailable)
+                 │ 7. rehydrate with disclosure policy      (409 unresolved_token)
                  ▼
-               User  (final answer + audit trail: what was masked, what was verified)
+               User  (final answer + OKF evidence document: what was masked, what was verified)
 ```
+
+Unstructured span extraction (Gemma, inside the Gateway hop) also fails closed: a
+transport failure or an uninterpretable response is `502 extraction_unavailable` and
+Core is never called, because the regexes alone cannot see a personal name or an
+address.
+
+### Everything fails closed
+
+Every gate below stops the pipeline on failure: no rehydrated answer is returned, and
+only masked artifacts are persisted (`status: draft`, `verified` omitted).
+
+| Gate                                                              | Outcome                                                                                |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Reserved `⟦…⟧` syntax in raw input                                | `400 reserved_syntax` (before masking, before the vault)                               |
+| Gemma span extraction (`valid-empty` / `valid-spans` / `invalid`) | `invalid` or a transport failure → `502 extraction_unavailable`; Core is never reached |
+| Egress guard finds raw PII in the masked prompt                   | `422 outbound_guard_refused`                                                           |
+| Vault mapping missing                                             | `409 vault_missing`                                                                    |
+| Vault mapping expired                                             | `410 vault_expired`                                                                    |
+| Vault generation mismatch                                         | `409 vault_generation_mismatch`                                                        |
+| Core invented a placeholder absent from the prompt                | `409 invented_token`                                                                   |
+| Deterministic leak check fails                                    | `422 leak_check_failed`                                                                |
+| Gemma judge returns `leak: true`                                  | `422 judge_flagged`                                                                    |
+| Gemma judge unavailable / no usable verdict                       | `422 judge_unavailable`                                                                |
+| Unresolved placeholder survives rehydration                       | `409 unresolved_token`                                                                 |
+| Per-IP demo rate limit exceeded                                   | `429`                                                                                  |
+| Body over `MAX_BODY_BYTES`                                        | `413`                                                                                  |
+| End-to-end deadline exceeded                                      | `504`                                                                                  |
+
+### The Gemma judge is asymmetric and probabilistic
+
+The Gemma judge in Synthesis is advisory in one direction only: `leak: true`, or "no
+usable verdict" (transport failure, timeout, unparseable answer), **blocks** the
+release; `leak: false` adds **no trust whatsoever** — it never upgrades a verdict or
+contributes to the trust tier. A probabilistic model may veto a release; it may never
+be the reason one is trusted. It runs at temperature 0 for reproducibility and never
+sees the rehydrated body — only the masked (still-tokenized) response — so it cannot
+itself become a channel for real PII.
+
+### Pseudonymization, not anonymization
+
+Masking here is pseudonymization, not anonymization or de-identification, and the
+residual risk is real: a placeholder still discloses the category of what it replaced
+and preserves equality (the same `⟦PERSON_1⟧` recurring shows the same person is meant
+each time). Surviving quasi-identifiers — employer, location, date, role, event
+context — are not tokenized at all and can permit contextual re-identification even
+when every direct identifier has been replaced.
 
 ## 4. Fortified Enterprise Fleet mapping
 
-- **Registry**: A2A Agent Cards (`/.well-known/agent-card.json` — the standard path in `@a2a-js/sdk` 0.3.x, exported as `AGENT_CARD_PATH`) per service; Gateway discovers Core/Synthesis by card URL (env-configured).
+- **Registry**: an A2A Agent Card (`/.well-known/agent-card.json` — the standard path in `@a2a-js/sdk` 0.3.x, exported as `AGENT_CARD_PATH`) for Core. The Gateway discovers Core by card URL (env-configured) and exposes no Agent Card of its own; Synthesis publishes a card that only acknowledges a gateway exchange (see §2).
 - **Runtime**: ADK `Runner` per agent, served by ADK's A2A server on Cloud Run.
-- **Memory**: Firestore — Token Vault (short-lived, TTL policy) + Audit Log (append-only).
-- **Security**: IAM-only service-to-service auth (Cloud Run invoker + ID tokens), least-privilege SAs, Gemma endpoint internal ingress, no PII in logs (structured logs are masked).
-- **Observability**: Cloud Logging structured logs (one JSON object per line) carrying `request_id`, `session_id` and the Cloud Trace correlation fields; OpenTelemetry spans per agent hop, joined into one trace by `traceparent` propagation; per-request audit record (masked count, leak-check verdict, latency per hop). Event names, error codes and the span tree are specified in [OBSERVABILITY.md](OBSERVABILITY.md); `request_id` is a UUIDv7 the UI and the API both surface.
+- **Memory**: Firestore — the Token Vault (per-request, TTL policy) and a per-request evidence document (masked prompt, Core's tokenized response, the OKF document; TTL policy, not append-only).
+- **Security**: IAM-only service-to-service auth (Cloud Run invoker + ID tokens), least-privilege SAs, Gemma endpoint internal ingress, a typed logging allowlist rather than PII scrubbing (see OBSERVABILITY.md).
+- **Observability**: Cloud Logging structured logs (one JSON object per line) carrying `request_id` and the Cloud Trace correlation fields; OpenTelemetry spans per agent hop, joined into one trace by `traceparent` propagation; a per-request OKF evidence document (masked count, leak-check verdict, latency per hop). Event names, error codes and the span tree are specified in [OBSERVABILITY.md](OBSERVABILITY.md); `request_id` is a UUIDv7 the UI and the API both surface.
 
 ## 5. Repository layout
 
@@ -69,25 +149,94 @@ docs/            # ARCHITECTURE.md, OBSERVABILITY.md, DEPLOY.md, diagram
 justfile         # dev / test / deploy tasks
 ```
 
-`packages/common` exports subpaths so the dependency graph enforces the boundary:
-Core imports only `/logging`, `/config`, `/schema` and `/telemetry`, none of which
-reach the vault. Gateway and Synthesis import the package entry point.
+`packages/common` exports subpaths, and Core imports only `/logging`, `/config`,
+`/schema` and `/telemetry`. That convention keeps Core's own code away from the
+vault module, but Core's package still installs the whole `@privacy-gateway/common`
+package, so the dependency graph on disk does not by itself prevent Core from
+reaching Firestore — the actual structural guarantee is IAM: Core's service account
+has no Firestore role. Gateway and Synthesis import the package entry point.
 
 ## 6. Key design decisions (Why not)
 
 - **Why not Gemma via Gemini API?** It would leave the boundary and defeat the point. Self-hosted on Cloud Run GPU; local dev uses local Ollama with the same OpenAI-compatible interface.
-- **Why hybrid regex + Gemma for detection?** Regex gives deterministic, auditable coverage for structured PII (emails, phones, card numbers, API keys); Gemma covers unstructured entities (names, addresses). Tokens must be stable within a session so Gemini can reason about `⟦PERSON_1⟧` consistently.
+- **Why hybrid regex + Gemma for detection?** Regex gives deterministic, auditable coverage for structured PII (emails, phones, card numbers, API keys); Gemma covers unstructured entities (names, addresses). Tokens must be stable within one request so Gemini can reason about `⟦PERSON_1⟧` consistently across the single round trip; there is no multi-turn stability requirement because there is no multi-turn state (see §2).
 - **Why a separate Synthesis agent instead of rehydrating in Gateway?** Separation of duties: the agent that verifies _output_ safety should not be the one that decided _input_ masking; it also makes the leak check an independent gate on every response.
-- **Why A2A instead of in-process sub-agents?** The boundary is the product. Separate services with separate IAM identities make "Core cannot read the vault" a deployable guarantee, not a code convention.
+- **Why A2A for Gateway → Core but plain HTTP for Gateway → Synthesis?** Core's job is reasoning, so A2A's LLM-oriented protocol fits. Synthesis's HTTP routes return an audit artifact (the OKF document, the masked prompt, Core's tokenized response) that must come back byte-for-byte, not as something an LLM has rephrased — so the route the Gateway actually uses is plain authenticated HTTP even though Synthesis also exposes an A2A surface that acknowledges the exchange.
+- **Why separate services at all instead of in-process sub-agents?** The boundary is the product. Separate services with separate IAM identities make "Core cannot reach Firestore" a deployable guarantee enforced by IAM, not a code convention — see the note on the dependency graph in §5.
 
-## 7. Demo scenario (≤4 min video)
+## 7. API surface
+
+| Route                               | Method | Purpose                                                                                                                                                                                                                                                  |
+| ----------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/v1/ask`                           | POST   | `{text}` only. Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
+| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                       |
+| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                           |
+| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                   |
+
+There is no approval route, no tier-lookup route and no session-scoped answer route:
+`POST /v1/sessions/:id/approve`, `GET /v1/sessions/:id/tier` and
+`GET /v1/sessions/:id/answer` do not exist in this design (see §2 — sessions and human
+approval are both gone). Every route above is keyed by `request_id`.
+
+Request limits: body size is capped at 64 KB (`MAX_BODY_BYTES`), the whole
+gateway → Core → Synthesis chain has a 60 s deadline (`REQUEST_DEADLINE_SECONDS`), and
+a per-IP demo rate limit applies (`RATE_LIMIT_PER_MINUTE`, default 20 requests/minute,
+`0` disables it). These are demo-grade: the public gateway authenticates nobody, and
+one request drives two Gemma calls plus a Gemini call, so an unbounded endpoint is a
+cost incident waiting to happen.
+
+## 8. Persistence and the vault
+
+Firestore stores **only masked artifacts**, keyed by `request_id`:
+
+- the **Token Vault** (`token_vault` collection): the placeholder → raw-value mapping
+  for one request, a `generation` counter, and `expires_at`. Firestore allocation runs
+  inside `runTransaction` so two concurrent writers cannot silently overwrite each
+  other's mapping. Synthesis is handed the generation the Gateway wrote and refuses to
+  rehydrate against any other one.
+- the **evidence store** (`gateway_answers` collection): the masked prompt, Core's
+  still-tokenized response, the OKF document (whose body holds the _masked_ answer),
+  and `expires_at`. It uses the same `expires_at` field name as `token_vault` so one
+  Firestore TTL policy shape covers both collections.
+
+The rehydrated answer exists only inside the one `/v1/ask` API response that produced
+it. It is never written to Firestore, in any collection, under any status. A refused
+request still persists its (answer-free) evidence document — `status: draft`,
+`verified` omitted — so a blocked request remains auditable. Neither collection is
+append-only: each is a per-request document with a TTL, not a log.
+
+## 9. Disclosure policy
+
+`API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD` and `MY_NUMBER` are never rehydrated into a
+released answer by default — the placeholder stays in place and the withheld
+categories are listed in both `attestation.withheld` (OKF) and the API response's
+`attestation.withheld`. The rationale: the caller who submitted a secret already holds
+it, and echoing it back through a frontier-model round trip only widens the blast
+radius of a logged or screenshotted response. `REHYDRATE_ALLOW_CATEGORIES`
+(comma-separated, e.g. `CREDIT_CARD,MY_NUMBER`) re-enables specific categories for a
+deployment that needs them released.
+
+## 10. UI trust dimensions
+
+The UI shows four dimensions **separately**, never collapsed into one badge, so a
+partial failure cannot read as a clean pass:
+
+- **policy verdict** — `pass` / `fail` (the deterministic leak check and consistency check)
+- **document status** — `draft` / `stable` / `deprecated`
+- **freshness** — `fresh` / `stale` / `unknown` (derived from `stale_after`; a missing or unparseable `stale_after` is `unknown`, never `fresh`)
+- **review identity** — always `none` (see §2 — human approval is out of scope)
+
+A blocked request is shown as its own outcome, not folded into one of the four
+dimensions.
+
+## 11. Demo scenario (≤4 min video)
 
 Customer-support email containing name, email, phone, credit-card and an API key →
 ask "draft a reply and a Python script to update this customer's record".
-Show: masked prompt sent to Gemini, Gemini's tokenized output, leak-check pass,
-rehydrated final answer, audit record, Cloud Run console.
+Show: masked prompt sent to Gemini, Gemini's tokenized output, leak-check pass, the
+rehydrated final answer, the OKF evidence document, Cloud Run console.
 
-## 8. Knowledge & trust signals: Open Knowledge Format (OKF v0.2)
+## 12. Knowledge & trust signals: Open Knowledge Format (OKF v0.2)
 
 Every answer the fleet produces is _agent-written content_. We adopt
 [OKF v0.2](https://github.com/GoogleCloudPlatform/open-knowledge-format) so that
@@ -95,12 +244,25 @@ provenance, trust, freshness, lifecycle and attestation are first-class on each 
 
 - **Bundle** `knowledge/` (in repo): `policies/pii-masking.md` (human-authored, `human:` verified),
   `computations/leak-check.md` (`type: Attested Computation`, `runtime: typescript`,
-  deterministic attester `references/attesters/leak_check.ts`, receipt `[session_id, response_hash, findings]`).
-- **Per-request output** (Synthesis Agent → Firestore → UI): an OKF concept `type: Gateway Answer` with
-  `generated.by: core_agent/gemini-3.5-*`, `verified: [{by: synthesis_agent/gemma-3}]` once the leak-check
-  attestation passes (⇒ _machine-confirmed_), optionally `human:<id>` after approval in the UI (⇒ _human-reviewed_),
-  `sources` pointing at the masked prompt and the policy, `stale_after` = vault expiry, `status: draft` on failure.
-- The UI derives and shows the trust tier; attestation failures are surfaced, never dropped.
+  deterministic attester `references/attesters/leak_check.ts`, receipt `[request_id, response_hash, findings]`).
+- **Per-request output** (Synthesis Agent → Firestore → UI): an OKF concept `type: Gateway Answer`.
+  `generated.by` is `synthesis_agent/<version>` — Synthesis assembles the concept, so OKF SPEC §7's
+  actor convention attributes the document to it; Core supplies the tokenized prose and appears
+  instead as a `core-response` provenance source (`author: core_agent/<GEMINI_MODEL>`). `sources[]`
+  carries three entries: `masked-prompt` (`/requests/<id>/masked-prompt.md`), `core-response`
+  (`/requests/<id>/core-response.md`) and `pii-policy` — the first two are actually served by the
+  Gateway (§7 above). `verified[].by` is `process:leak-check@<attester sha256 short>` once the leak-check
+  attestation passes (⇒ _machine-confirmed_); it is never an LLM actor, and there is no `human:<id>`
+  entry ever (§2). `stale_after` = vault expiry, `status: draft` on any failed gate.
+- A top-level `attestation:` block carries `computation`, `computation_sha256`, `attester_sha256`,
+  `masked_prompt_sha256`, `core_response_sha256`, `verdict`, `checked_at`, `request_id`, `trace_id`
+  and, when applicable, `withheld` — enough for a third party to replay the verdict without trusting
+  this fleet. Replay it with `just verify-answer <request_id>`.
+- Malformed `verified` entries (missing or non-string `by`) are excluded from the trust-tier
+  derivation, so a corrupted field derives `unverified` rather than crashing or over-trusting. An
+  invalid or absent `stale_after` derives freshness `unknown`, never `fresh`.
+- The UI derives and shows the four trust dimensions (§10) separately; attestation failures are
+  surfaced, never dropped.
 - Why OKF rather than an ad-hoc JSON audit record: the audit trail becomes a portable, diffable, human-readable
   bundle that any OKF consumer (Knowledge Catalog, an agent, `cat`) can read — trust in agent output is the
   product, so the record of that trust should be a standard.

@@ -41,14 +41,36 @@ describe('span recording', () => {
     expect(spans[0]?.attributes['placeholder_count']).toBe(3);
   });
 
-  it('records the exception and rethrows on failure', async () => {
+  it('records the error class and rethrows on failure', async () => {
     await expect(
       withSpan(SPAN.guardEgress, {}, () => Promise.reject(new Error('blocked'))),
     ).rejects.toThrow('blocked');
 
     const span = exporter.getFinishedSpans()[0];
     expect(span?.status.code).toBe(2);
-    expect(span?.events.some((event) => event.name === 'exception')).toBe(true);
+    expect(span?.attributes['error.class']).toBe('Error');
+  });
+
+  it('never copies an exception message or stack onto the span', async () => {
+    // `recordException` would attach exception.message and exception.stacktrace
+    // verbatim, and an exception message routinely embeds the value that caused
+    // it — a response body, a prompt fragment, a header.
+    const secret = 'taro@example.co.jp';
+    await expect(
+      withSpan(SPAN.guardEgress, {}, () => Promise.reject(new Error(`could not reach ${secret}`))),
+    ).rejects.toThrow(secret);
+
+    const span = exporter.getFinishedSpans()[0];
+    expect(JSON.stringify(span?.attributes)).not.toContain(secret);
+    expect(span?.status.message).not.toContain(secret);
+    expect(span?.events.some((event) => event.name === 'exception')).toBe(false);
+  });
+
+  it('records a numeric or string error code when the failure carries one', async () => {
+    const failure = Object.assign(new Error('nope'), { code: 'ECONNREFUSED' });
+    await expect(withSpan(SPAN.a2aCore, {}, () => Promise.reject(failure))).rejects.toThrow();
+
+    expect(exporter.getFinishedSpans()[0]?.attributes['error.code']).toBe('ECONNREFUSED');
   });
 
   it('nests child spans under the active parent', async () => {

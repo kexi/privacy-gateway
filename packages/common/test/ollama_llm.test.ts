@@ -5,7 +5,10 @@
  */
 
 import { LLMRegistry, type LlmRequest, type LlmResponse } from '@google/adk';
-import { describe, expect, it } from 'vitest';
+import type { GoogleAuth } from 'google-auth-library';
+import { afterEach, describe, expect, it } from 'vitest';
+import { gemmaAuthMode } from '../src/config.ts';
+import { IdTokenError, resetIdTokenCache, setGoogleAuthForTests } from '../src/http_client.ts';
 import {
   OllamaLlm,
   ollamaModelId,
@@ -217,5 +220,144 @@ describe('live connections', () => {
   it('refuses rather than degrading silently', async () => {
     const llm = new OllamaLlm({ model: 'ollama/gemma3:12b' });
     await expect(llm.connect(request())).rejects.toThrow(/does not support live connections/u);
+  });
+});
+
+/** A GoogleAuth stand-in that always mints `token`, recording each audience. */
+function stubAuth(token = 'id-token') {
+  const audiences: string[] = [];
+  const auth = {
+    getIdTokenClient(audience: string) {
+      audiences.push(audience);
+      return Promise.resolve({
+        getRequestHeaders: () => Promise.resolve({ authorization: `Bearer ${token}` }),
+      });
+    },
+  } as unknown as GoogleAuth;
+  return { auth, audiences };
+}
+
+function authHeaderOf(init: RequestInit): string | undefined {
+  return (init.headers as Record<string, string> | undefined)?.['authorization'];
+}
+
+/**
+ * What the Gemma credential selection guarantees: Cloud Run's Gemma service is
+ * IAM-protected, so a static `Bearer ollama` there is simply the wrong
+ * credential and produces a 403. The scheme decides by default, GEMMA_AUTH
+ * overrides, and an IAM hop that cannot mint a token fails closed.
+ */
+describe('gemma auth header selection', () => {
+  afterEach(() => {
+    resetIdTokenCache();
+  });
+
+  async function drain(llm: OllamaLlm): Promise<void> {
+    for await (const _ of llm.generateContentAsync(request())) {
+      // exhaust the generator so the request is actually issued
+    }
+  }
+
+  it('sends the static key for a local http endpoint', async () => {
+    const { auth, audiences } = stubAuth();
+    setGoogleAuthForTests(auth);
+    const { impl, calls } = stubFetch(completion('{}'));
+
+    await drain(
+      new OllamaLlm({
+        model: 'ollama/gemma3:12b',
+        baseUrl: 'http://localhost:11434/v1',
+        apiKey: 'ollama',
+        fetchImpl: impl,
+      }),
+    );
+
+    expect(authHeaderOf(calls[0]!.init)).toBe('Bearer ollama');
+    expect(audiences).toEqual([]);
+  });
+
+  it('sends a Google ID token for an https endpoint, keyed to the service origin', async () => {
+    const { auth, audiences } = stubAuth('cloud-run-token');
+    setGoogleAuthForTests(auth);
+    const { impl, calls } = stubFetch(completion('{}'));
+
+    await drain(
+      new OllamaLlm({
+        model: 'ollama/gemma3:12b',
+        baseUrl: 'https://gemma-serving-123.us-central1.run.app/v1',
+        apiKey: 'ollama',
+        fetchImpl: impl,
+      }),
+    );
+
+    expect(authHeaderOf(calls[0]!.init)).toBe('Bearer cloud-run-token');
+    // Audience is the origin, not the /v1 base and not the completions path.
+    expect(audiences).toEqual(['https://gemma-serving-123.us-central1.run.app']);
+  });
+
+  it('honours GEMMA_AUTH=none against an https endpoint (tunnelled local Ollama)', async () => {
+    const { auth, audiences } = stubAuth();
+    setGoogleAuthForTests(auth);
+    const { impl, calls } = stubFetch(completion('{}'));
+
+    await drain(
+      new OllamaLlm({
+        model: 'ollama/gemma3:12b',
+        baseUrl: 'https://tunnel.test/v1',
+        apiKey: 'static-key',
+        auth: 'none',
+        fetchImpl: impl,
+      }),
+    );
+
+    expect(authHeaderOf(calls[0]!.init)).toBe('Bearer static-key');
+    expect(audiences).toEqual([]);
+  });
+
+  it('honours GEMMA_AUTH=iam against an http endpoint', async () => {
+    const { auth, audiences } = stubAuth('forced-token');
+    setGoogleAuthForTests(auth);
+    const { impl, calls } = stubFetch(completion('{}'));
+
+    await drain(
+      new OllamaLlm({
+        model: 'ollama/gemma3:12b',
+        baseUrl: 'http://gemma.internal/v1',
+        auth: 'iam',
+        fetchImpl: impl,
+      }),
+    );
+
+    expect(authHeaderOf(calls[0]!.init)).toBe('Bearer forced-token');
+    expect(audiences).toEqual(['http://gemma.internal']);
+  });
+
+  it('fails closed rather than calling an IAM endpoint without a token', async () => {
+    const auth = {
+      getIdTokenClient: () => Promise.reject(new Error('no metadata server')),
+    } as unknown as GoogleAuth;
+    setGoogleAuthForTests(auth);
+    const { impl, calls } = stubFetch(completion('{}'));
+
+    const llm = new OllamaLlm({
+      model: 'ollama/gemma3:12b',
+      baseUrl: 'https://gemma.test/v1',
+      fetchImpl: impl,
+    });
+
+    await expect(drain(llm)).rejects.toBeInstanceOf(IdTokenError);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('gemmaAuthMode', () => {
+  it('defaults to iam for https and none for http', () => {
+    expect(gemmaAuthMode('https://gemma.test/v1')).toBe('iam');
+    expect(gemmaAuthMode('http://localhost:11434/v1')).toBe('none');
+  });
+
+  it('lets an explicit setting win over the scheme', () => {
+    expect(gemmaAuthMode('https://tunnel.test/v1', 'none')).toBe('none');
+    expect(gemmaAuthMode('http://gemma.internal/v1', 'iam')).toBe('iam');
   });
 });

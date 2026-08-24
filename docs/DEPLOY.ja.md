@@ -316,33 +316,83 @@ gcloud projects get-iam-policy all-thinkgs \
 > 単一 apply 内で `run.invoker` の付与を Cloud Run サービスの後に並べるので、
 > 付与が失敗する初回ウィンドウ自体が存在しない。
 
-### 3.7 なぜ Direct VPC egress が要るのか
+### 3.7 プライベート経路の設計
 
-`gemma-serving` は internal ingress。ところが Cloud Run の既定の下り通信は VPC を経由しない
-ため、**Cloud Run から Cloud Run の internal ingress を呼ぶと 403 になる**。そこで呼ぶ側に
-Direct VPC egress を付ける。Terraform ではこう書く:
+4 サービスのうち 3 つが **internal ingress** である: `gemma-serving`、`core-agent`、
+`synthesis-agent`。インターネットからの通信を受けるのは `gateway-agent` だけ。
+
+ここで見落としやすいのは、呼ぶ側が互いを**パブリックな `run.app` URL** で指している点。
+Cloud Run がその通信を "internal" と認めるのは、実際に VPC ネットワークを経由した場合だけ。
+[Cloud Run のプライベートネットワーキング](https://cloud.google.com/run/docs/securing/private-networking)
+によれば、Cloud Run 同士の通信は "all require additional configuration before they are
+recognized as 'internal'" であり、その手段は次の 3 つ:
+
+1. 呼ぶ側の**すべての**通信を VPC 経由にし、**かつ** Direct VPC egress が使うサブネットで
+   Private Google Access を有効にする
+2. 呼ばれる側の前段に Private Service Connect か内部アプリケーション ロードバランサを置き、
+   内部 IP で到達する
+3. Private Google Access を有効にし、`run.app` を `private.googleapis.com` /
+   `restricted.googleapis.com` に向ける DNS オーバーライドを追加する
+
+本デプロイは**方式 1** を採る。Terraform では 2 つの設定が対になって初めて機能する。
+一方はサブネット側 (`infra/terraform/network.tf`):
+
+```hcl
+resource "google_compute_subnetwork" "fleet" {
+  name                     = "agentic-fleet-us-central1"
+  ip_cidr_range            = "10.60.0.0/24"
+  private_ip_google_access = true # <- これが無いと internal ingress に到達できない
+}
+```
+
+もう一方は呼ぶ側すべて (`infra/terraform/cloudrun.tf`):
 
 ```hcl
 vpc_access {
-  egress = "PRIVATE_RANGES_ONLY"
+  egress = "ALL_TRAFFIC" # <- PRIVATE_RANGES_ONLY ではない
   network_interfaces {
     network    = "default"
-    subnetwork = "default"
+    subnetwork = "agentic-fleet-us-central1"
   }
 }
 ```
 
-これを付けるのは **`gateway-agent` と `synthesis-agent` だけ**。`core-agent` には VPC egress を
-**付けていない**。Core が到達するのは Vertex AI（パブリックエンドポイント）だけなので、
-VPC 経路を持たせても何も得られないため。
+> **これが直した不具合。** 以前は `default` サブネットに対して
+> `egress = "PRIVATE_RANGES_ONLY"` を指定していた。`PRIVATE_RANGES_ONLY` が VPC に流すのは
+> RFC1918 宛だけで、パブリックな `run.app` アドレスは内部アドレスではない。結果その通信は
+> 通常のインターネット経路に出てしまい、Gateway → Gemma の呼び出しはすべて `403` になっていた。
+> ユニットテストは Gemma エンドポイントをモックするため、これを検出できなかった。
 
-`PRIVATE_RANGES_ONLY` なので、Vertex AI や Firestore など外部宛はそのまま素通りする。
-`all-thinkgs` に `default` VPC と `us-central1` の `default` サブネット (10.128.0.0/20) が
-存在することは確認済みなので、追加作成は不要（要件は `/26` 以上で、`/20` はこれを満たす）。
-この参照のために `compute.googleapis.com` を有効化しておく必要がある（§3.4）。
+この egress は `core-agent` を含む 3 サービスすべてに付ける。Core が到達するのは
+パブリックエンドポイントである Vertex AI だけだが、VPC 経由にすることで Vertex AI へは
+インターネットではなく Private Google Access で到達する。`docs/ARCHITECTURE.md` の
+トラストバウンダリの主張が実際に意味するのはこの状態である。
 
-Serverless VPC Access コネクタを使わない理由: コネクタ VM が常時課金され、
-provisioning にも数分かかる。Direct VPC egress は追加リソースなしで同じ効果が得られる。
+**`default` ではなく専用サブネットを作る理由**: Private Google Access は Direct VPC egress が
+接続するサブネット側で有効にする必要があり、`default` に対して有効化するのは Terraform が
+所有していないリソースへのプロジェクト全体の副作用になる。また Direct VPC egress は
+そのサブネットのアドレスを消費する（インスタンス数の約 2 倍、デプロイ中はリビジョンの
+重なり分の余裕も要る）ため、専用の `/24` にしておけば他のワークロードのアドレスを
+枯渇させることがない（要件は `/26` 以上。`/24` はその余裕分）。
+
+**方式 2（内部 ALB / Private Service Connect）を採らない理由**: ロードバランサまたは
+サービスアタッチメントに加え、転送ルール・予約内部 IP・限定公開 DNS ゾーンが要る。
+4 サービスのデモに対して課金対象リソースと障害点が明らかに過剰であり、しかも*誰が*
+呼び出せるかは何も変わらない。それは既に IAM (`roles/run.invoker`、§3.6) が決めている。
+方式 1 はサブネット 1 つで済む。
+
+**方式 3（DNS オーバーライド）を採らない理由**: ネットワーク全体で `*.run.app` を書き換える
+限定公開 DNS ゾーンが必要になり、パブリック経路を正当に使いたいものも含め、このプロジェクトの
+将来のワークロードすべての名前解決を暗黙に変えてしまう。
+
+**Serverless VPC Access コネクタを使わない理由**: コネクタ VM が常時課金され、provisioning にも
+数分かかる。Direct VPC egress はサブネット以外の追加リソースなしで同じ効果が得られる。
+
+ネットワーク参照の解決のため `compute.googleapis.com` の有効化が必要（§3.4）。
+Cloud NAT は不要: Private Google Access により Google API 宛の通信は NAT を経由せず
+Google 内部ネットワークに留まる。
+
+経路が通っていることは `just smoke` で確認する。実際にこの経路を通る唯一のチェックである。
 
 ### 3.8 設定を壊さないための仕組み
 
@@ -601,7 +651,7 @@ GATEWAY_URL=$(gcloud run services describe gateway-agent \
   --region=us-central1 --format='value(status.url)')
 
 curl -sS "${GATEWAY_URL}/healthz"
-curl -sS "${GATEWAY_URL}/.well-known/agent.json" | jq .
+curl -sS "${GATEWAY_URL}/.well-known/agent-card.json" | jq .
 ```
 
 ### 8.3 Core / Synthesis（要 ID token）
@@ -609,19 +659,33 @@ curl -sS "${GATEWAY_URL}/.well-known/agent.json" | jq .
 **アクセストークンではなく ID token**を使う。
 
 ```bash
+just verify-auth
+```
+
+このレシピが検証そのもの。各プライベートサービスの `/healthz` を匿名と ID token 付きの
+2 回呼び、`403` → `200` になることを検査する。手で書くとこうなる:
+
+```bash
 CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
 
-curl -sS -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
-  "${CORE_URL}/.well-known/agent.json" | jq .
+# audience は呼ばれる側の URL でなければならない。別の値で発行したトークンは
+# Owner であっても拒否される。
+curl -sS -H "Authorization: Bearer $(gcloud auth print-identity-token --audiences="${CORE_URL}")" \
+  "${CORE_URL}/.well-known/agent-card.json" | jq .
 
 # 認証が実際に効いていることの証明（403 が返るのが正解）
-curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-known/agent.json"
+curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-known/agent-card.json"
 ```
 
 > `gcloud auth print-identity-token` が返すのは**あなた自身**の ID token。
 > これで通るのは、あなたが Owner だから。サービス間は各 SA の ID token を使う（§4）。
 
 `just agent-card core-agent` はこのトークン処理を代わりにやってくれる。
+
+`core-agent` と `synthesis-agent` も **internal ingress** になったため、手元からの呼び出しは
+IAM の判定より前にネットワーク層で拒否される。`just verify-auth` はそれを織り込み済み。
+生の `curl` を VPC の外から実行する場合は両方 `403` が正しい結果であり、`200` 側の証明は
+フリート内部から取る必要がある。それを行うのが `just smoke`。
 
 ### 8.4 Gemma（internal ingress なので外からは届かない）
 
@@ -646,14 +710,25 @@ gcloud firestore fields ttls list --collection-group=token_vault --database='(de
 ### 8.6 エンドツーエンド
 
 ```bash
-curl -sS -X POST "${GATEWAY_URL}/v1/query" \
+just smoke
+```
+
+`just smoke` はデプロイ済み Gateway の `/v1/ask` に固定の PII サンプルを POST し、
+レスポンスが `200` であること、マスク済みプロンプトに `⟦TYPE_N⟧` プレースホルダが
+含まれること、生のメールアドレスと電話番号が**含まれない**ことを検査する。
+モックを使うユニットテストに対する、デプロイ版の対応物にあたる。Cloud Run の IAM、
+Gemma への VPC 経路、Firestore の Vault をまとめて通る唯一のチェックである。
+
+手で実行する場合:
+
+```bash
+curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
 ```
 
 確認すべき点: Core に渡ったのはマスク済みか / leak check が通ったか / 最終回答が
 リハイドレートされているか / OKF レコードが付いているか。
-（エンドポイントのパスはコード担当の実装に合わせて読み替えること）
 
 ---
 
@@ -692,10 +767,11 @@ gcloud projects get-iam-policy all-thinkgs --flatten="bindings[].members" \
   --filter="bindings.members:sa-core@all-thinkgs.iam.gserviceaccount.com" \
   --format="value(bindings.role)"
 
-# 認証が効いている（403）/ ID token 付きなら通る（200）
-curl -s -o /dev/null -w "no auth  -> %{http_code}\n" "${CORE_URL}/.well-known/agent.json"
-curl -s -o /dev/null -w "with ID  -> %{http_code}\n" \
-  -H "Authorization: Bearer $(gcloud auth print-identity-token)" "${CORE_URL}/.well-known/agent.json"
+# 認証が効いている（403）/ ID token 付きなら通る（200）— 全プライベートサービス分
+just verify-auth
+
+# デプロイ済みフリートを通る実リクエスト 1 本（プライバシー検査つき）
+just smoke
 ```
 
 インフラが宣言的になったので追加で撮る価値があるもの: `infra/terraform/iam.tf` を数秒、
