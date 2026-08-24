@@ -49,10 +49,10 @@ just hooks
 
 ### What the hooks run
 
-| Stage          | Checks                                                                                                                                                                                                        |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **pre-commit** | gitleaks (staged diff), ruff (standalone scripts), PEP 723 header check, oxlint / oxfmt --check / tsc --noEmit, just fmt-check, just check-recipe-docs, actionlint, pinact verify, shellcheck, nixfmt --check |
-| **pre-push**   | `pnpm -r test` (vitest)                                                                                                                                                                                       |
+| Stage          | Checks                                                                                                                                                                                                                            |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **pre-commit** | gitleaks (staged diff), ruff (standalone scripts), PEP 723 header check, oxlint / oxfmt --check / tsc --noEmit, just fmt-check, just check-recipe-docs, actionlint, pinact verify, terraform fmt/validate, tflint, nixfmt --check |
+| **pre-push**   | `pnpm -r test` (vitest)                                                                                                                                                                                                           |
 
 pre-commit is tuned for speed and scopes to **staged files** wherever possible.
 Heavy work such as the full test suite runs on pre-push instead.
@@ -88,8 +88,10 @@ just fmt-check          # oxfmt --check + justfile formatting drift
 just lint-python        # ruff over clients/ (standalone scripts)
 just lint-pep723        # PEP 723 headers on standalone scripts
 just check-recipe-docs  # fail on recipes without a doc comment
-just lint-shell         # shellcheck for infra/*.sh
 just lint-actions       # actionlint
+just tf-fmt-check       # terraform fmt --check over infra/terraform
+just tf-validate        # terraform validate (no backend, no credentials)
+just tf-lint            # tflint over infra/terraform
 just pin                # pin GitHub Actions to commit SHAs
 just pin-verify         # verify pinned SHAs match version comments
 just secrets-scan       # gitleaks (full history)
@@ -252,6 +254,22 @@ gcloud config set project <PROJECT_ID>
 Put the project ID and similar values in `.env` for direnv to load. `.env` is
 never committed.
 
+`terraform` and `tflint` are in the devShell too. Cloud resources are declared in
+`infra/terraform/` and are only ever created through the `just tf-*` recipes —
+never by an ad-hoc `gcloud` command. The one exception is `just tf-bootstrap`,
+which creates the GCS bucket holding Terraform's own remote state; that bucket
+cannot be a Terraform resource because it has to exist before the first
+`terraform init`.
+
+`terraform fmt -check`, `terraform validate` and `tflint` run in pre-commit and
+in the CI `terraform` job. `just tf-apply` and `just tf-destroy` always prompt
+for interactive approval — they are never run with `-auto-approve`.
+
+```sh
+just tf-plan gpu_enabled=false   # what would change
+just tf-validate                 # no backend, no credentials needed
+```
+
 ## 8. Handling secrets
 
 `gitleaks` runs in both pre-commit and CI.
@@ -269,14 +287,15 @@ with a comment explaining why.
 
 `.github/workflows/ci.yml` runs on push and pull request:
 
-| Job       | Contents                                                                                                                  |
-| --------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `python`  | ruff check / format over `clients/`, PEP 723 headers                                                                      |
-| `node`    | Only when `pnpm-lock.yaml` exists. pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E (chromium) |
-| `just`    | just fmt-check, check-recipe-docs, `just --list`                                                                          |
-| `actions` | actionlint, pinact verify                                                                                                 |
-| `secrets` | gitleaks (full history)                                                                                                   |
-| `nix`     | `nix flake check`, devShell build                                                                                         |
+| Job         | Contents                                                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `python`    | ruff check / format over `clients/`, PEP 723 headers                                                                      |
+| `node`      | Only when `pnpm-lock.yaml` exists. pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E (chromium) |
+| `just`      | just fmt-check, check-recipe-docs, `just --list`                                                                          |
+| `actions`   | actionlint, pinact verify                                                                                                 |
+| `terraform` | terraform fmt -check, terraform validate, tflint over `infra/terraform`                                                   |
+| `secrets`   | gitleaks (full history)                                                                                                   |
+| `nix`       | `nix flake check`, devShell build                                                                                         |
 
 Every external action `uses:` is pinned to a full commit SHA, because tags are
 mutable and leave the supply chain open to takeover. After adding an action or

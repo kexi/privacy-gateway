@@ -49,10 +49,10 @@ just hooks
 
 ### フックの内容
 
-| タイミング     | 内容                                                                                                                                                                                                           |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **pre-commit** | gitleaks（ステージ済み差分）、ruff（単体スクリプト）、PEP 723 ヘッダ検査、oxlint / oxfmt --check / tsc --noEmit、just fmt-check、just check-recipe-docs、actionlint、pinact verify、shellcheck、nixfmt --check |
-| **pre-push**   | `pnpm -r test`（vitest）                                                                                                                                                                                       |
+| タイミング     | 内容                                                                                                                                                                                                                               |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **pre-commit** | gitleaks（ステージ済み差分）、ruff（単体スクリプト）、PEP 723 ヘッダ検査、oxlint / oxfmt --check / tsc --noEmit、just fmt-check、just check-recipe-docs、actionlint、pinact verify、terraform fmt/validate、tflint、nixfmt --check |
+| **pre-push**   | `pnpm -r test`（vitest）                                                                                                                                                                                                           |
 
 pre-commit は速度を最優先し、可能な限り**ステージ済みファイルのみ**を対象にする。
 テスト全体のような重い処理は pre-push に置いている。
@@ -88,8 +88,10 @@ just fmt-check          # oxfmt --check + justfile の整形崩れを検出
 just lint-python        # clients/ の ruff（単体スクリプト）
 just lint-pep723        # 単体スクリプトの PEP 723 ヘッダ検査
 just check-recipe-docs  # doc コメントの無いレシピを検出
-just lint-shell         # infra/*.sh の shellcheck
 just lint-actions       # actionlint
+just tf-fmt-check       # infra/terraform の terraform fmt --check
+just tf-validate        # terraform validate（backend も認証情報も不要）
+just tf-lint            # infra/terraform の tflint
 just pin                # GitHub Actions を commit SHA に固定
 just pin-verify         # 固定済み SHA とバージョンコメントの一致を検証
 just secrets-scan       # gitleaks（全履歴）
@@ -250,6 +252,21 @@ gcloud config set project <PROJECT_ID>
 プロジェクト ID などは `.env` に書いておくと `direnv` が読み込む。
 `.env` はコミットしない。
 
+`terraform` と `tflint` も devShell に入っている。クラウド上のリソースは
+`infra/terraform/` で宣言し、作成は必ず `just tf-*` レシピ経由で行う。
+その場限りの `gcloud` コマンドで作ってはいけない。唯一の例外が `just tf-bootstrap` で、
+これは Terraform 自身の remote state を置く GCS バケットを作る。最初の
+`terraform init` より前に存在している必要があるため、Terraform のリソースにはできない。
+
+`terraform fmt -check` / `terraform validate` / `tflint` は pre-commit と CI の
+`terraform` ジョブの両方で走る。`just tf-apply` と `just tf-destroy` は常に対話的な
+承認を求める（`-auto-approve` は使わない）。
+
+```sh
+just tf-plan gpu_enabled=false   # 変更内容の確認
+just tf-validate                 # backend も認証情報も不要
+```
+
 ## 8. シークレットの扱い
 
 `gitleaks` が pre-commit と CI の両方で走る。
@@ -266,14 +283,15 @@ gcloud config set project <PROJECT_ID>
 
 `.github/workflows/ci.yml` が push と PR で走る。ジョブは次の通り。
 
-| ジョブ    | 内容                                                                                                                     |
-| --------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `python`  | `clients/` の ruff check / format、PEP 723 ヘッダ検査                                                                    |
-| `node`    | `pnpm-lock.yaml` がある場合のみ。pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E（chromium） |
-| `just`    | just fmt-check、check-recipe-docs、`just --list`                                                                         |
-| `actions` | actionlint、pinact verify                                                                                                |
-| `secrets` | gitleaks（全履歴）                                                                                                       |
-| `nix`     | `nix flake check`、devShell のビルド確認                                                                                 |
+| ジョブ      | 内容                                                                                                                     |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `python`    | `clients/` の ruff check / format、PEP 723 ヘッダ検査                                                                    |
+| `node`      | `pnpm-lock.yaml` がある場合のみ。pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E（chromium） |
+| `just`      | just fmt-check、check-recipe-docs、`just --list`                                                                         |
+| `actions`   | actionlint、pinact verify                                                                                                |
+| `terraform` | `infra/terraform` の terraform fmt -check、terraform validate、tflint                                                    |
+| `secrets`   | gitleaks（全履歴）                                                                                                       |
+| `nix`       | `nix flake check`、devShell のビルド確認                                                                                 |
 
 外部 Action の `uses:` はすべて完全な commit SHA に固定してある
 （タグは書き換え可能なので、SHA でなければ供給元の乗っ取りに対して無防備になる）。

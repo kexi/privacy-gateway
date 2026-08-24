@@ -11,8 +11,9 @@ Gateway / Synthesis Agent が `OllamaLlm`（`packages/common` にある ADK `Bas
 | `gemma3:12b` (既定) | 約 8.1GB | L4 (VRAM 24GB) に収まる最大級。PII スパン抽出と leak check の精度が要件。 |
 | `gemma3:4b` (退避)  | 約 3.3GB | L4 quota が取れない、またはコールドスタートを更に縮めたい場合。           |
 
-切り替えは `infra/common.sh` の `GEMMA_MODEL` で行う
-（例: `GEMMA_MODEL=gemma3:4b ./infra/build.sh gemma`）。
+切り替えは Terraform 変数 `gemma_model` で行う
+（例: `GEMMA_MODEL=gemma3:4b just build gemma` のあと
+`just tf-apply gemma_model=gemma3:4b`）。
 ビルドとデプロイの両方に効く。`build.sh` は `--build-arg GEMMA_MODEL` として渡し、
 `deploy.sh` は同じ値を `GEMMA_MODEL` 環境変数として注入する。
 

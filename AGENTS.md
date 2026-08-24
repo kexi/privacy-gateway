@@ -36,7 +36,7 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 - TypeScript lint/format: **oxlint** (with `oxlint-tsgolint` for type-aware rules) and **oxfmt** — not eslint/prettier. Config at repo root (`.oxlintrc.json`, `.oxfmtrc.json`); one `pnpm` devDependency version for the whole workspace.
 - **Type checking is a separate step**: `tsc --noEmit` per package (`just typecheck`). oxlint does not replace it.
 - **Import specifiers use the `.ts` extension** (`import { x } from './x.ts'`): `allowImportingTsExtensions` + `rewriteRelativeImportExtensions` in tsconfig; tsc rewrites to `.js` on build. Never write `.js` in source imports.
-- Pre-commit (lefthook): gitleaks, oxlint, oxfmt --check, tsc --noEmit, actionlint, pinact verify, shellcheck, nix fmt, just fmt-check, recipe-doc check, ruff (clients/). Pre-push: `pnpm -r test`.
+- Pre-commit (lefthook): gitleaks, oxlint, oxfmt --check, tsc --noEmit, actionlint, pinact verify, terraform fmt/validate, tflint, nix fmt, just fmt-check, recipe-doc check, ruff (clients/). Pre-push: `pnpm -r test`.
 - GitHub Actions refs are pinned to commit SHAs with **pinact**; run `just pin` after editing workflows.
 - Secrets: never commit real credentials. Test fixtures with fake PII/keys are allow-listed in `.gitleaks.toml`.
 
@@ -44,6 +44,12 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 
 - Unit/integration: **vitest** in every package (`pnpm -r test`). Tests state _what_ is guaranteed.
 - Browser E2E: **Playwright** (chromium) in `web/e2e`, run via `just web-e2e`; not in pre-commit/pre-push, runs in CI. Mock Core/Ollama over HTTP; never hit real Gemini/Gemma in tests.
+
+## Infrastructure
+
+- Google Cloud resources are declared in **Terraform** under `infra/terraform/` (google provider, Cloud Run v2, IAM, Firestore + TTL, Artifact Registry). Never create cloud resources with ad-hoc `gcloud` commands; put them in Terraform. Container images are built by Cloud Build via `just build`.
+- Run only through `just tf-*` recipes (`tf-init`, `tf-plan`, `tf-apply`, `tf-destroy`). `terraform fmt -check`, `terraform validate` and `tflint` run in lefthook and CI. `tf-apply`/`tf-destroy` are never run by agents without explicit maintainer approval.
+- Remote state lives in a GCS bucket; secrets never go into `.tfvars` committed to git.
 
 ## Runtime conventions
 

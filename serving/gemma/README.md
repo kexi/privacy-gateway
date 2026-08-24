@@ -12,8 +12,9 @@ The OpenAI-compatible endpoint that the Gateway and Synthesis agents call throug
 | `gemma3:12b` (default) | ~8.1GB | The largest that comfortably fits an L4 (24GB VRAM). Needed for PII span extraction and leak-check accuracy. |
 | `gemma3:4b` (fallback) | ~3.3GB | When L4 quota is unavailable, or to shorten cold starts further.                                             |
 
-Switch with `GEMMA_MODEL` in `infra/common.sh` (for example
-`GEMMA_MODEL=gemma3:4b ./infra/build.sh gemma`). It applies to both build and
+Switch with the `gemma_model` Terraform variable (for example
+`GEMMA_MODEL=gemma3:4b just build gemma` then `just tf-apply gemma_model=gemma3:4b`).
+It applies to both build and
 deploy: `build.sh` passes it as `--build-arg GEMMA_MODEL`, and `deploy.sh`
 injects the same value as the `GEMMA_MODEL` environment variable.
 

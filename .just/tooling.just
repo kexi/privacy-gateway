@@ -52,10 +52,6 @@ fmt-nix:
 fmt-nix-check:
     nixfmt --check flake.nix
 
-# Lint the shell scripts under infra/
-lint-shell:
-    shellcheck --external-sources infra/*.sh
-
 # Check that standalone scripts carry PEP 723 inline metadata
 lint-pep723:
     #!/usr/bin/env bash
@@ -122,17 +118,17 @@ typecheck *packages:
 # The narrow `*-ts` / `*-just` / `*-nix` / `*-python` recipes above stay
 # available for targeted runs; these three are the surface docs and CI use.
 
-# Lint everything: TypeScript, standalone Python, shell, GitHub Actions
-lint: lint-ts lint-python lint-pep723 lint-shell lint-actions
+# Lint everything: TypeScript, standalone Python, Terraform, GitHub Actions
+lint: lint-ts lint-python lint-pep723 tf-lint lint-actions
 
-# Format everything in place: TypeScript, justfiles, flake.nix, Python
-fmt: fmt-ts fmt-just fmt-nix fmt-python
+# Format everything in place: TypeScript, justfiles, flake.nix, Python, Terraform
+fmt: fmt-ts fmt-just fmt-nix fmt-python tf-fmt
 
-# Detect formatting drift everywhere (oxfmt + justfiles + flake.nix + Python)
-fmt-check: fmt-ts-check fmt-just-check fmt-nix-check fmt-python-check
+# Detect formatting drift everywhere (oxfmt + justfiles + flake.nix + Python + Terraform)
+fmt-check: fmt-ts-check fmt-just-check fmt-nix-check fmt-python-check tf-fmt-check
 
 # Run the full local check suite (equivalent to CI)
-check: fmt-check check-recipe-docs lint typecheck pin-verify secrets-scan test
+check: fmt-check check-recipe-docs lint tf-validate typecheck pin-verify secrets-scan test
 
 # Run the pre-commit hooks against all files
 check-hooks:

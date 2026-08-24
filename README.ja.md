@@ -74,7 +74,7 @@ clients/python/    # pgw.py — 単一ファイルの PEP 723 クライアント
 serving/gemma/     # Cloud Run GPU 用の Ollama Dockerfile
 web/               # デモ UI（マスク済みと最終回答の対比）+ Playwright スペック
 knowledge/         # OKF v0.2 バンドル: ポリシー、Attested Computation、executor skill
-infra/             # デプロイスクリプト、IAM、Firestore TTL
+infra/terraform/   # Terraform: Cloud Run、IAM、Firestore TTL、Artifact Registry
 ```
 
 workspace のパッケージは `web`、`packages/common`、`agents/core`、`agents/gateway`、
@@ -277,11 +277,22 @@ Vertex AI の選択は ADK のドキュメントどおり環境変数で行う�
 
 詳細は **[docs/DEPLOY.md](docs/DEPLOY.md)**。要約:
 
+Google Cloud のリソースは Terraform（`infra/terraform/`）で宣言し、コンテナイメージだけを
+Cloud Build で別途ビルドする。コマンド面は従来どおり `just` に一本化されている。
+
 ```bash
-just infra-setup       # API 有効化、サービスアカウント、Firestore TTL
-just deploy            # 全サービスを Cloud Run へ
-just deploy-gateway    # 個別にデプロイする場合
+just tf-bootstrap                 # state 用 GCS バケットを作成（初回のみ。gcloud で作る唯一のリソース）
+just tf-init                      # そのバケットを backend として Terraform を初期化
+just build                        # 4 つのイメージを Cloud Build でビルド・push
+just tf-plan gpu_enabled=false    # 変更内容を確認
+just tf-apply gpu_enabled=false   # GPU サービス以外をすべて適用
+just tf-apply                     # L4 クォータ承認後に gemma-serving を追加
+just urls && just health          # 確認
+just tf-destroy                   # 撤収（GPU の課金を最優先で止める）
 ```
+
+`gpu_enabled=false` は GPU を使う `gemma-serving` を作成対象から外すため、Cloud Run の L4
+クォータ申請が承認待ちの間でも残りのフリートを先にデプロイできる。
 
 Core のサービスアカウントには意図的に Firestore ロールを **与えない**。Gemma のエンドポイントは
 内部 ingress のみ。サービス間呼び出しは ID トークンで認証する。

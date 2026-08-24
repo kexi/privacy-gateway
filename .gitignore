@@ -21,6 +21,23 @@ web/playwright-report/
 *-key.json
 service-account*.json
 
+# --- Terraform ---
+# .terraform/ holds downloaded providers; state may contain resource metadata
+# and must never be committed (the real state lives in GCS).
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+# Variable files may carry per-environment values; example.tfvars is the
+# committed template.
+*.tfvars
+*.tfvars.json
+!example.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
 # --- OS / editor ---
 .DS_Store
 *.swp

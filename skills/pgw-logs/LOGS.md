@@ -130,7 +130,7 @@ Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. 
 | Answer status `draft`, tier `unverified`     | synthesis `attest.verdict` findings; this is the leak check doing its job — inspect what Core emitted (tokenized text is safe to read) |
 | Placeholders left unresolved in final answer | `rehydrate.done.tokens_unknown`; vault expiry (`stale_after` passed ⇒ vault TTL purged mapping)                                        |
 | Gemma timeouts                               | `gemma-serving` logs (model load on cold start ≈ 30–60 s on L4); `--no-cpu-throttling`, min instances                                  |
-| 403 between services                         | `infra/iam.sh` bindings; token audience must be the callee's URL                                                                       |
+| 403 between services                         | `infra/terraform/iam.tf` bindings; token audience must be the callee's URL                                                             |
 | No trace / broken trace                      | `OTEL_ENABLED`, exporter errors in that service's logs (`event="otel.export.error"`)                                                   |
 
 ## 7. Firestore

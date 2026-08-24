@@ -74,7 +74,7 @@ clients/python/    # pgw.py — single-file PEP 723 client, the language-agnosti
 serving/gemma/     # Ollama Dockerfile for Cloud Run GPU
 web/               # demo UI (masked vs final, side by side) + Playwright specs
 knowledge/         # OKF v0.2 bundle: policy, attested computation, executor skill
-infra/             # deploy scripts, IAM, Firestore TTL
+infra/terraform/   # Terraform: Cloud Run, IAM, Firestore TTL, Artifact Registry
 ```
 
 The workspace packages are `web`, `packages/common`, `agents/core`, `agents/gateway` and
@@ -282,11 +282,22 @@ plus ADC via `gcloud auth application-default login`.
 
 See **[docs/DEPLOY.md](docs/DEPLOY.md)**. In short:
 
+Google Cloud resources are declared in Terraform (`infra/terraform/`); container images
+are built separately by Cloud Build. `just` remains the only command surface.
+
 ```bash
-just infra-setup       # enable APIs, service accounts, Firestore TTL
-just deploy            # all services to Cloud Run
-just deploy-gateway    # or one at a time
+just tf-bootstrap                 # create the GCS state bucket (once; the only gcloud-made resource)
+just tf-init                      # initialise Terraform against that bucket
+just build                        # build and push the four images with Cloud Build
+just tf-plan gpu_enabled=false    # review the changes
+just tf-apply gpu_enabled=false   # apply everything except the GPU service
+just tf-apply                     # add gemma-serving once the L4 quota is granted
+just urls && just health          # verify
+just tf-destroy                   # tear down (GPU billing stops first)
 ```
+
+`gpu_enabled=false` skips the GPU-backed `gemma-serving` service, so the rest of the fleet
+can be deployed while the Cloud Run L4 quota request is still pending.
 
 Core's service account deliberately has **no** Firestore role; the Gemma serving endpoint
 uses internal-only ingress; service-to-service calls authenticate with ID tokens.

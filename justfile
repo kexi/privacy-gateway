@@ -89,33 +89,8 @@ approve session by="human:kei":
     uv run clients/python/pgw.py approve {{ session }} --by {{ by }}
 
 # --- deploy -----------------------------------------------------------------
-# Backed by infra/deploy.sh.
-
-# Deploy every service
-deploy: (deploy-service "all")
-
-# Deploy one service (gateway | core | synthesis | gemma | all)
-deploy-service service:
-    ./infra/deploy.sh {{ service }}
-
-# Deploy only the Gateway
-deploy-gateway: (deploy-service "gateway")
-
-# Deploy only the Core agent
-deploy-core: (deploy-service "core")
-
-# Deploy only the Synthesis agent
-deploy-synthesis: (deploy-service "synthesis")
-
-# Deploy only the Gemma serving container
-deploy-gemma: (deploy-service "gemma")
-
-# One-time GCP setup (enable APIs, service accounts, Firestore TTL)
-# Why three scripts and not one setup.sh: each step is independently
-# idempotent and useful on its own when re-converging a single concern.
-infra-setup:
-    ./infra/enable-apis.sh
-    ./infra/iam.sh
-    ./infra/firestore.sh
+# Terraform-backed. See .just/deploy.just and docs/DEPLOY.md.
 
 import '.just/tooling.just'
+import '.just/deploy.just'
+import '.just/logs.just'

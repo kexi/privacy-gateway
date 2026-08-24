@@ -3,7 +3,7 @@
  *
  * This is the structural half of the trust boundary. The other half — the IAM
  * binding that denies Core's service account any Firestore role — lives in
- * `infra/iam.sh`; this test pins the code side, so a future import cannot
+ * `infra/terraform/iam.tf`; this test pins the code side, so a future import cannot
  * quietly undo it.
  */
 

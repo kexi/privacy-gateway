@@ -1,10 +1,17 @@
 # Deploy Runbook
 
-Project: `all-thinkgs` / Region: **`us-central1`** / Account: `kei.of.nakayama@gmail.com`
+Project: `all-thinkgs` (project number `257034533412`) / Region: **`us-central1`** /
+Account: `kei.of.nakayama@gmail.com`
 
-This document covers operating `infra/` and `serving/`. For the reasoning behind the
-architecture see [ARCHITECTURE.md](./ARCHITECTURE.md); for the diagram see
+This document covers operating `infra/terraform/` and `serving/`. For the reasoning behind
+the architecture see [ARCHITECTURE.md](./ARCHITECTURE.md); for the diagram see
 [diagram/architecture.drawio.png](./diagram/architecture.drawio.png).
+
+All cloud resources are declared in Terraform under `infra/terraform/` and applied through
+the `just tf-*` recipes. The one exception is the GCS bucket that holds the Terraform state,
+which has to exist before `terraform init` can run; `just tf-bootstrap` creates it with
+gcloud. Container images are built separately by `just build`, because an image tag is an
+artifact rather than infrastructure.
 
 A Japanese version of this document is at [DEPLOY.ja.md](./DEPLOY.ja.md).
 
@@ -44,7 +51,8 @@ The trade-off: demoing from Japan adds roughly 100-150ms of round-trip latency. 
 dominant costs here are Gemma and Gemini inference (seconds), so the perceived impact is
 small. **There is no option that avoids GPU-capable regions**, so this is accepted.
 
-To change it, override the environment variable, e.g. `REGION=europe-west1 just deploy`.
+To change it, either override the environment variable (`REGION=europe-west1 just deploy`)
+or pass the Terraform variable directly (`just tf-apply region=europe-west1`).
 
 ---
 
@@ -54,80 +62,143 @@ To change it, override the environment variable, e.g. `REGION=europe-west1 just 
 gcloud config set project all-thinkgs
 gcloud config set account kei.of.nakayama@gmail.com
 gcloud auth login
-gcloud auth application-default login   # for local development
+gcloud auth application-default login   # Terraform and local development
 ```
+
+`terraform` and `tflint` come from the Nix devShell, so `nix develop` (or direnv) is all
+that is needed to get the right versions. Terraform authenticates with Application Default
+Credentials, which is why the `application-default login` above is mandatory rather than
+just for local development.
 
 IAM needed by the operator: `roles/owner`, or
 `run.admin` + `iam.serviceAccountAdmin` + `datastore.owner` + `artifactregistry.admin` +
-`cloudbuild.builds.editor` + `serviceusage.serviceUsageAdmin`.
+`cloudbuild.builds.editor` + `serviceusage.serviceUsageAdmin` + `storage.admin`
+(the last one for the Terraform state bucket).
 
 ---
 
 ## 3. Steps
 
-Every script uses `set -euo pipefail` and is **idempotent**. If one fails partway, fix the
-cause and re-run the same command.
+Terraform is declarative and the recipes are **idempotent**. If a step fails partway, fix
+the cause and re-run the same command; Terraform reconciles from whatever state exists.
+
+The full order, including the GPU quota gate described in 3.5:
+
+```
+just tf-bootstrap                 # once per project
+just tf-init                      # once per checkout
+just build                        # ~25 min for Gemma (see the note in 3.3
+                                  #   for the very first run on a fresh project)
+just tf-plan gpu_enabled=false    # review: 33 resources to add
+just tf-apply gpu_enabled=false   # everything except gemma-serving
+   ... wait for the L4 quota to be granted (section 6) ...
+just tf-apply                     # adds gemma-serving, 36 total
+just urls && just health          # verify (section 8)
+just tf-destroy                   # when finished (section 10)
+```
 
 ### 3.0 Check the configuration
 
-```bash
-source infra/common.sh && env | grep -E 'PROJECT_ID|REGION|GEMMA_MODEL'
-```
-
-Only export environment variables if you want to change a default
-(for example `export GEMMA_MODEL=gemma3:4b`).
-
-### 3.1 Enable APIs
+Defaults live in `infra/terraform/variables.tf`; `infra/terraform/example.tfvars` shows the
+values worth overriding. Overrides are passed per invocation as `var=value`:
 
 ```bash
-just enable-apis
+just tf-plan gemma_model=gemma3:4b
+just tf-apply gpu_enabled=false
 ```
 
-Enables: `run` / `compute` / `artifactregistry` / `cloudbuild` / `firestore` /
-`aiplatform` / `iam` / `logging` / `cloudtrace`.
-
-`compute.googleapis.com` is required because Direct VPC egress references the `default`
-VPC (see 3.5); without it, subnet resolution fails.
-(`all-thinkgs` is a new project, so this is where they get enabled for the first time.)
-
-### 3.2 Service accounts and IAM
+The environment variables `PROJECT_ID` / `REGION` / `IMAGE_TAG` / `GEMMA_MODEL` /
+`TF_STATE_BUCKET` still work and are read by the recipes themselves:
 
 ```bash
-just iam
+GEMMA_MODEL=gemma3:4b just build gemma
 ```
 
-The service accounts and their permissions:
-
-| SA             | Firestore             | Vertex AI         | run.invoker (granted to) | logging/trace |
-| -------------- | --------------------- | ----------------- | ------------------------ | ------------- |
-| `sa-gateway`   | `datastore.user`      | -                 | -                        | yes           |
-| `sa-core`      | **none (deliberate)** | `aiplatform.user` | from gateway             | yes           |
-| `sa-synthesis` | `datastore.user`      | -                 | from gateway             | yes           |
-| `sa-gemma`     | -                     | -                 | from gateway / synthesis | yes           |
-
-**Giving `sa-core` no Firestore role is the heart of this project.** The Core Agent being
-unable to read the Token Vault is not a promise made in code; it is a fact enforced by IAM.
-That is the pitch. The command to verify it during the demo:
+### 3.1 Bootstrap the Terraform state bucket
 
 ```bash
-gcloud projects get-iam-policy all-thinkgs \
-  --flatten="bindings[].members" \
-  --filter="bindings.members:sa-core@all-thinkgs.iam.gserviceaccount.com" \
-  --format="value(bindings.role)"
-# Expected: only roles/aiplatform.user, roles/logging.logWriter, roles/cloudtrace.agent
-# Not a single datastore line -- that absence is the proof of the structural guarantee
+just tf-bootstrap
 ```
 
-> On the first run the Cloud Run services do not exist yet, so the `run.invoker` grants
-> emit warnings. `deploy.sh` re-runs `iam.sh` at the end to converge, so this is expected.
+Creates `gs://all-thinkgs-tfstate` (override with `TF_STATE_BUCKET`) in the deploy region
+with uniform bucket-level access, public access prevention and **versioning enabled** — so a
+corrupted or truncated state file can be rolled back. The recipe is idempotent and prints
+`already exists` on a second run.
 
-### 3.3 Firestore
+This is the **only** resource in the repository created by gcloud rather than Terraform.
+The reason is chicken-and-egg: the backend bucket has to exist before `terraform init` can
+store state in it, so it cannot be a Terraform resource itself.
+
+### 3.2 Initialise Terraform
 
 ```bash
-just firestore
+just tf-init
 ```
 
-Creates the Native-mode `(default)` database in `us-central1` and sets a TTL policy on the
+Runs `terraform init` against the GCS backend, passing
+`-backend-config=bucket=all-thinkgs-tfstate`. The bucket name is deliberately absent from
+`backend.tf`: keeping it out of the committed config lets a second environment reuse the
+same directory unchanged. State is stored under the prefix `agentic-fleet`.
+
+Re-run this after changing `TF_STATE_BUCKET`, or after a provider version bump
+(`just tf-init -upgrade`).
+
+### 3.3 Build the images
+
+```bash
+just build                    # all four
+just build gemma              # just Gemma
+just build core gateway       # a subset
+```
+
+Cloud Build pushes to the `agentic-fleet` repository in Artifact Registry. Images are built
+outside Terraform on purpose: rebuilding on every plan would be intolerable, and the tag is
+an artifact rather than infrastructure. Terraform consumes the tag through the `image_tag`
+variable (default `latest`).
+
+The Gemma image **bakes the model in at build time**, so it is slow (15-25 minutes for
+`gemma3:12b`). It runs on `e2-highcpu-32` with a 100GB disk and a 3600s timeout. To avoid
+redoing this, pin the tag once a Gemma build succeeds.
+
+> The Artifact Registry repository itself is a Terraform resource, so the very first
+> `just build` on a fresh project has to come **after** the first `just tf-apply`, or the
+> push target does not exist yet. In practice: apply once with `gpu_enabled=false` (which
+> will fail to pull images), run `just build`, then apply again. On any subsequent cycle the
+> repository already exists and `just build` comes first.
+
+### 3.4 Plan and apply
+
+```bash
+just tf-plan                  # review what would change
+just tf-apply                 # apply, with interactive approval
+```
+
+`just tf-apply` deliberately does **not** pass `-auto-approve`: it creates GPU-backed
+billable resources, so a human reads the plan every time. `just deploy` is the shorthand for
+`just build` followed by `just tf-apply`, and takes the same `var=value` overrides.
+
+What a clean apply creates:
+
+| Resource type                            | `gpu_enabled=true` | `gpu_enabled=false` |
+| ---------------------------------------- | ------------------ | ------------------- |
+| `google_project_iam_member`              | 11                 | 11                  |
+| `google_project_service`                 | 9                  | 9                   |
+| `google_cloud_run_v2_service_iam_member` | 5                  | 3                   |
+| `google_service_account`                 | 4                  | 4                   |
+| `google_cloud_run_v2_service`            | 4                  | 3                   |
+| `google_firestore_field` (TTL)           | 1                  | 1                   |
+| `google_firestore_database`              | 1                  | 1                   |
+| `google_artifact_registry_repository`    | 1                  | 1                   |
+| **Total**                                | **36**             | **33**              |
+
+APIs enabled by the `google_project_service` resources: `run` / `compute` /
+`artifactregistry` / `cloudbuild` / `firestore` / `aiplatform` / `iam` / `logging` /
+`cloudtrace`. `compute.googleapis.com` is required because Direct VPC egress references the
+`default` VPC (see 3.7); without it, subnet resolution fails. They are created with
+`disable_on_destroy = false`, so `just tf-destroy` leaves them enabled — disabling an API
+would take unrelated workloads in the project down with it.
+
+Firestore: a Native-mode `(default)` database in `us-central1`, plus a TTL policy on the
 `expires_at` field of the `token_vault` collection.
 
 TTL caveats:
@@ -138,85 +209,175 @@ TTL caveats:
 - **Therefore the reader (Synthesis) must always validate `expires_at` itself.**
   TTL is capacity management, not access control
 
-### 3.4 Build the images
+### 3.5 Deploying while the GPU quota is pending
+
+`gpu_enabled=false` skips the `gemma-serving` service and the two `run.invoker` bindings
+that point at it, leaving 33 resources that need no GPU quota at all. **This is the
+recommended path on a fresh project**, because the L4 quota request (section 6) takes
+minutes to days and everything else can be up and verified in the meantime:
 
 ```bash
-just build                    # all four
-just build gemma              # just Gemma
+just tf-plan gpu_enabled=false     # 33 to add
+just tf-apply gpu_enabled=false
 ```
 
-Pushes to the `agentic-fleet` repository in Artifact Registry.
-
-The Gemma image **bakes the model in at build time**, so it is slow (15-25 minutes for
-`gemma3:12b`). It runs on `e2-highcpu-32` with a 100GB disk and a 3600s timeout. To avoid
-redoing this, pin the tag once a Gemma build succeeds.
-
-### 3.5 Deploy
+Once the quota shows `grantedValue: 1`, flip it back:
 
 ```bash
-just deploy
+just tf-apply                      # gpu_enabled defaults to true; 3 more resources
 ```
 
-Deploys in the order `gemma -> core -> synthesis -> gateway`, wiring each downstream URL
-into the upstream service's environment (`GEMMA_BASE_URL` / `CORE_BASE_URL` /
-`SYNTHESIS_BASE_URL`). This order is mandatory.
+The second apply adds only `gemma-serving` and its two invoker bindings. The three agent
+services are **not** re-created, because the Gemma URL they were given in the first apply is
+computed up front (3.6) rather than read back from the service — so it was already correct
+while the service did not exist.
 
-`GEMMA_BASE_URL` carries the OpenAI-compatible `/v1` path (e.g.
-`https://gemma-serving-xxxx.us-central1.run.app/v1`), which is what
-`packages/common/src/config.ts` validates.
+### 3.6 Deterministic Cloud Run URLs
 
-Core and Synthesis are deployed in **two phases**. Their A2A Agent Card must advertise
-their own public `https://` URL, and Cloud Run only assigns that once the service exists,
-so the initial deploy is followed by:
+Cloud Run assigns every service the URL
 
-```bash
-gcloud run services update core-agent \
-  --update-env-vars A2A_PUBLIC_URL=https://core-agent-xxxx.us-central1.run.app,A2A_HOST=core-agent-xxxx.us-central1.run.app,A2A_PROTOCOL=https
+```
+https://<service>-<project_number>.<region>.run.app
 ```
 
-`just deploy` does this automatically for both services.
+whenever the DNS label (service name + project number + any tag) is 63 characters or fewer.
+For this project the longest is `synthesis-agent` (15) + `-` + the 12-digit project number
+`257034533412` = 28 characters, comfortably inside the limit. Verified against
+[cloud.google.com/run/docs/triggering/https-request](https://cloud.google.com/run/docs/triggering/https-request).
+
+So the URLs are known before anything is created:
+
+| Service           | URL                                                        |
+| ----------------- | ---------------------------------------------------------- |
+| `gateway-agent`   | `https://gateway-agent-257034533412.us-central1.run.app`   |
+| `core-agent`      | `https://core-agent-257034533412.us-central1.run.app`      |
+| `synthesis-agent` | `https://synthesis-agent-257034533412.us-central1.run.app` |
+| `gemma-serving`   | `https://gemma-serving-257034533412.us-central1.run.app`   |
+
+**This is why the whole fleet applies in one pass.** The shell deploy this replaced had to
+create each service, read `status.url` back, and then run a second `gcloud run services
+update` to inject `A2A_PUBLIC_URL` and the downstream base URLs — an ordering constraint
+(`gemma -> core -> synthesis -> gateway`) plus a two-phase patch. Computing the URL from the
+project number collapses that into a single apply and removes the dependency cycle between
+the services entirely: Terraform creates all four in parallel.
+
+`GEMMA_BASE_URL` carries the OpenAI-compatible `/v1` path
+(`https://gemma-serving-257034533412.us-central1.run.app/v1`), which is what
+`packages/common/src/config.ts` validates. `CORE_BASE_URL` and `SYNTHESIS_BASE_URL` are the
+bare base URLs.
+
+`just tf-output deterministic_urls` prints the computed values, and the `gateway_url` /
+`core_url` / `synthesis_url` outputs print what Cloud Run actually assigned — a mismatch
+between the two is immediately visible.
 
 Exposure:
 
-| Service           | Auth                         | Ingress      | Notes                                                |
-| ----------------- | ---------------------------- | ------------ | ---------------------------------------------------- |
-| `gateway-agent`   | `--allow-unauthenticated`    | all          | The only public entry point; also serves the demo UI |
-| `core-agent`      | `--no-allow-unauthenticated` | all          | Gateway's ID token only                              |
-| `synthesis-agent` | `--no-allow-unauthenticated` | all          | Gateway's ID token only                              |
-| `gemma-serving`   | `--no-allow-unauthenticated` | **internal** | Reachable only from inside the boundary              |
+| Service           | Auth                          | Ingress      | Notes                                                |
+| ----------------- | ----------------------------- | ------------ | ---------------------------------------------------- |
+| `gateway-agent`   | `allUsers` has `run.invoker`  | all          | The only public entry point; also serves the demo UI |
+| `core-agent`      | IAM (gateway SA only)         | all          | Gateway's ID token only                              |
+| `synthesis-agent` | IAM (gateway SA only)         | all          | Gateway's ID token only                              |
+| `gemma-serving`   | IAM (gateway / synthesis SAs) | **internal** | Reachable only from inside the boundary              |
 
-Shared environment variables injected into every service:
+Core and Synthesis are kept private by **IAM** — no `allUsers` invoker binding — not by
+ingress. Restricting their ingress instead would only add a failure mode, since there is no
+load balancer in front of them and nothing outside Cloud Run needs to reach them.
+`gemma-serving` is `INGRESS_TRAFFIC_INTERNAL_ONLY` on top of IAM, which is what makes a
+403 from a laptop the evidence in 8.4.
+
+Shared environment variables injected into every agent service:
 `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` / `VAULT_BACKEND=firestore` /
-`FIRESTORE_DATABASE` / `VAULT_COLLECTION`. Core additionally gets
-`GOOGLE_GENAI_USE_VERTEXAI=1` and `GEMINI_MODEL`.
+`FIRESTORE_DATABASE` / `VAULT_COLLECTION` / `GEMMA_MODEL` / `OTEL_ENABLED`, plus
+`A2A_PUBLIC_URL` / `A2A_HOST` / `A2A_PROTOCOL` for the service's own Agent Card. Core
+additionally gets `GOOGLE_GENAI_USE_VERTEXAI=1` and `GEMINI_MODEL`.
 
-#### Why Direct VPC egress is required
+### 3.6.1 Service accounts and IAM
 
-`gemma-serving` uses `--ingress internal`. However, Cloud Run's default egress does not
-traverse a VPC, so **a Cloud Run service calling another Cloud Run service on internal
-ingress gets a 403**. The fix is to give the callers (`gateway` and `synthesis`) Direct
-VPC egress:
+The service accounts and their permissions, all declared in `infra/terraform/iam.tf`:
 
+| SA             | Firestore             | Vertex AI         | run.invoker (granted to) | logging/trace |
+| -------------- | --------------------- | ----------------- | ------------------------ | ------------- |
+| `sa-gateway`   | `datastore.user`      | -                 | -                        | yes           |
+| `sa-core`      | **none (deliberate)** | `aiplatform.user` | from gateway             | yes           |
+| `sa-synthesis` | `datastore.user`      | -                 | from gateway             | yes           |
+| `sa-gemma`     | -                     | -                 | from gateway / synthesis | yes           |
+
+**Giving `sa-core` no Firestore role is the heart of this project.** The Core Agent being
+unable to read the Token Vault is not a promise made in code; it is a fact enforced by IAM,
+and now by a Terraform configuration that can be read and diffed. The command to verify it
+during the demo:
+
+```bash
+gcloud projects get-iam-policy all-thinkgs \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:sa-core@all-thinkgs.iam.gserviceaccount.com" \
+  --format="value(bindings.role)"
+# Expected: only roles/aiplatform.user, roles/logging.logWriter, roles/cloudtrace.agent
+# Not a single datastore line -- that absence is the proof of the structural guarantee
 ```
---network=default --subnet=default --vpc-egress=private-ranges-only
+
+The bindings use `google_project_iam_member` rather than `google_project_iam_binding`:
+`_binding` is authoritative for the whole role and would strip memberships the project
+already has, including Google-managed service agents.
+
+> The old two-pass `iam.sh` warning is gone. Terraform's `depends_on` orders the
+> `run.invoker` grants after the Cloud Run services within a single apply, so there is no
+> first-run window where the grants fail.
+
+### 3.7 Why Direct VPC egress is required
+
+`gemma-serving` uses internal ingress. However, Cloud Run's default egress does not traverse
+a VPC, so **a Cloud Run service calling another Cloud Run service on internal ingress gets a
+403**. The fix is to give the callers Direct VPC egress, which in Terraform is:
+
+```hcl
+vpc_access {
+  egress = "PRIVATE_RANGES_ONLY"
+  network_interfaces {
+    network    = "default"
+    subnetwork = "default"
+  }
+}
 ```
 
-Because it is `private-ranges-only`, external destinations such as Vertex AI still go out
-the normal path. The `default` VPC and the `us-central1` `default` subnet (10.128.0.0/20)
-have been confirmed to exist in `all-thinkgs`, so nothing extra needs creating (the
-requirement is `/26` or larger, and `/20` satisfies it). `compute.googleapis.com` must be
-enabled for this reference to resolve (see 3.1).
+This is set on **`gateway-agent` and `synthesis-agent`** only. `core-agent` has **no** VPC
+egress at all: it reaches only Vertex AI, which is a public endpoint, so a VPC path would
+buy it nothing.
+
+Because it is `PRIVATE_RANGES_ONLY`, external destinations such as Vertex AI and Firestore
+still go out the normal path. The `default` VPC and the `us-central1` `default` subnet
+(10.128.0.0/20) have been confirmed to exist in `all-thinkgs`, so nothing extra needs
+creating (the requirement is `/26` or larger, and `/20` satisfies it).
+`compute.googleapis.com` must be enabled for this reference to resolve (see 3.4).
 
 Why not a Serverless VPC Access connector: the connector VM bills continuously and takes
 minutes to provision. Direct VPC egress achieves the same thing with no extra resources.
+
+### 3.8 Keeping the configuration honest
+
+`terraform fmt`, `terraform validate` and `tflint` run in the lefthook pre-commit hook
+(scoped to `infra/terraform/*.tf`) and in a dedicated `terraform` job in CI. Locally:
+
+```bash
+just tf-fmt          # format in place
+just tf-fmt-check    # detect drift
+just tf-validate     # validate without a backend or credentials
+just tf-lint         # tflint
+```
+
+`just tf-validate` and the CI job both use `-backend=false`, so they work without
+credentials for the state bucket. All four are also reachable through the aggregate
+`just fmt` / `just fmt-check` / `just lint` / `just check` entry points.
 
 ---
 
 ## 4. Service-to-service auth (**implementation requirement for the code**)
 
-Cloud Run's `--no-allow-unauthenticated` means **IAM authentication**: the caller must
-attach an **ID token** as `Authorization: Bearer`, or it gets a 403. Note it must be an
-ID token, not an access token (`print-access-token`).
+Cloud Run "require authentication" means **IAM authentication**: the caller must attach an
+**ID token** as `Authorization: Bearer`, or it gets a 403. Note it must be an ID token, not
+an access token (`print-access-token`). `roles/run.invoker` on the callee is what makes that
+token accepted, and those bindings are the
+`google_cloud_run_v2_service_iam_member.invoker` resources in `infra/terraform/iam.tf`.
 
 For whoever implements the agents (this belongs in `agents/common/`):
 
@@ -234,7 +395,7 @@ def id_token_for(audience: str) -> str:
 
 def a2a_headers(target_url: str) -> dict[str, str]:
     # The audience must be the service's base URL, with no path or query string.
-    # e.g. https://core-agent-xxxx.us-central1.run.app
+    # e.g. https://core-agent-257034533412.us-central1.run.app
     return {"Authorization": f"Bearer {id_token_for(target_url)}"}
 ```
 
@@ -274,7 +435,7 @@ Rates are the real `us-central1` SKUs from the Cloud Billing API (as of 2026-08,
 
 ### Hourly rate while instances are up
 
-`gemma-serving` (1 GPU + 8 vCPU + 32GiB, `--no-cpu-throttling`):
+`gemma-serving` (1 GPU + 8 vCPU + 32GiB, `cpu_idle = false`):
 
 | Component                    | $/h            |
 | ---------------------------- | -------------- |
@@ -290,8 +451,10 @@ The three agent services (1 vCPU + 1GiB each): $0.072/h each, so **$0.216/h** to
 
 ### What it actually costs
 
-With `--min-instances=0`, **idle costs $0**. Charges apply only while requests are being
+With `min_instance_count = 0`, **idle costs $0**. Charges apply only while requests are being
 handled and during the idle timeout (about 15 minutes by default).
+An apply with `gpu_enabled=false` costs essentially nothing while the quota is pending, which
+is another reason to prefer that path.
 
 | Scenario                                                  | Approx.                          |
 | --------------------------------------------------------- | -------------------------------- |
@@ -299,17 +462,18 @@ handled and during the idle timeout (about 15 minutes by default).
 | Sporadic development use (about 1 hour/day)               | ~$1.6 / day                      |
 | **Left running for 24h by mistake**                       | **~$39 / day** <- watch out      |
 | Cloud Build (Gemma, e2-highcpu-32 for ~25 min)            | ~$0.5 / build                    |
-| Firestore / Artifact Registry                             | free tier to a few tens of cents |
+| Firestore / Artifact Registry / state bucket              | free tier to a few tens of cents |
 
 **Forgetting to shut down the GPU is the only real way to get hurt here.** Always run the
-teardown in section 8 when you finish. Gemini (Vertex AI) is billed per token and comes to
+teardown in section 10 when you finish. Gemini (Vertex AI) is billed per token and comes to
 a few tens of cents at demo scale.
 
 ---
 
 ## 6. GPU quota
 
-A new project usually has a Cloud Run GPU quota of **0**. Check before deploying.
+A new project usually has a Cloud Run GPU quota of **0**. Check before deploying with
+`gpu_enabled=true`.
 
 ### Check
 
@@ -325,7 +489,7 @@ filter for `nvidia`.
 
 ### Which quota to request
 
-`deploy.sh` uses `--no-gpu-zonal-redundancy`, so request the **first** one:
+`gemma-serving` sets `gpu_zonal_redundancy_disabled = true`, so request the **first** one:
 
 - `Total Nvidia L4 GPU allocation without zonal redundancy, per project per region` <- **this one**
 - `Total Nvidia L4 GPU allocation with zonal redundancy, per project per region`
@@ -341,8 +505,8 @@ just quota-request
 ```
 
 The recipe wraps `gcloud alpha quotas preferences create` with
-`--quota-id=NvidiaL4GpuAllocNoZonalRedundancyPerProjectRegion` and
-`--preferred-value=1`, taking the region from `infra/common.sh`.
+`--quota-id=NvidiaL4GpuAllocNoZonalRedundancyPerProjectRegion` and `--preferred-value=1`,
+taking the region from the `REGION` environment variable (default `us-central1`).
 
 The quota id is `NvidiaL4GpuAllocNoZonalRedundancyPerProjectRegion` -- note it is _not_
 `...PerProjectPerRegion`, which is a common and silent mistake.
@@ -355,11 +519,11 @@ just quota-status
 
 Read the result as follows:
 
-| Field                           | Meaning                                         |
-| ------------------------------- | ----------------------------------------------- |
-| `reconciling: true`             | Still under review                              |
-| `quotaConfig.grantedValue: '0'` | Not granted yet -- a GPU deploy will still fail |
-| `quotaConfig.grantedValue: '1'` | **Approved.** `deploy.sh` can now run           |
+| Field                           | Meaning                                            |
+| ------------------------------- | -------------------------------------------------- |
+| `reconciling: true`             | Still under review                                 |
+| `quotaConfig.grantedValue: '0'` | Not granted yet -- deploy with `gpu_enabled=false` |
+| `quotaConfig.grantedValue: '1'` | **Approved.** `just tf-apply` can now run          |
 
 Current state (as of writing): preference id `34528bab-4b5b-47f1-82da-cec57b21a95d`,
 `reconciling: true`, `grantedValue: 0` -- i.e. **pending**. Re-check before deploying.
@@ -367,8 +531,8 @@ Current state (as of writing): preference id `34528bab-4b5b-47f1-82da-cec57b21a9
 ### How to request (Console)
 
 1. Select the row in the Console Quotas page -> **EDIT QUOTAS**
-2. Region = `us-central1`, New limit = **1** (matching `--max-instances=1`; asking for a
-   larger number draws out the review, so request the minimum you need)
+2. Region = `us-central1`, New limit = **1** (matching `max_instance_count = 1`; asking for
+   a larger number draws out the review, so request the minimum you need)
 3. Write the justification in English, for example:
    > Hackathon project (All Things Agentic Hackathon, submission due 2026-08-31).
    > Serving Gemma 3 with Ollama on Cloud Run GPU for a privacy-preserving
@@ -376,13 +540,14 @@ Current state (as of writing): preference id `34528bab-4b5b-47f1-82da-cec57b21a9
 4. Approval takes **minutes to a few business days**. Given the deadline, **file this first,
    before anything else**
 
-### If it is denied
+### While it is pending, or if it is denied
 
-| Step | Action                                                                         |
-| ---- | ------------------------------------------------------------------------------ |
-| 1    | Drop to `GEMMA_MODEL=gemma3:4b` (3.3GB, but still needs an L4)                 |
-| 2    | Request in another region: `REGION=us-east4` / `europe-west1` / `europe-west4` |
-| 3    | Give up on GPU and go through Vertex AI (below)                                |
+| Step | Action                                                                                       |
+| ---- | -------------------------------------------------------------------------------------------- |
+| 0    | **Deploy the other 33 resources now**: `just tf-apply gpu_enabled=false` (see 3.5)           |
+| 1    | Drop to `just tf-apply gemma_model=gemma3:4b` (3.3GB, but still needs an L4)                 |
+| 2    | Request in another region: `just tf-apply region=us-east4` / `europe-west1` / `europe-west4` |
+| 3    | Give up on GPU and go through Vertex AI (below)                                              |
 
 ---
 
@@ -396,16 +561,20 @@ Instead of self-hosting Gemma, use a Vertex AI Model Garden Gemma endpoint.
 ```bash
 # Check whether Gemma is deployable in Model Garden (read-only)
 gcloud ai model-garden models list --region=us-central1 --filter="gemma" 2>/dev/null | head
-
-# After deploying to an endpoint, delete gemma-serving and swap the env vars
-gcloud run services delete gemma-serving --region=us-central1 --quiet
-gcloud run services update gateway-agent --region=us-central1 \
-  --set-env-vars="GEMMA_BACKEND=vertex,GEMMA_ENDPOINT_ID=<ENDPOINT_ID>"
-gcloud run services update synthesis-agent --region=us-central1 \
-  --set-env-vars="GEMMA_BACKEND=vertex,GEMMA_ENDPOINT_ID=<ENDPOINT_ID>"
 ```
 
-This also requires adding `roles/aiplatform.user` to `sa-gateway` and `sa-synthesis`.
+Then take `gemma-serving` out of the picture and point the agents at the endpoint:
+
+```bash
+just tf-apply gpu_enabled=false
+```
+
+The Terraform configuration has no Model Garden variables, so wiring `GEMMA_BACKEND=vertex`
+and `GEMMA_ENDPOINT_ID` into `gateway-agent` and `synthesis-agent` means adding them to
+`local.agent_services` in `infra/terraform/locals.tf` and re-applying — not a
+`gcloud run services update`, which the next apply would revert. The same edit needs
+`roles/aiplatform.user` added to `sa-gateway` and `sa-synthesis` in
+`local.sa_project_roles` (`infra/terraform/iam.tf`).
 
 ### The trust-boundary trade-off (important)
 
@@ -420,7 +589,7 @@ operate**. Going through Model Garden changes that:
   say it is hosted inside the boundary. It is **a weaker claim** than the Cloud Run GPU setup
 
 So the real demo should run on the GPU configuration. File the quota request in section 6
-as your first action.
+as your first action, and use `gpu_enabled=false` to keep building while it is reviewed.
 
 ---
 
@@ -429,9 +598,13 @@ as your first action.
 ### 8.1 Deployment state
 
 ```bash
-gcloud run services list --region=us-central1 \
-  --format="table(metadata.name, status.url, spec.template.spec.serviceAccountName)"
+just urls      # the deployed services and their URLs
+just health    # /healthz on each agent, with an ID token
+just tf-output # the Terraform outputs, including deterministic_urls
 ```
+
+`just health` prints `not deployed` for a service that does not exist, which is the expected
+line for `gemma-serving` while the quota is pending.
 
 ### 8.2 Gateway (public, no auth)
 
@@ -460,6 +633,8 @@ curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-know
 > `gcloud auth print-identity-token` returns **your own** ID token. It works because you are
 > an Owner. Service-to-service calls use each SA's own ID token (see section 4).
 
+`just agent-card core-agent` does the token dance for you.
+
 ### 8.4 Gemma (internal ingress, unreachable from outside)
 
 Being unreachable from your laptop is **correct** and is evidence the boundary works.
@@ -471,11 +646,8 @@ curl -s -o /dev/null -w "from laptop -> HTTP %{http_code}\n" \
 # 403 is the expected result
 ```
 
-Check connectivity through a gateway diagnostic endpoint or via the logs instead.
-
-```bash
-gcloud run services logs read gemma-serving --region=us-central1 --limit=50
-```
+Check connectivity through a gateway diagnostic endpoint or via the logs instead
+(`just logs-service gemma-serving`).
 
 ### 8.5 Firestore TTL
 
@@ -539,12 +711,17 @@ curl -s -o /dev/null -w "with ID  -> %{http_code}\n" \
   -H "Authorization: Bearer $(gcloud auth print-identity-token)" "${CORE_URL}/.well-known/agent.json"
 ```
 
+Worth adding now that the infrastructure is declarative: a few seconds of
+`infra/terraform/iam.tf` on screen, scrolled to the block that gives `sa-core` only
+`roles/aiplatform.user`. The absence of a Firestore role is easier to believe when it is
+visible as committed code next to the `gcloud` output that confirms it.
+
 ### 9.3 Filming tips
 
 - **Always keep the project ID `all-thinkgs` on screen** (Console header or URL bar). It is
   the simplest possible proof that this is not a local mock
-- Show the public URL (`https://gateway-agent-....us-central1.run.app`) in the browser's
-  address bar. A visible `localhost` ruins the effect
+- Show the public URL (`https://gateway-agent-257034533412.us-central1.run.app`) in the
+  browser's address bar. A visible `localhost` ruins the effect
 - **Warm the GPU up before filming.** Nobody sits through a 1-2 minute cold start on video.
   Fire one dummy request right before recording to get the instance running
 - The video is 4 minutes, so keep the Console tour to 30-40 seconds and spend the rest on
@@ -557,27 +734,43 @@ curl -s -o /dev/null -w "with ID  -> %{http_code}\n" \
 **Stopping GPU billing comes first. Always run this when you finish.**
 
 ```bash
-just destroy
+just tf-destroy
 ```
 
-By default this deletes only the four Cloud Run services, keeping Firestore, the service
-accounts, and the images. For a full cleanup:
+Terraform prompts for confirmation and then removes everything it manages: the four Cloud
+Run services, the four service accounts and their role bindings, the invoker bindings and
+the Artifact Registry repository (images included).
 
-```bash
-DELETE_IMAGES=1 DELETE_SA=1 DELETE_FIRESTORE=1 just destroy
-```
+Two things deliberately survive:
 
-> `DELETE_FIRESTORE=1` destroys the Token Vault and the audit log. Do not run it while you
-> still need the demo evidence.
+| Resource              | Why it survives                                                          |
+| --------------------- | ------------------------------------------------------------------------ |
+| Firestore `(default)` | `deletion_policy = ABANDON` — the Token Vault and the audit records stay |
+| The 9 enabled APIs    | `disable_on_destroy = false` — disabling them would hit other workloads  |
+
+The Firestore database is abandoned rather than destroyed on purpose: `just tf-destroy` must
+not be able to take the demo evidence with it. If you genuinely mean to delete it, do so by
+hand in the Console after removing it from state. (The old `DELETE_FIRESTORE=1` /
+`DELETE_SA=1` / `DELETE_IMAGES=1` flags on `just destroy` no longer exist; service accounts
+and images now go with the normal destroy.)
+
+The Terraform state bucket is outside Terraform's own lifecycle, so `just tf-destroy` leaves
+it in place. That is what makes a later `just tf-apply` a clean re-create rather than a
+re-bootstrap.
 
 Verify:
 
 ```bash
-gcloud run services list --region=us-central1   # should be empty
+just urls        # should be empty
+just tf-output   # should report no outputs
 ```
 
-To stop just the GPU service while keeping its configuration:
+To stop just the GPU service while keeping everything else deployed:
 
 ```bash
-gcloud run services update gemma-serving --region=us-central1 --max-instances=0
+just tf-apply gpu_enabled=false
 ```
+
+This is the same switch used while the quota is pending, and it is the preferred way to park
+the fleet between sessions: GPU billing stops, the other 33 resources stay up, and
+`just tf-apply` brings Gemma back without touching the agent services.

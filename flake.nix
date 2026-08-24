@@ -15,7 +15,18 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        # Terraform moved to the BSL in 1.6, so nixpkgs marks it unfree.
+        # Why a predicate rather than `allowUnfree = true`: this permits exactly
+        # one package, so an unfree dependency slipping in elsewhere still fails
+        # the build instead of being silently accepted.
+        # Why not opentofu (which is Apache-2.0 and would need no exception):
+        # the google/google-beta providers are published and validated against
+        # HashiCorp's registry first, and the Cloud Run v2 GPU attributes this
+        # stack depends on land there earliest.
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = pkg: builtins.elem (nixpkgs.lib.getName pkg) [ "terraform" ];
+        };
 
         # Playwright E2E (chromium only). The browser bundle is pinned by
         # nixpkgs, so @playwright/test in web/package.json MUST match
@@ -33,6 +44,7 @@
           lefthook
           gitleaks
           pinact
+          gh # pinact-verify needs an authenticated GitHub token (see lefthook.yml)
           actionlint
           ruff
           gcloud
@@ -40,6 +52,10 @@
           yq-go
           shellcheck
           nixfmt
+
+          # Infrastructure is declared in Terraform under infra/terraform/.
+          terraform
+          tflint
 
           # Node is the primary runtime (pnpm workspace: web, packages/*,
           # agents/*). Why not corepack: pinning pnpm through nixpkgs keeps it
