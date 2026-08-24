@@ -88,7 +88,7 @@ jobs:
         run: pnpm -r typecheck
 
       - name: test
-        run: pnpm -r test
+        run: pnpm test
 
       # Install the browser via Playwright's own CLI rather than a marketplace
       # action, so the version always tracks the @playwright/test in the lockfile.
