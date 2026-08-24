@@ -17,14 +17,14 @@
   "dependencies": {
     "@privacy-gateway/common": "workspace:*",
     "yaml": "^2.7.0",
-    "zod": "^3.24.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@playwright/test": "1.61.1",
+    "@playwright/test": "1.62.1",
     "@privacy-gateway/gateway": "workspace:*",
     "@privacy-gateway/synthesis": "workspace:*",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.3",
-    "vite": "^6.0.7"
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
   }
 }

@@ -45,26 +45,26 @@
     "fmt:check": "oxfmt --check"
   },
   "dependencies": {
-    "@google-cloud/firestore": "^7.11.0",
-    "@google-cloud/opentelemetry-cloud-trace-exporter": "^2.4.1",
+    "@google-cloud/firestore": "^9.0.0",
+    "@google-cloud/opentelemetry-cloud-trace-exporter": "^3.1.0",
     "@google/adk": "2.0.0",
     "@google/genai": "^2.9.0",
-    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/core": "^2.0.0",
     "@opentelemetry/resources": "^2.0.0",
     "@opentelemetry/sdk-trace-base": "^2.0.0",
     "@opentelemetry/sdk-trace-node": "^2.0.0",
     "@opentelemetry/semantic-conventions": "^1.28.0",
-    "google-auth-library": "^9.15.0",
-    "uuid": "^11.0.0",
+    "google-auth-library": "^11.0.2",
+    "uuid": "^14.0.2",
     "yaml": "^2.7.0",
-    "zod": "^3.24.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@opentelemetry/sdk-trace-node": "^2.0.0",
-    "@types/node": "^22.10.0",
-    "typescript": "^5.7.2",
-    "vitest": "^3.0.0"
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=22"

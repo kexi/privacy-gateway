@@ -14,18 +14,18 @@
     "fmt:check": "oxfmt --check"
   },
   "dependencies": {
-    "@a2a-js/sdk": "0.3.14",
+    "@a2a-js/sdk": "1.0.1",
     "@google/adk": "2.0.0",
     "@privacy-gateway/common": "workspace:*",
     "express": "^5.1.0",
-    "zod": "^3.24.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.2.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "vitest": "^3.0.0"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=22"
