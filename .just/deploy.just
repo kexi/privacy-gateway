@@ -170,6 +170,69 @@ build *services:
     gcloud artifacts docker images list "${ar_path}" \
       --project="{{ project_id }}" --format="table(package,tags,createTime)" || true
 
+# Build the three agent images locally, without pushing (fast packaging check)
+image-build-local:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The repository root is the build context for all three: they share
+    # packages/common, and only the Dockerfile path differs.
+    for t in core gateway synthesis; do
+      echo "==> building pgw-${t}:local"
+      docker build -f "agents/${t}/Dockerfile" -t "pgw-${t}:local" .
+    done
+    echo "OK: all three images built"
+
+# Start the Synthesis image and assert it emits real attestation digests
+image-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The packaging check the unit tests structurally cannot make.
+    #
+    # The production image ships `dist/` alone: no `.ts` sources and no
+    # `knowledge/` bundle. That is exactly the environment where the old on-disk
+    # hash degraded to the literal string `unavailable` while the document still
+    # wrote `verified` and read back as `machine-confirmed`. Every vitest run
+    # happens in a checkout where both files are present, so no unit test could
+    # ever have caught it — only starting the real container can.
+    #
+    # Digests are now build-time constants compiled into `dist/`, and
+    # `GET /v1/attestation` reports them. A 64-hex answer from inside the
+    # container is the evidence that the packaging is sound.
+    image="${IMAGE:-pgw-synthesis:local}"
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      echo "==> ${image} not present; building it"
+      docker build -f agents/synthesis/Dockerfile -t "$image" .
+    fi
+
+    name="pgw-image-test-$$"
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    docker run -d --name "$name" -p 18083:8083 \
+      -e VAULT_BACKEND=memory -e PORT=8083 "$image" >/dev/null
+
+    # Poll rather than sleep: a fixed wait is either flaky or slow.
+    for _ in $(seq 1 60); do
+      if curl -sf http://127.0.0.1:18083/healthz >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+
+    body=$(curl -sf http://127.0.0.1:18083/v1/attestation) || {
+      echo "FAIL: could not reach /v1/attestation in the running image"
+      docker logs "$name" 2>&1 | tail -40
+      exit 1
+    }
+    echo "$body" | jq .
+
+    for key in attester_sha256 computation_sha256; do
+      value=$(echo "$body" | jq -r ".${key}")
+      if ! printf '%s' "$value" | grep -Eq '^[0-9a-f]{64}$'; then
+        echo "FAIL: ${key} is '${value}', not a sha256 digest"
+        exit 1
+      fi
+      echo "OK   ${key}: ${value}"
+    done
+
+    echo "OK: the production image emits replayable attestation digests"
+
 # Build the images and apply the Terraform configuration with that tag
 deploy *vars: build (tf-apply vars)
 

@@ -10,6 +10,7 @@ import {
   isStale,
   nowIso,
   parse,
+  REQUEST_ARTIFACT_BASE,
   TRUST_HUMAN_REVIEWED,
   TRUST_MACHINE_CONFIRMED,
   TRUST_UNVERIFIED,
@@ -22,10 +23,12 @@ const REQUEST_ID = '01920000-0000-7000-8000-000000000001';
 
 const EVIDENCE: AttestationEvidence = {
   computation: '/computations/leak-check.md',
+  // Hex on purpose: a digest that is not 64 lowercase hex characters names
+  // bytes nobody can fetch, and the builder refuses to machine-confirm over one.
   computationSha256: 'c'.repeat(64),
   attesterSha256: 'a'.repeat(64),
-  maskedPromptSha256: 'm'.repeat(64),
-  coreResponseSha256: 'r'.repeat(64),
+  maskedPromptSha256: '0'.repeat(64),
+  coreResponseSha256: 'f'.repeat(64),
   checkedAt: new Date('2026-08-24T10:00:00Z'),
 };
 
@@ -273,8 +276,11 @@ describe('Gateway Answer assembly', () => {
   it('cites both masked artifacts and the policy, at paths the gateway serves', () => {
     const sources = answer().metadata['sources'] as Array<{ resource: string }>;
     const resources = sources.map((source) => source.resource);
-    expect(resources).toContain(`/requests/${REQUEST_ID}/masked-prompt.md`);
-    expect(resources).toContain(`/requests/${REQUEST_ID}/core-response.md`);
+    // The gateway serves these under /v1; a source that omits the prefix is a
+    // dangling link and makes the document unreplayable.
+    expect(resources).toContain(`${REQUEST_ARTIFACT_BASE}/${REQUEST_ID}/masked-prompt.md`);
+    expect(resources).toContain(`${REQUEST_ARTIFACT_BASE}/${REQUEST_ID}/core-response.md`);
+    expect(REQUEST_ARTIFACT_BASE).toBe('/v1/requests');
     expect(resources).toContain('/policies/pii-masking.md');
   });
 

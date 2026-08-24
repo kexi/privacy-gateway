@@ -11,7 +11,7 @@ parameters:
   - { name: response, type: string, required: true }
 executor:
   resource: /references/skills/run-leak-check.md
-  receipt: [request_id, masked_prompt_hash, response_hash, findings, response]
+  receipt: [request_id, masked_prompt_hash, response_hash, findings, response, masked_prompt]
 attester:
   resource: /references/attesters/leak_check.ts
 generated: { by: gateway_fleet/bootstrap, at: 2026-08-24T00:00:00Z }

@@ -22,8 +22,11 @@ be derived and never stored, and a client that re-derives it proves the property
 holds end to end.
 
 ``verify`` goes further: it re-runs the leak-check scan over the masked artifacts
-the gateway serves and compares every digest the answer records, so the fleet's
-own claim about the verdict is checked rather than believed.
+the gateway serves and checks **every** digest the answer records — the two
+artifact hashes against the bytes the gateway serves, and the attester and
+computation hashes against the bundle files in this checkout — plus the request
+id and the verdict. A digest that is not 64 lowercase hex characters fails
+outright rather than being printed and ignored.
 """
 
 from __future__ import annotations
@@ -281,8 +284,39 @@ def _attestation_block(markdown: str) -> dict[str, str]:
     }
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# The bundle files the `attestation` block names, relative to the repository
+# root. A checkout is the third party's copy of the code that produced the
+# verdict; hashing it here is what turns `attester_sha256` from a number the
+# fleet asserts into one the reader confirms.
+_BUNDLE_PATHS = {
+    "attester_sha256": "knowledge/references/attesters/leak_check.ts",
+    "computation_sha256": "knowledge/computations/leak-check.md",
+}
+
+
+def _repo_root() -> str:
+    """The repository root, derived from this script's own location."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _bundle_digest(relative: str) -> str | None:
+    """SHA-256 of a bundle file, or ``None`` when the checkout is absent."""
+    try:
+        with open(os.path.join(_repo_root(), relative), "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
-    """Re-derive one answer's verdict from the artifacts the gateway serves."""
+    """Re-derive one answer's verdict from the artifacts the gateway serves.
+
+    Every digest the document records is checked, not just the two artifact
+    hashes: a replay that ignores ``attester_sha256`` and ``computation_sha256``
+    cannot tell whether the verdict came from the code the document names.
+    """
     base = args.base.rstrip("/")
     with httpx.Client(base_url=base, timeout=TIMEOUT_SECONDS) as http:
         try:
@@ -304,28 +338,72 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return fail("the document carries no attestation block; nothing to replay")
 
     findings = scan(core.text)
-    checks: list[tuple[str, bool, str]] = [
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. Syntax. A digest that is not 64 lowercase hex characters names bytes
+    #    nobody can fetch, so it is rejected before it is compared to anything.
+    for name in (
+        "masked_prompt_sha256",
+        "core_response_sha256",
+        "attester_sha256",
+        "computation_sha256",
+    ):
+        value = recorded.get(name, "")
+        checks.append(
+            (f"{name} is a sha256 digest", bool(_SHA256_RE.match(value)), value or "(absent)")
+        )
+
+    # 2. The two artifacts the gateway serves, hashed here.
+    checks.append(
         (
-            "masked_prompt_sha256",
+            "masked_prompt_sha256 matches the served prompt",
             recorded.get("masked_prompt_sha256") == sha256(prompt.text),
             recorded.get("masked_prompt_sha256", "(absent)"),
-        ),
+        )
+    )
+    checks.append(
         (
-            "core_response_sha256",
+            "core_response_sha256 matches the served response",
             recorded.get("core_response_sha256") == sha256(core.text),
             recorded.get("core_response_sha256", "(absent)"),
-        ),
+        )
+    )
+
+    # 3. The attester and the computation, hashed from the bundle in this
+    #    checkout. Skipped (and reported as skipped, never as a pass) when the
+    #    script runs outside the repository.
+    for name, relative in _BUNDLE_PATHS.items():
+        local = _bundle_digest(relative)
+        if local is None:
+            print(f"SKIP {name} vs {relative}: bundle file not found in this checkout")
+            continue
+        checks.append(
+            (
+                f"{name} matches {relative}",
+                recorded.get(name) == local,
+                recorded.get(name, "(absent)"),
+            )
+        )
+
+    # 4. The request id the document binds itself to, and the verdict.
+    checks.append(
         (
-            "verdict",
+            "request_id matches the document",
+            recorded.get("request_id") == args.request_id,
+            recorded.get("request_id", "(absent)"),
+        )
+    )
+    checks.append(
+        (
+            "verdict matches the independently derived findings",
             recorded.get("verdict") == ("pass" if not findings else "fail"),
             recorded.get("verdict", "(absent)"),
-        ),
-    ]
+        )
+    )
 
     for name, ok, value in checks:
         print(f"{'OK  ' if ok else 'FAIL'} {name}: {value}")
     print(f"     independently derived findings: {', '.join(findings) or '(none)'}")
-    print(f"     recorded attester_sha256: {recorded.get('attester_sha256', '(absent)')}")
     print(f"     trust tier: {trust_tier(okf.text)}")
 
     return 0 if all(ok for _, ok, _ in checks) else 2

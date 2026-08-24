@@ -16,10 +16,13 @@ import {
   authorizedFetch,
   authorizedHeaders,
   IdTokenError,
+  idTokenAudienceAllowlist,
   isLocalhost,
   requiresIdToken,
   resetIdTokenCache,
   setGoogleAuthForTests,
+  setIdTokenAudienceAllowlist,
+  UnknownAudienceError,
 } from '../src/http_client.ts';
 
 /**
@@ -231,5 +234,110 @@ describe('explicit useIdToken override', () => {
 
     expect(audiences).toEqual([]);
     expect(headerOf(calls[0]!.init, 'authorization')).toBeUndefined();
+  });
+});
+
+describe('the audience allowlist (P2)', () => {
+  const CORE = 'https://core-agent-abc.us-central1.run.app';
+  const SYNTHESIS = 'https://synthesis-agent-abc.us-central1.run.app';
+
+  it('attaches a token to a configured origin', async () => {
+    const { auth } = stubAuth(() => 'token');
+    setGoogleAuthForTests(auth);
+    setIdTokenAudienceAllowlist([CORE, SYNTHESIS]);
+
+    const headers = await authorizedHeaders(`${CORE}/jsonrpc`);
+    expect(headers['authorization']).toBe('Bearer token');
+  });
+
+  it('refuses to mint a token for an origin nobody configured', async () => {
+    // A mistyped SYNTHESIS_BASE_URL used to hand this fleet's service identity
+    // to whatever host the typo named. The token is never created at all now.
+    const { auth, audiences } = stubAuth(() => 'token');
+    setGoogleAuthForTests(auth);
+    setIdTokenAudienceAllowlist([CORE, SYNTHESIS]);
+
+    await expect(authorizedHeaders('https://attacker.example.com/collect')).rejects.toThrow(
+      UnknownAudienceError,
+    );
+    expect(audiences).toEqual([]);
+  });
+
+  it('sends no request at all to a rejected origin', async () => {
+    const { auth } = stubAuth(() => 'token');
+    setGoogleAuthForTests(auth);
+    setIdTokenAudienceAllowlist([CORE]);
+    const { impl, calls } = recordingFetch();
+
+    await expect(
+      authorizedFetch('https://attacker.example.com/collect', { fetchImpl: impl }),
+    ).rejects.toThrow(UnknownAudienceError);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('names the rejected origin without a token in the error', async () => {
+    setIdTokenAudienceAllowlist([CORE]);
+    const error = await authorizedHeaders('https://attacker.example.com/x').catch(
+      (thrown: unknown) => thrown,
+    );
+
+    expect(error).toBeInstanceOf(UnknownAudienceError);
+    expect((error as UnknownAudienceError).origin).toBe('https://attacker.example.com');
+    expect((error as UnknownAudienceError).event).toBe('auth.audience.rejected');
+  });
+
+  it('allows every https origin while no allowlist is declared', async () => {
+    // `just dev` and the tests declare none; the previous behaviour holds there.
+    const { auth } = stubAuth(() => 'token');
+    setGoogleAuthForTests(auth);
+
+    const headers = await authorizedHeaders('https://anything.example.com/x');
+    expect(headers['authorization']).toBe('Bearer token');
+  });
+
+  it('ignores an http entry, which names no IAM-protected service', () => {
+    setIdTokenAudienceAllowlist(['http://localhost:8083', CORE, undefined, '']);
+    expect(idTokenAudienceAllowlist()).toEqual([CORE]);
+  });
+});
+
+describe('caller signals', () => {
+  it('does not start a request whose signal is already aborted', async () => {
+    // `addEventListener` never fires for an abort that has already happened, so
+    // the old code sent a request the caller had already cancelled.
+    const controller = new AbortController();
+    controller.abort();
+
+    const impl = ((_url: string, init: RequestInit) =>
+      Promise.resolve(
+        Response.json({ aborted: init.signal?.aborted === true }),
+      )) as unknown as typeof fetch;
+
+    const response = await authorizedFetch('http://localhost:8083/x', {
+      fetchImpl: impl,
+      timeoutMs: 1000,
+      signal: controller.signal,
+    });
+
+    expect(((await response.json()) as { aborted: boolean }).aborted).toBe(true);
+  });
+
+  it('removes its listener so a long-lived signal does not accumulate them', async () => {
+    const controller = new AbortController();
+    const { impl } = recordingFetch();
+
+    for (let index = 0; index < 20; index += 1) {
+      await authorizedFetch('http://localhost:8083/x', {
+        fetchImpl: impl,
+        timeoutMs: 1000,
+        signal: controller.signal,
+      });
+    }
+
+    // Node's EventTarget warns past ten listeners and then leaks them; if the
+    // listener were not removed, twenty hops on one request-scoped signal would
+    // hold twenty closures alive.
+    controller.abort();
+    expect(controller.signal.aborted).toBe(true);
   });
 });

@@ -45,6 +45,7 @@ Supply values for the declared parameters only. Do not edit the computation.
      response_hash: responseHash(response),
      findings: scan(response),
      response,
+     masked_prompt: maskedPrompt,
    };
    ```
 
@@ -53,10 +54,12 @@ Supply values for the declared parameters only. Do not edit the computation.
 
 # Output
 
-The receipt above. All five fields are declared in `executor.receipt`, and the attester
+The receipt above. All six fields are declared in `executor.receipt`, and the attester
 exports the same list as `RECEIPT_FIELDS`, so the contract and the check cannot drift.
-`response` is carried so the attester can re-derive the findings independently instead of
-trusting the runner; `masked_prompt_hash` binds the verdict to one exchange.
+`response` and `masked_prompt` are both carried so the attester can re-derive **both**
+hashes independently instead of trusting the runner: the prompt binding is attested, not
+asserted. A receipt that merely names a `masked_prompt_hash` could be replayed against a
+different exchange, so `verify()` recomputes it from the prompt and rejects a mismatch.
 
 # Constraints
 

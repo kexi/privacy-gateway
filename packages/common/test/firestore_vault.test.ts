@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   FirestoreTokenVault,
+  liveEntry,
   type FirestoreLike,
   type FirestoreTransactionLike,
 } from '../src/vault.ts';
@@ -18,9 +19,9 @@ import {
 /**
  * Minimal in-memory stand-in for the Firestore surface the vault uses.
  *
- * `withTransaction` decides whether `runTransaction` is offered, so the same
- * suite can assert both the transactional path (production) and the plain
- * read-modify-write fallback for a double that predates it.
+ * `withTransaction` decides whether `runTransaction` is offered, so the suite can
+ * also assert that a client without one is refused outright rather than silently
+ * downgraded to a read-modify-write.
  */
 interface Fake {
   readonly client: FirestoreLike;
@@ -36,7 +37,7 @@ function fakeFirestore(
   const docs = new Map<string, Record<string, unknown>>(Object.entries(seed));
   let transactions = 0;
 
-  const client: FirestoreLike = {
+  const client = {
     collection: (name: string) => ({
       doc: (id: string) => {
         const key = `${name}/${id}`;
@@ -74,7 +75,7 @@ function fakeFirestore(
         }
       : {}),
   };
-  return { client, docs, transactionCount: () => transactions };
+  return { client: client as FirestoreLike, docs, transactionCount: () => transactions };
 }
 
 function vaultWith(seed: Record<string, Record<string, unknown>> = {}, withTransaction = true) {
@@ -101,12 +102,12 @@ describe('storage', () => {
     const { vault } = vaultWith();
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
 
-    expect((await vault.get('s1'))?.mapping).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
+    expect(liveEntry(await vault.get('s1'))?.mapping).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
   });
 
-  it('returns nothing for an unknown session', async () => {
+  it('reports an unknown session as missing', async () => {
     const { vault } = vaultWith();
-    expect(await vault.get('nope')).toBeNull();
+    expect(await vault.get('nope')).toEqual({ state: 'missing' });
   });
 
   it('forgets a deleted session', async () => {
@@ -115,7 +116,7 @@ describe('storage', () => {
     await vault.delete('s1');
 
     expect(docs.has('token_vault/s1')).toBe(false);
-    expect(await vault.get('s1')).toBeNull();
+    expect(await vault.get('s1')).toEqual({ state: 'missing' });
   });
 });
 
@@ -125,7 +126,7 @@ describe('merging and expiry', () => {
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
     await vault.put('s1', { '⟦PHONE_1⟧': '090-1234-5678' }, 60);
 
-    const entry = await vault.get('s1');
+    const entry = liveEntry(await vault.get('s1'));
     expect(Object.keys(entry?.mapping ?? {}).sort()).toEqual(['⟦EMAIL_1⟧', '⟦PHONE_1⟧']);
   });
 
@@ -150,23 +151,25 @@ describe('merging and expiry', () => {
     expect(entry.expiresAt.getTime()).toBeGreaterThan(Date.now());
   });
 
-  it('refuses to serve an entry the TTL sweeper has not reached yet', async () => {
-    // TTL policy deletions lag behind, so the reader checks the expiry as well.
+  it('reports an entry the TTL sweeper has not reached yet as expired', async () => {
+    // TTL policy deletions lag behind, so the reader checks the expiry as well —
+    // and reports it as expired, which Synthesis turns into a 410.
+    const expiry = new Date(Date.now() - 1000);
     const { vault } = vaultWith({
-      'token_vault/s1': {
-        mapping: { '⟦EMAIL_1⟧': 'a@b.co' },
-        expires_at: new Date(Date.now() - 1000),
-      },
+      'token_vault/s1': { mapping: { '⟦EMAIL_1⟧': 'a@b.co' }, expires_at: expiry },
     });
 
-    expect(await vault.get('s1')).toBeNull();
+    const lookup = await vault.get('s1');
+    expect(lookup.state).toBe('expired');
+    expect(lookup.state === 'expired' && lookup.expiresAt.getTime()).toBe(expiry.getTime());
+    expect(liveEntry(lookup)).toBeNull();
   });
 
-  it('treats a document without an expiry as unreadable', async () => {
-    // Without a bound there is no way to honour the freshness contract, so the
-    // safe answer is to behave as if the mapping is gone.
+  it('treats a document without an expiry as missing', async () => {
+    // Without a bound there is no way to honour the freshness contract, and
+    // nothing to report an expiry time from, so the safe answer is "never there".
     const { vault } = vaultWith({ 'token_vault/s1': { mapping: { '⟦EMAIL_1⟧': 'a@b.co' } } });
-    expect(await vault.get('s1')).toBeNull();
+    expect(await vault.get('s1')).toEqual({ state: 'missing' });
   });
 });
 
@@ -181,7 +184,7 @@ describe('stored value coercion', () => {
       },
     });
 
-    expect((await vault.get('s1'))?.expiresAt.getTime()).toBe(future.getTime());
+    expect(liveEntry(await vault.get('s1'))?.expiresAt.getTime()).toBe(future.getTime());
   });
 
   it('accepts an ISO string expiry', async () => {
@@ -193,7 +196,7 @@ describe('stored value coercion', () => {
       },
     });
 
-    expect((await vault.get('s1'))?.expiresAt.getTime()).toBe(future.getTime());
+    expect(liveEntry(await vault.get('s1'))?.expiresAt.getTime()).toBe(future.getTime());
   });
 
   it('drops non-string mapping values rather than failing', async () => {
@@ -205,14 +208,14 @@ describe('stored value coercion', () => {
       },
     });
 
-    expect((await vault.get('s1'))?.mapping).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
+    expect(liveEntry(await vault.get('s1'))?.mapping).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
   });
 
   it('treats a malformed expiry as no expiry at all', async () => {
     const { vault } = vaultWith({
       'token_vault/s1': { mapping: {}, expires_at: 'not a date' },
     });
-    expect(await vault.get('s1')).toBeNull();
+    expect(await vault.get('s1')).toEqual({ state: 'missing' });
   });
 });
 
@@ -232,7 +235,7 @@ describe('generation', () => {
     await vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
     await vault.put('r1', { '⟦PHONE_1⟧': '090-1234-5678' }, 60);
 
-    expect((await vault.get('r1'))?.generation).toBe(2);
+    expect(liveEntry(await vault.get('r1'))?.generation).toBe(2);
   });
 
   it('treats a document written before the counter existed as generation 0', async () => {
@@ -276,12 +279,16 @@ describe('allocation is transactional', () => {
     expect(fake.transactionCount()).toBe(1);
   });
 
-  it('still writes correctly against a client with no transaction support', async () => {
+  it('refuses to allocate against a client that cannot run a transaction', async () => {
+    // There is deliberately no read-modify-write fallback: it is the path that
+    // silently discards one caller's mapping under concurrency, so a backend that
+    // cannot offer a transaction fails the request instead of degrading.
     const { vault, docs, fake } = vaultWith({}, false);
-    const entry = await vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
 
+    await expect(vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60)).rejects.toThrow(
+      /refusing to allocate a vault entry without a transaction/u,
+    );
     expect(fake.transactionCount()).toBe(0);
-    expect(entry.generation).toBe(1);
-    expect(docs.get('token_vault/r1')?.['mapping']).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
+    expect(docs.has('token_vault/r1')).toBe(false);
   });
 });

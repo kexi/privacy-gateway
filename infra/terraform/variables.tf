@@ -127,3 +127,15 @@ variable "answers_collection" {
   type        = string
   default     = "gateway_answers"
 }
+
+# Whether to declare the `verify-auth` Cloud Run Job.
+#
+# On by default: it costs nothing at rest — a Job bills only for the seconds of
+# an execution — and it is the only way to observe the IAM-success half of the
+# auth boundary, since internal ingress makes that unobservable from outside the
+# VPC. Set to false to keep the deployment to the four serving services.
+variable "enable_verify_job" {
+  description = "Declare the verify-auth Cloud Run Job used by `just verify-auth-internal`."
+  type        = bool
+  default     = true
+}

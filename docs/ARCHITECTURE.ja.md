@@ -42,10 +42,13 @@ Core 宛の A2A メッセージは送出前に PII スキャナで検証され�
 HTTP リクエストに対して、Gateway がサーバー側で生成する `request_id`（UUIDv7）が
 ちょうど 1 つ発行され、これが Token Vault のキーになる。`POST /v1/ask` が受け付ける
 のは `{text}` のみで、ボディに `session_id` が含まれていれば 400 で拒否される。受信した
-`X-Request-ID` ヘッダは相関のために呼び出し元へエコーバックされるが、Vault キーとして
-**採用されることは決してない** — 任意の ID を選べる呼び出し元は、他人のリクエストの
-マッピングを名指しし、そのプレースホルダを解決できてしまうからだ。したがって、
-複数リクエストにまたがるプレースホルダの安定性は存在しない。
+`X-Request-ID` ヘッダは**完全に無視される**: Gateway は自前で ID を発行し、
+`X-Request-ID` レスポンスヘッダで返すのはその ID である。したがって、ヘッダを読み返した
+呼び出し元が手にするのはサーバー側の ID であって自分の ID ではない。受信値がエコーされる
+ことは一切ない。任意の ID を選べる呼び出し元がいれば、他人のリクエストのマッピングを
+名指しし、そのプレースホルダを解決できてしまう — 呼び出し元指定の ID をどれだけ検証
+しても、この問題は消えない。したがって、複数リクエストにまたがるプレースホルダの
+安定性は存在しない。
 
 ### 人間によるレビューはスコープ外
 
@@ -236,10 +239,31 @@ Firestore が保存するのは `request_id` をキーとした**マスク済み
 
 リハイドレートされた回答が存在するのは、それを生成した 1 回の `/v1/ask` API
 レスポンスの中だけである。いかなるコレクションにも、いかなる status でも Firestore
-に書き込まれることはない。拒否されたリクエストでも（回答を含まない）証跡ドキュメントは
-永続化される — `status: draft`、`verified` は省略 — ので、ブロックされたリクエストも
-監査可能なまま残る。どちらのコレクションも追記のみのログではない: どちらも TTL 付きの
-リクエスト単位のドキュメントである。
+に書き込まれることはない。
+
+**拒否は、拒否された Core のテキストを一切永続化しない。** ゲートが一度でも走った後に
+拒否されたリクエストは証跡ドキュメントを永続化する — `status: draft`、`verified` は
+省略 — が、その本文は文字通りのマーカー `content withheld` であり、保存される
+`core_response` も同じマーカーである。拒否されたテキストはまさにゲートがリリースを
+拒んだテキストそのものであり、証跡ルートは未認証なので、それを保存してしまえば
+ゲートが今しがた止めた漏洩を再現することになる。生き残るのは `attestation` ブロックで
+ある: 拒否された応答の SHA-256 が記録をその exchange に紐づけたままにするので、
+オリジナルを持つ監査者は、ストアがそのテキストを一度も保持していなくても、これが
+何についてのテキストだったかを証明できる。
+
+2 種類の拒否は、そもそも証跡ドキュメントが存在する*前*に起きる: `vault_missing`
+（409）と `vault_expired`（410）は、パイプラインがドキュメントを組み立てる元になる
+マッピングをまだ持っていない段階で決まり、`vault_generation_mismatch`（409）も同様
+である。これらのリクエストは、保存されたドキュメントからではなく、構造化ログ
+（`refusal` フィールドを伴う `release.refused`）から監査できる。一方、コンテンツ
+ポリシーによる拒否 — `invented_token`、`leak_check_failed`、`judge_flagged`、
+`judge_unavailable`、`unresolved_token` — はいずれもドキュメントを 1 件永続化する。
+
+どちらのコレクションも追記のみのログではない: どちらも TTL 付きのリクエスト単位の
+ドキュメントである。証跡レコードの `expires_at` は **Vault エントリ自身の失効時刻**
+であり、ドキュメントの `stale_after` から読み戻した値である。永続化時点で計算した
+`now + TTL` ではない — 後者だと、ドキュメントが自ら示す鮮度を超えてレコードを
+提供できてしまう。
 
 ## 9. 開示ポリシー
 
@@ -283,15 +307,23 @@ UI は 4 つのディメンションを**別々に**表示し、1 つのバッ�
 - **バンドル** `knowledge/`（リポジトリ内）: `policies/pii-masking.md`（人間が執筆、`human:` で検証済み）、
   `computations/leak-check.md`（`type: Attested Computation`、`runtime: typescript`、
   決定的なアテスター `references/attesters/leak_check.ts`、レシート
-  `[request_id, response_hash, findings]`）。
+  `[request_id, masked_prompt_hash, response_hash, findings, response, masked_prompt]`）。
+  レシートが `response` と `masked_prompt` の両方を運ぶのは、アテスター自身が*両方*の
+  ハッシュを再計算するためである: レシートが `masked_prompt_hash` を主張するだけなら、
+  それを別の exchange に対してリプレイできてしまう。だからプロンプトの紐付けは
+  「主張される」のではなく「証明される」。`executor.receipt` とアテスターがエクスポート
+  する `RECEIPT_FIELDS` は同一のリストであり、それをテストが強制している。
 - **リクエストごとの出力**（Synthesis Agent → Firestore → UI）: `type: Gateway Answer` の OKF
   コンセプト。`generated.by` は `synthesis_agent/<version>` — このコンセプトを組み立てるのは
   Synthesis なので、OKF SPEC §7 のアクター規約に従い文書は Synthesis に帰属する。Core は
   トークン化された文章を供給する側であり、代わりに `core-response` という provenance
   ソース（`author: core_agent/<GEMINI_MODEL>`）として現れる。`sources[]` は 3 エントリ:
-  `masked-prompt`（`/requests/<id>/masked-prompt.md`）、`core-response`
-  （`/requests/<id>/core-response.md`）、`pii-policy` — 最初の 2 つは実際に Gateway が
-  配信する（上記§7）。`verified[].by` はリークチェックのアテステーションが通れば
+  `masked-prompt`（`/v1/requests/<id>/masked-prompt.md`）、`core-response`
+  （`/v1/requests/<id>/core-response.md`）、`pii-policy`。最初の 2 つは Gateway が実際に
+  配信するパスと一字一句同じである（上記§7） — `/requests/<id>/...` のように `/v1` を
+  欠いた名前を付けていた頃は、実際のルートが `/v1/requests/<id>/...` だったため
+  dangling link になっていた。provenance をたどれないドキュメントはリプレイできない。
+  `verified[].by` はリークチェックのアテステーションが通れば
   `process:leak-check@<attester sha256 の短縮形>`（⇒ _machine-confirmed_）で、LLM
   アクターになることは決してなく、`human:<id>` エントリも一切存在しない（§2）。
   `stale_after` は Vault の失効時刻、いずれかのゲートが失敗すれば `status: draft`。

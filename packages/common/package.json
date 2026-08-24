@@ -36,8 +36,9 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/generate_attestation_digests.mjs && tsc -p tsconfig.build.json",
     "lint": "oxlint",
+    "attestation-digests:check": "node scripts/generate_attestation_digests.mjs --check",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "fmt": "oxfmt",

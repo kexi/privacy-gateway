@@ -204,10 +204,15 @@ export function loadConfig(options: LoadConfigOptions): Config {
   const parsed = EnvSchema.safeParse(source);
 
   if (!parsed.success) {
+    // Key and zod error *code* only, never `issue.message` and never the value.
+    // A zod message routinely quotes the input it rejected, and the value of an
+    // env var that failed validation is exactly the kind of thing — a
+    // misconfigured URL carrying a token, a pasted secret — that must not reach
+    // a log line at startup.
     const issues = parsed.error.issues.map(
-      (issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`,
+      (issue) => `${issue.path.join('.') || 'root'}:${issue.code}`,
     );
-    return failInvalid(options, 'environment validation failed', issues);
+    return failInvalid(options, 'config.invalid.schema', issues);
   }
 
   const env = parsed.data;
@@ -215,8 +220,8 @@ export function loadConfig(options: LoadConfigOptions): Config {
   if (missing.length > 0) {
     return failInvalid(
       options,
-      'required environment variables are unset',
-      missing.map((key) => `${String(key)}: required by the ${options.agent} agent`),
+      'config.invalid.missing',
+      missing.map((key) => `${String(key)}:required`),
     );
   }
 
@@ -237,23 +242,22 @@ export function loadConfig(options: LoadConfigOptions): Config {
  * The message is written directly rather than through the logger because
  * logging itself depends on a resolved config.
  */
-function failInvalid(
-  options: LoadConfigOptions,
-  message: string,
-  issues: readonly string[],
-): never {
+function failInvalid(options: LoadConfigOptions, code: string, issues: readonly string[]): never {
   const entry = {
     severity: 'ERROR',
-    message: `${message}: ${issues.join('; ')}`,
+    // The message is the error code, and `issues` names keys plus zod codes. No
+    // rejected value appears anywhere in this line.
+    message: code,
     time: new Date().toISOString(),
     event: 'config.invalid',
+    error_code: code,
     agent: options.agent,
     issues,
   };
   process.stderr.write(`${JSON.stringify(entry)}\n`);
 
   if (options.onInvalid !== undefined) {
-    return options.onInvalid(message, issues);
+    return options.onInvalid(code, issues);
   }
   process.exit(1);
 }

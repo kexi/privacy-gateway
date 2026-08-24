@@ -38,10 +38,12 @@ by a PII scanner before egress (defense in depth).
 There is no caller-supplied session and no multi-turn state. One HTTP request gets
 exactly one server-generated `request_id` (UUIDv7), minted by the Gateway and used as
 the Token Vault key. `POST /v1/ask` accepts only `{text}`; a body carrying `session_id`
-is rejected with 400. An inbound `X-Request-ID` header is echoed back to the caller for
-correlation but is **never adopted** as the vault key — a caller who could choose that
-id could name another request's mapping and resolve its placeholders. There is
-consequently no placeholder stability across requests.
+is rejected with 400. An inbound `X-Request-ID` header is **ignored entirely**: the
+Gateway mints its own id and returns that one in the `X-Request-ID` response header, so
+a caller reading the header back gets the server's id, not its own. Nothing echoes the
+inbound value. A caller who could choose the id could name another request's mapping and
+resolve its placeholders, and no amount of validation on a caller-supplied id removes
+that. There is consequently no placeholder stability across requests.
 
 ### Human approval is out of scope
 
@@ -200,10 +202,28 @@ Firestore stores **only masked artifacts**, keyed by `request_id`:
   Firestore TTL policy shape covers both collections.
 
 The rehydrated answer exists only inside the one `/v1/ask` API response that produced
-it. It is never written to Firestore, in any collection, under any status. A refused
-request still persists its (answer-free) evidence document — `status: draft`,
-`verified` omitted — so a blocked request remains auditable. Neither collection is
-append-only: each is a per-request document with a TTL, not a log.
+it. It is never written to Firestore, in any collection, under any status.
+
+**A refusal persists no rejected Core text.** Once a gate has run, a refused request
+persists an evidence document — `status: draft`, `verified` omitted — whose body is the
+literal marker `content withheld` and whose stored `core_response` is the same marker.
+The rejected text is precisely the text a gate refused to release, and the evidence
+routes are unauthenticated, so storing it would recreate the leak the gate just stopped.
+What survives is the `attestation` block: the SHA-256 of the rejected response still
+binds the record to the exchange, so an auditor holding the original can prove which
+text this was about without the store ever having held it.
+
+Two refusals happen _before_ any evidence document exists: `vault_missing` (409) and
+`vault_expired` (410) are decided before the pipeline has a mapping to build a document
+against, and `vault_generation_mismatch` (409) likewise. Those requests are auditable
+from the structured logs (`release.refused` with the `refusal` field), not from a stored
+document. Every content-policy refusal — `invented_token`, `leak_check_failed`,
+`judge_flagged`, `judge_unavailable`, `unresolved_token` — does persist one.
+
+Neither collection is append-only: each is a per-request document with a TTL, not a log.
+The evidence record's `expires_at` is the **vault entry's own expiry**, read back from
+the document's `stale_after`, not `now + TTL` computed when persistence happens — the
+latter let the service serve a record past the freshness the document advertises.
 
 ## 9. Disclosure policy
 
@@ -244,14 +264,22 @@ provenance, trust, freshness, lifecycle and attestation are first-class on each 
 
 - **Bundle** `knowledge/` (in repo): `policies/pii-masking.md` (human-authored, `human:` verified),
   `computations/leak-check.md` (`type: Attested Computation`, `runtime: typescript`,
-  deterministic attester `references/attesters/leak_check.ts`, receipt `[request_id, response_hash, findings]`).
+  deterministic attester `references/attesters/leak_check.ts`, receipt
+  `[request_id, masked_prompt_hash, response_hash, findings, response, masked_prompt]`).
+  The receipt carries both `response` and `masked_prompt` so the attester re-derives
+  _both_ hashes itself: a receipt that merely asserted `masked_prompt_hash` could be
+  replayed against a different exchange, so the prompt binding is attested rather than
+  claimed. `executor.receipt` and the attester's exported `RECEIPT_FIELDS` are the same
+  list, and a test enforces that.
 - **Per-request output** (Synthesis Agent → Firestore → UI): an OKF concept `type: Gateway Answer`.
   `generated.by` is `synthesis_agent/<version>` — Synthesis assembles the concept, so OKF SPEC §7's
   actor convention attributes the document to it; Core supplies the tokenized prose and appears
   instead as a `core-response` provenance source (`author: core_agent/<GEMINI_MODEL>`). `sources[]`
-  carries three entries: `masked-prompt` (`/requests/<id>/masked-prompt.md`), `core-response`
-  (`/requests/<id>/core-response.md`) and `pii-policy` — the first two are actually served by the
-  Gateway (§7 above). `verified[].by` is `process:leak-check@<attester sha256 short>` once the leak-check
+  carries three entries: `masked-prompt` (`/v1/requests/<id>/masked-prompt.md`),
+  `core-response` (`/v1/requests/<id>/core-response.md`) and `pii-policy`. The first two are
+  the exact paths the Gateway serves (§7 above), byte for byte — a source that named
+  `/requests/<id>/...` while the route was `/v1/requests/<id>/...` was a dangling link, and a
+  document whose provenance cannot be followed cannot be replayed. `verified[].by` is `process:leak-check@<attester sha256 short>` once the leak-check
   attestation passes (⇒ _machine-confirmed_); it is never an LLM actor, and there is no `human:<id>`
   entry ever (§2). `stale_after` = vault expiry, `status: draft` on any failed gate.
 - A top-level `attestation:` block carries `computation`, `computation_sha256`, `attester_sha256`,

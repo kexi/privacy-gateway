@@ -9,6 +9,7 @@
  */
 
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { isSha256Hex } from './attestation.ts';
 import type { VerificationEvent } from './schema.ts';
 
 export const TRUST_UNVERIFIED = 'unverified';
@@ -16,6 +17,15 @@ export const TRUST_MACHINE_CONFIRMED = 'machine-confirmed';
 export const TRUST_HUMAN_REVIEWED = 'human-reviewed';
 
 export const GATEWAY_ANSWER_TYPE = 'Gateway Answer';
+
+/**
+ * The route prefix under which the gateway serves a request's masked artifacts.
+ *
+ * The `sources[].resource` values are built from this so the document names the
+ * path that actually resolves. Changing the routes means changing this constant;
+ * `packages/common/test/okf.test.ts` asserts the two agree.
+ */
+export const REQUEST_ARTIFACT_BASE = '/v1/requests';
 
 export type TrustTier =
   | typeof TRUST_UNVERIFIED
@@ -239,9 +249,19 @@ export interface BuildGatewayAnswerOptions {
  * `# Attestation` section (§10.5: a failed attestation must not be dropped).
  */
 export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocument {
-  const passed = options.attestation.ok === true;
   const generatedAt = options.generatedAt ?? new Date();
   const { requestId, evidence } = options;
+
+  // A digest that is not 64 hex characters names bytes nobody can fetch, so the
+  // document cannot be machine-confirmed over it. Failing the attestation here —
+  // rather than emitting `verified` beside an unusable digest — is what keeps
+  // "machine-confirmed" a claim a third party can actually check.
+  const digestsUsable =
+    isSha256Hex(evidence.computationSha256) &&
+    isSha256Hex(evidence.attesterSha256) &&
+    isSha256Hex(evidence.maskedPromptSha256) &&
+    isSha256Hex(evidence.coreResponseSha256);
+  const passed = options.attestation.ok === true && digestsUsable;
 
   const metadata: OkfMetadata = {
     type: GATEWAY_ANSWER_TYPE,
@@ -257,14 +277,17 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
     sources: [
       {
         id: 'masked-prompt',
-        resource: `/requests/${requestId}/masked-prompt.md`,
+        // The path the gateway actually serves, byte for byte. It used to omit
+        // the `/v1` prefix, so following the provenance link as an
+        // origin-relative URL returned 404 and the document was unreplayable.
+        resource: `${REQUEST_ARTIFACT_BASE}/${requestId}/masked-prompt.md`,
         title: 'Masked prompt sent to the core agent',
         author: 'gateway_agent/tokenizer',
         last_modified: nowIso(generatedAt),
       },
       {
         id: 'core-response',
-        resource: `/requests/${requestId}/core-response.md`,
+        resource: `${REQUEST_ARTIFACT_BASE}/${requestId}/core-response.md`,
         title: 'Tokenized response returned by the core agent',
         author: options.coreActor,
         last_modified: nowIso(generatedAt),
@@ -302,7 +325,10 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
   }
 
   const findings = options.attestation.findings ?? [];
-  const verdictLine = passed ? 'passed' : `**failed** — ${options.attestation.reason ?? 'unknown'}`;
+  const failureReason = digestsUsable
+    ? (options.attestation.reason ?? 'unknown')
+    : 'the build recorded no usable attestation digests, so the verdict cannot be replayed';
+  const verdictLine = passed ? 'passed' : `**failed** — ${failureReason}`;
   const findingsBlock =
     findings.length > 0
       ? findings.map((finding) => `- \`${finding}\``).join('\n')

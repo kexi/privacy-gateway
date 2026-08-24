@@ -422,3 +422,16 @@ summary {
 .console-link {
   font-size: 0.75rem;
 }
+
+/*
+ * The scope qualifier beside the derived trust tier.
+ *
+ * Deliberately the same weight as the tier itself rather than a de-emphasised
+ * footnote: the point is that "machine-confirmed" alone overclaims, so the
+ * qualifier has to be read as part of the same phrase.
+ */
+.tier-scope {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.95em;
+  color: var(--fg-muted, #6b7280);
+}

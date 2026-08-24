@@ -42,9 +42,12 @@ export function buildSynthesisAgent(model?: string): LlmAgent {
   registerOllamaLlm();
   return new LlmAgent({
     name: SYNTHESIS_AGENT_NAME,
+    // The card and this description must agree: this agent acknowledges an
+    // exchange over A2A and nothing more. Verification, rehydration and OKF
+    // assembly run in the deterministic pipeline behind POST /v1/synthesize.
     description:
-      'Verifies a tokenized answer for leaks, rehydrates it from the token vault ' +
-      'and packages it as an attested OKF document.',
+      'Acknowledges a gateway exchange over A2A. It performs no verification, ' +
+      'rehydration or attestation; those run on this service’s HTTP routes.',
     model: ollamaModelId(model),
     instruction: INSTRUCTION,
     generateContentConfig: { responseMimeType: 'application/json' },
@@ -82,7 +85,10 @@ export interface JudgeOptions {
  */
 export function createLeakJudge(
   options: JudgeOptions = {},
-): (text: string) => Promise<{ leak: boolean | null; categories?: string[] }> {
+): (
+  text: string,
+  signal?: AbortSignal,
+) => Promise<{ leak: boolean | null; categories?: readonly string[] }> {
   const baseUrl = (
     options.baseUrl ??
     process.env['GEMMA_BASE_URL'] ??
@@ -106,11 +112,21 @@ export function createLeakJudge(
     return { ...base, authorization: `Bearer ${apiKey}` };
   };
 
-  return async (text: string) => {
+  return async (text: string, signal?: AbortSignal) => {
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort();
     }, options.timeoutMs ?? 60_000);
+
+    // The caller's deadline cancels the judge too. Handled before the listener
+    // is attached because `addEventListener` never fires for an abort that has
+    // already happened, and removed afterwards so a request-scoped signal does
+    // not accumulate one listener per judged answer.
+    const abort = (): void => {
+      controller.abort();
+    };
+    if (signal?.aborted === true) abort();
+    else signal?.addEventListener('abort', abort, { once: true });
 
     try {
       const response = await fetchImpl(url, {
@@ -142,6 +158,7 @@ export function createLeakJudge(
       return parseJudgeVerdict(payload.choices?.[0]?.message?.content ?? '');
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
     }
   };
 }
@@ -155,21 +172,23 @@ export function createLeakJudge(
  */
 export function parseJudgeVerdict(raw: string): {
   leak: boolean | null;
-  categories?: string[];
-  raw?: string;
+  categories?: readonly string[];
 } {
+  // The raw model output is deliberately not returned. It reached the
+  // attestation object and from there the response, so an unparseable answer was
+  // a channel for whatever Gemma had decided to write.
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
-  if (start === -1 || end <= start) return { leak: null, raw };
+  if (start === -1 || end <= start) return { leak: null };
 
   let payload: unknown;
   try {
     payload = JSON.parse(raw.slice(start, end + 1));
   } catch {
-    return { leak: null, raw };
+    return { leak: null };
   }
 
   const parsed = LeakJudgeSchema.safeParse(payload);
-  if (!parsed.success) return { leak: null, raw };
+  if (!parsed.success) return { leak: null };
   return { leak: parsed.data.leak, categories: parsed.data.categories };
 }

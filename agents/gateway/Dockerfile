@@ -40,6 +40,16 @@ RUN pnpm install --frozen-lockfile \
 
 COPY packages/common/ packages/common/
 COPY agents/gateway/ agents/gateway/
+# The Attested Computation document, needed only at build time.
+#
+# `packages/common`'s build hashes it (and the attester source) into
+# `attestation_digests.generated.ts`, so the digests the runtime records are
+# fixed here rather than read from disk later. Why not copy it into the runtime
+# stage instead: the image would then carry a second copy that could drift from
+# the one the digest was taken over, and every consumer would have to decide
+# which copy is canonical. A constant has exactly one answer.
+COPY knowledge/computations/ knowledge/computations/
+
 COPY web/ web/
 
 # The shared package is built first; both the agent and the web UI import it.

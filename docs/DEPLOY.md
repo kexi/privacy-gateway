@@ -675,8 +675,12 @@ Use an **ID token, not an access token**.
 just verify-auth
 ```
 
-That recipe is the whole check: for each private service it calls `/healthz` twice, once
-anonymously and once with an ID token, and asserts `403` then `200`. Run by hand it is:
+That recipe is **half** the check, and it is the half a laptop can perform: for each
+private service it calls `/healthz` twice, once anonymously and once with an ID token, and
+asserts `403` both times. Since `core-agent`, `synthesis-agent` and `gemma-serving` all use
+**internal ingress**, and ingress is evaluated before IAM, a request from outside the VPC is
+refused at the network edge whether or not it carries a valid token. A `200` here would mean
+the ingress setting had regressed. Run by hand it is:
 
 ```bash
 CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
@@ -695,11 +699,59 @@ curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-know
 
 `just agent-card core-agent` does the token dance for you.
 
-Since `core-agent` and `synthesis-agent` now also use **internal ingress**, a call from a
-laptop is refused at the network layer before IAM is consulted. `just verify-auth` accounts
-for that; when running the raw `curl` from outside the VPC, a `403` on both lines is the
-correct result, and the `200` half of the proof has to come from inside the fleet — which is
-exactly what `just smoke` exercises.
+### Verifying IAM from inside the VPC
+
+The other half of the proof — that IAM **accepts** an authorized caller — cannot be observed
+from a laptop at all, for the reason above. It has to run inside the VPC:
+
+```bash
+just verify-auth-internal
+```
+
+That executes a Cloud Run **Job** (`infra/terraform/verify_job.tf`) which attaches to the
+fleet subnet with Direct VPC egress and runs as the Gateway's own service account. It calls
+`/healthz` on each private service twice — once with an ID token minted from the metadata
+server for the callee's origin, once anonymously — and asserts `200` then `403`. That is the
+exact hop the Gateway makes in production, made by the same identity, so a `200` is evidence
+about the fleet rather than about a broader credential. A Job costs nothing at rest; it bills
+only for the seconds of one execution.
+
+Read its output with `just logs-service verify-auth 30`.
+
+**If the job is not deployed** (`enable_verify_job = false`, or Terraform has not been
+applied), the manual path is:
+
+1. Deploy the job: `just tf-apply` with `enable_verify_job=true` (the default).
+2. Or, without Terraform, run the same probe from any workload already inside the VPC —
+   `gcloud run jobs execute` on an ad-hoc job, or a shell on a GCE instance in the fleet
+   subnet — fetching the token from the metadata server:
+
+   ```bash
+   CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
+   TOKEN=$(curl -sf -H 'Metadata-Flavor: Google' \
+     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${CORE_URL}")
+   curl -s -o /dev/null -w 'with-id-token -> HTTP %{http_code}\n' \
+     -H "Authorization: Bearer ${TOKEN}" "${CORE_URL}/healthz"   # expect 200
+   curl -s -o /dev/null -w 'no-auth       -> HTTP %{http_code}\n' "${CORE_URL}/healthz"  # expect 403
+   ```
+
+`just smoke` exercises the same path implicitly, end to end, but it cannot isolate the IAM
+decision the way the job above does.
+
+### 8.3b Attestation digests inside the production image
+
+The Synthesis image ships `dist/` alone — no `.ts` sources and no `knowledge/` bundle — so a
+digest computed by hashing a file at runtime would be unavailable there. The digests are
+compiled in at build time instead, and `just image-test` proves it by starting the real image
+and reading `GET /v1/attestation`:
+
+```bash
+just image-test
+```
+
+Both `attester_sha256` and `computation_sha256` must be 64 lowercase hex characters. A
+document that cannot name usable digests is emitted as `status: draft` with no `verified`
+entry, so it can never read back as machine-confirmed.
 
 ### 8.4 Gemma (internal ingress, unreachable from outside)
 
@@ -738,7 +790,7 @@ By hand:
 ```bash
 curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
+  -d '{"text":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
 ```
 
 What to check: was the text reaching Core masked, did the leak check pass, is the final
@@ -763,7 +815,8 @@ Capture the following.
    and friends, with **no Firestore** (this is the crux of the project)
 6. **Firestore -> token_vault** - TTL enabled, documents carrying `expires_at`
 7. **Cloud Trace** - a waterfall of one request making three hops: gateway -> core -> synthesis
-8. **Logs Explorer** - structured logs across hops, correlated by `session_id`
+8. **Logs Explorer** - structured logs across hops, correlated by `request_id` (there is no
+   `session_id`: the Gateway mints one UUIDv7 per request and uses it as the vault key)
 
 ### 9.2 Terminal (a few seconds each)
 

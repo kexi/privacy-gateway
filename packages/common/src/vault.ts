@@ -45,6 +45,23 @@ export function isExpired(entry: VaultEntry, now: Date = new Date()): boolean {
   return now.getTime() >= entry.expiresAt.getTime();
 }
 
+/**
+ * What a lookup found.
+ *
+ * Discriminated rather than a nullable entry: a record that existed and aged out
+ * is a different fact from one that was never written, and Synthesis owes the
+ * caller a different status for each (410 `vault_expired` versus 409
+ * `vault_missing`). Collapsing both into `null` made the documented 410 path
+ * unreachable.
+ *
+ * `expiresAt` rides along on `expired` so the caller can say *when* it lapsed
+ * without a second read.
+ */
+export type VaultLookup =
+  | { readonly state: 'missing' }
+  | { readonly state: 'expired'; readonly expiresAt: Date }
+  | { readonly state: 'live'; readonly entry: VaultEntry };
+
 /** Interface of the Token Vault. */
 export interface TokenVault {
   /** Store the request mapping, merging into any existing one without extending it. */
@@ -53,10 +70,15 @@ export interface TokenVault {
     mapping: Readonly<Record<string, string>>,
     ttlSeconds?: number,
   ): Promise<VaultEntry>;
-  /** Return the request mapping, or `null` if it is absent or has expired. */
-  get(requestId: string): Promise<VaultEntry | null>;
+  /** Look the request mapping up, distinguishing missing from expired. */
+  get(requestId: string): Promise<VaultLookup>;
   /** Discard the entry. */
   delete(requestId: string): Promise<void>;
+}
+
+/** The entry when the lookup was live, else `null`. Convenience for callers that only need that. */
+export function liveEntry(lookup: VaultLookup): VaultEntry | null {
+  return lookup.state === 'live' ? lookup.entry : null;
 }
 
 /** In-process map implementation. */
@@ -83,14 +105,14 @@ export class InMemoryTokenVault implements TokenVault {
     return Promise.resolve(entry);
   }
 
-  get(requestId: string): Promise<VaultEntry | null> {
+  get(requestId: string): Promise<VaultLookup> {
     const entry = this.entries.get(requestId);
-    if (entry === undefined) return Promise.resolve(null);
+    if (entry === undefined) return Promise.resolve({ state: 'missing' });
     if (isExpired(entry)) {
       this.entries.delete(requestId);
-      return Promise.resolve(null);
+      return Promise.resolve({ state: 'expired', expiresAt: entry.expiresAt });
     }
-    return Promise.resolve(entry);
+    return Promise.resolve({ state: 'live', entry });
   }
 
   delete(requestId: string): Promise<void> {
@@ -119,11 +141,14 @@ export interface FirestoreTransactionLike {
 export interface FirestoreLike {
   collection(name: string): { doc(id: string): FirestoreDocLike };
   /**
-   * Optional so an older double still type-checks; when it is absent the vault
-   * falls back to a plain read-modify-write, which is correct for the
-   * single-writer-per-request model but loses the concurrency guarantee.
+   * Required. There is deliberately no read-modify-write fallback: two writers
+   * that both read an empty document each allocate generation 1, and the later
+   * `set` silently discards the earlier mapping — cross-wiring one caller's
+   * placeholders onto another caller's values. A backend that cannot run a
+   * transaction must not be selectable in production, so the vault refuses it
+   * rather than degrading.
    */
-  runTransaction?<T>(fn: (transaction: FirestoreTransactionLike) => Promise<T>): Promise<T>;
+  runTransaction<T>(fn: (transaction: FirestoreTransactionLike) => Promise<T>): Promise<T>;
 }
 
 export interface FirestoreVaultOptions {
@@ -207,29 +232,32 @@ export class FirestoreTokenVault implements TokenVault {
       };
     };
 
-    if (typeof client.runTransaction === 'function') {
-      return client.runTransaction(async (transaction) => {
-        const snapshot = await transaction.get(doc);
-        const { entry, payload } = apply(snapshot.exists ? snapshot.data() : undefined);
-        transaction.set(doc, payload);
-        return entry;
-      });
+    if (typeof client.runTransaction !== 'function') {
+      // Fail closed. Silently downgrading to a read-modify-write is exactly the
+      // path that loses one caller's mapping under concurrency.
+      throw new Error(
+        'the Firestore client exposes no runTransaction; refusing to allocate a vault entry ' +
+          'without a transaction',
+      );
     }
-
-    const snapshot = await doc.get();
-    const { entry, payload } = apply(snapshot.exists ? snapshot.data() : undefined);
-    await doc.set(payload);
-    return entry;
+    return client.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(doc);
+      const { entry, payload } = apply(snapshot.exists ? snapshot.data() : undefined);
+      transaction.set(doc, payload);
+      return entry;
+    });
   }
 
-  async get(requestId: string): Promise<VaultEntry | null> {
+  async get(requestId: string): Promise<VaultLookup> {
     const doc = await this.doc(requestId);
     const snapshot = await doc.get();
-    if (!snapshot.exists) return null;
+    if (!snapshot.exists) return { state: 'missing' };
 
     const data = snapshot.data() ?? {};
     const expiresAt = asDate(data['expires_at']);
-    if (expiresAt === null) return null;
+    // A record whose expiry cannot be read names no lifetime at all, so it is
+    // treated as absent rather than as live-forever.
+    if (expiresAt === null) return { state: 'missing' };
 
     const entry: VaultEntry = {
       requestId,
@@ -238,7 +266,7 @@ export class FirestoreTokenVault implements TokenVault {
       generation: asGeneration(data['generation']),
     };
     // TTL policy deletions lag behind, so the reader checks the expiry as well.
-    return isExpired(entry) ? null : entry;
+    return isExpired(entry) ? { state: 'expired', expiresAt } : { state: 'live', entry };
   }
 
   async delete(requestId: string): Promise<void> {

@@ -662,8 +662,13 @@ curl -sS "${GATEWAY_URL}/.well-known/agent-card.json" | jq .
 just verify-auth
 ```
 
-このレシピが検証そのもの。各プライベートサービスの `/healthz` を匿名と ID token 付きの
-2 回呼び、`403` → `200` になることを検査する。手で書くとこうなる:
+このレシピが検証してくれるのは**半分だけ**であり、それはラップトップから実行できる
+半分である: 各プライベートサービスの `/healthz` を匿名と ID token 付きの 2 回呼び、
+**両方とも** `403` になることを検査する。`core-agent` / `synthesis-agent` /
+`gemma-serving` はいずれも **internal ingress** を使っており、ingress の判定は IAM
+より前に評価されるため、VPC の外からのリクエストはトークンの有効性にかかわらず
+ネットワークの端で拒否される。ここで `200` が返るとしたら、それは ingress の設定が
+壊れたことを意味する。手で書くとこうなる:
 
 ```bash
 CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
@@ -682,10 +687,62 @@ curl -s -o /dev/null -w "no-auth -> HTTP %{http_code}\n" "${CORE_URL}/.well-know
 
 `just agent-card core-agent` はこのトークン処理を代わりにやってくれる。
 
-`core-agent` と `synthesis-agent` も **internal ingress** になったため、手元からの呼び出しは
-IAM の判定より前にネットワーク層で拒否される。`just verify-auth` はそれを織り込み済み。
-生の `curl` を VPC の外から実行する場合は両方 `403` が正しい結果であり、`200` 側の証明は
-フリート内部から取る必要がある。それを行うのが `just smoke`。
+### VPC 内部から IAM を検証する
+
+もう半分の証明 — IAM が**認可された呼び出し元を受け入れる**こと — は、上記の理由により
+ラップトップからはそもそも観測できない。VPC の内部で走らせる必要がある:
+
+```bash
+just verify-auth-internal
+```
+
+これは Cloud Run **Job**（`infra/terraform/verify_job.tf`）を実行する。この Job は
+Direct VPC egress でフリートのサブネットに接続し、Gateway 自身のサービスアカウントとして
+動く。各プライベートサービスの `/healthz` を 2 回呼ぶ — 1 回は呼び出し先のオリジン向けに
+metadata server から取得した ID token 付きで、もう 1 回は匿名で — そして `200` →
+`403` の順になることを検査する。これはまさに Gateway が本番で行っているホップそのものを、
+同じアイデンティティで再現したものであり、ここでの `200` はより広いクレデンシャル一般に
+ついての証拠ではなく、このフリートについての証拠になる。Job はアイドル時は一切課金され
+ず、1 回の実行にかかった秒数分だけ課金される。
+
+出力は `just logs-service verify-auth 30` で読む。
+
+**Job がデプロイされていない場合**（`enable_verify_job = false`、または Terraform が
+未適用の場合）、手動での経路は次のとおり:
+
+1. Job をデプロイする: `just tf-apply` を `enable_verify_job=true`（既定値）で実行する。
+2. あるいは Terraform を使わずに、すでに VPC 内にあるワークロードから同じプローブを
+   実行する — アドホックな Job に対する `gcloud run jobs execute`、あるいはフリートの
+   サブネット上の GCE インスタンス上のシェルなど — トークンは metadata server から
+   取得する:
+
+   ```bash
+   CORE_URL=$(gcloud run services describe core-agent --region=us-central1 --format='value(status.url)')
+   TOKEN=$(curl -sf -H 'Metadata-Flavor: Google' \
+     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=${CORE_URL}")
+   curl -s -o /dev/null -w 'with-id-token -> HTTP %{http_code}\n' \
+     -H "Authorization: Bearer ${TOKEN}" "${CORE_URL}/healthz"   # expect 200
+   curl -s -o /dev/null -w 'no-auth       -> HTTP %{http_code}\n' "${CORE_URL}/healthz"  # expect 403
+   ```
+
+`just smoke` は同じ経路をエンドツーエンドで暗黙のうちに通るが、上記の Job のように
+IAM の判定だけを切り出して検証することはできない。
+
+### 8.3b 本番イメージ内でのアテステーション ダイジェスト
+
+Synthesis のイメージが積んでいるのは `dist/` だけである — `.ts` ソースも
+`knowledge/` バンドルも無い — ので、実行時にファイルをハッシュ化して求めるダイジェスト
+はそこでは手に入らない。ダイジェストはビルド時に埋め込まれており、`just image-test` が
+実際のイメージを起動して `GET /v1/attestation` を読むことでそれを証明する:
+
+```bash
+just image-test
+```
+
+`attester_sha256` と `computation_sha256` は、どちらも 64 文字の小文字 16 進数でなければ
+ならない。使用可能なダイジェストを名指しできないドキュメントは `status: draft` かつ
+`verified` エントリ無しで出力されるため、machine-confirmed として読み戻されることは
+決してない。
 
 ### 8.4 Gemma（internal ingress なので外からは届かない）
 
@@ -724,7 +781,7 @@ Gemma への VPC 経路、Firestore の Vault をまとめて通る唯一のチ�
 ```bash
 curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
+  -d '{"text":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}' | jq .
 ```
 
 確認すべき点: Core に渡ったのはマスク済みか / leak check が通ったか / 最終回答が
@@ -748,7 +805,9 @@ curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
    **Firestore が無い**ことを見せる（これが本プロジェクトの肝）
 6. **Firestore → token_vault** — TTL 有効、ドキュメントに `expires_at` が入っている
 7. **Cloud Trace** — 1 リクエストが gateway → core → synthesis と 3 ホップしている waterfall
-8. **Logs Explorer** — `session_id` で串刺しにしたホップ毎の構造化ログ
+8. **Logs Explorer** — `request_id` で串刺しにしたホップ毎の構造化ログ（`session_id`
+   というものは存在しない: Gateway がリクエストごとに 1 つの UUIDv7 を発行し、
+   それを Vault キーとして使っている）
 
 ### 9.2 ターミナル（数秒ずつ）
 

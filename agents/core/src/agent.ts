@@ -3,9 +3,12 @@
  * planning and code generation.
  *
  * This is the one agent that sits outside the trust boundary. It holds no
- * dependency whatsoever on the token vault (Firestore), and that absence is the
- * structural guarantee — expressed in the package's dependency graph rather
- * than in a coding convention.
+ * Firestore role and therefore cannot read the token vault — the guarantee is
+ * **IAM**, granted (or rather, not granted) in `infra/terraform/iam.tf`. The
+ * package graph reinforces it: Core imports only the `/logging`, `/config`,
+ * `/schema` and `/telemetry` subpaths of the shared package, none of which reach
+ * the vault. But a dependency edge is a convention a future commit can add, and
+ * the missing IAM binding is what actually stops a read.
  */
 
 import { LlmAgent } from '@google/adk';
@@ -79,11 +82,16 @@ export function createCoreAgent(options: CreateCoreAgentOptions = {}): LlmAgent 
   // `docs/OBSERVABILITY.md` has always promised an `llm.gemini` span for it.
   //
   // Why start and end it across two callbacks rather than with `withSpan`: ADK
-  // owns the call between them, so there is no function to wrap. The handle is
-  // per-agent and a Core process serves one request per invocation, so the pair
-  // cannot interleave; a leftover handle from a call that never returned is
-  // simply ended when the next one starts.
-  let modelSpan: TraceSpan | undefined;
+  // owns the call between them, so there is no function to wrap.
+  //
+  // The handle is keyed by the ADK callback context — one per in-flight model
+  // call — rather than held on the agent. Cloud Run runs this service at
+  // concurrency 40 over a single agent instance, so an agent-global handle let
+  // one request's `afterModelCallback` end another request's span, producing a
+  // trace that attributes latency to the wrong caller. A WeakMap also means a
+  // call that never returns drops its span with its context instead of being
+  // ended by whichever request happens to start next.
+  const modelSpans = new WeakMap<object, TraceSpan>();
 
   return new LlmAgent({
     name: CORE_AGENT_NAME,
@@ -91,16 +99,16 @@ export function createCoreAgent(options: CreateCoreAgentOptions = {}): LlmAgent 
       'Reasoning, planning and code generation over de-identified text. Operates on ⟦TYPE_N⟧ placeholder tokens and has no access to the token vault.',
     model,
     instruction: CORE_SYSTEM_INSTRUCTION,
-    beforeModelCallback: () => {
-      modelSpan?.end();
+    beforeModelCallback: ({ context }) => {
       // Attributes are the model id only: the request carries the masked prompt,
       // and a span attribute is not the place for any prompt text.
-      modelSpan = getTracer().startSpan(SPAN.llmGemini, { attributes: { model } });
+      modelSpans.set(context, getTracer().startSpan(SPAN.llmGemini, { attributes: { model } }));
       return undefined;
     },
-    afterModelCallback: () => {
-      modelSpan?.end();
-      modelSpan = undefined;
+    afterModelCallback: ({ context }) => {
+      const span = modelSpans.get(context);
+      span?.end();
+      modelSpans.delete(context);
       return undefined;
     },
     // No tools on purpose: the trust boundary assumes Core touches no external

@@ -10,9 +10,12 @@ import {
   parse as parseOkf,
   TRUST_MACHINE_CONFIRMED,
   TRUST_UNVERIFIED,
+  rehydrateWithPolicy,
+  WITHHELD_BODY_MARKER,
   type Logger,
 } from '@privacy-gateway/common';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { responseHash } from '@privacy-gateway/common/attesters/leak-check';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   actor,
   buildReceipt,
@@ -342,5 +345,146 @@ describe('the receipt', () => {
       'request_id',
       'response_hash',
     ]);
+  });
+});
+
+describe('a refusal persists no rejected Core text (P0)', () => {
+  const LEAKY = 'Contact leaked.person@example.com about ⟦PERSON_1⟧.';
+
+  it('puts the withheld marker in the document body, not the rejected answer', async () => {
+    const error = await refusal(LEAKY);
+    const document = parseOkf(error.evidence.markdown);
+
+    expect(document.content).toContain(WITHHELD_BODY_MARKER);
+    expect(error.evidence.markdown).not.toContain('leaked.person@example.com');
+  });
+
+  it('keeps the rejected text out of every field of the result', async () => {
+    const error = await refusal(LEAKY);
+    // Serialising the whole evidence object is the honest check: any future
+    // field that starts carrying the body fails here rather than in production.
+    expect(JSON.stringify(error.evidence)).not.toContain('leaked.person@example.com');
+  });
+
+  it('still records the digest of what was rejected, so an auditor can bind it', async () => {
+    const error = await refusal(LEAKY);
+    const block = (parseOkf(error.evidence.markdown).metadata['attestation'] ?? {}) as Record<
+      string,
+      unknown
+    >;
+
+    // The digest identifies the exchange without the store holding the text.
+    expect(block['core_response_sha256']).toBe(responseHash(LEAKY));
+    expect(block['verdict']).toBe('fail');
+  });
+
+  it('carries no raw mapping value in the refusal itself', async () => {
+    const error = await refusal(LEAKY);
+    expect(error.message).not.toContain('Taro Yamada');
+    expect(error.message).not.toContain('taro@example.co.jp');
+    expect(error.categories).toEqual(['EMAIL']);
+  });
+
+  it('marks the refused document draft with no verified entry', async () => {
+    const error = await refusal(LEAKY);
+    const metadata = parseOkf(error.evidence.markdown).metadata;
+
+    expect(metadata['status']).toBe('draft');
+    expect(metadata['verified']).toBeUndefined();
+    expect(error.evidence.trustTier).toBe(TRUST_UNVERIFIED);
+  });
+});
+
+/**
+ * A rehydrator that records every call and otherwise behaves normally.
+ *
+ * Observing invocation is the point: a released answer proves rehydration
+ * happened, but only a spy can prove it did *not* happen on a refusal.
+ */
+function watchRehydrate() {
+  return vi.fn(rehydrateWithPolicy);
+}
+
+describe('every gate runs before rehydration (P0)', () => {
+  it('does not rehydrate when the deterministic leak check fails', async () => {
+    const spy = watchRehydrate();
+    await refusal('Contact leaked.person@example.com now.', { rehydrate: spy });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('does not rehydrate when Core invented a placeholder', async () => {
+    const spy = watchRehydrate();
+    await refusal('Ask ⟦PERSON_9⟧ about it.', { rehydrate: spy });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('does not rehydrate when the advisory judge flags a leak', async () => {
+    const spy = watchRehydrate();
+    await refusal('Reply to ⟦PERSON_1⟧.', {
+      rehydrate: spy,
+      judge: () => Promise.resolve({ leak: true, categories: ['PERSON'] }),
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('does not rehydrate when the judge has no usable opinion', async () => {
+    const spy = watchRehydrate();
+    await refusal('Reply to ⟦PERSON_1⟧.', {
+      rehydrate: spy,
+      judge: () => Promise.resolve({ leak: null }),
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('does not rehydrate when a placeholder cannot be resolved', async () => {
+    // Resolvability is decided from the mapping's keys, so the refusal never
+    // needs a value to discover that one is missing.
+    const spy = watchRehydrate();
+    await refusal('Reply to ⟦PERSON_1⟧ and ⟦EMAIL_2⟧.', {
+      rehydrate: spy,
+      knownTokens: [...KNOWN_TOKENS, '⟦EMAIL_2⟧'],
+    });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('rehydrates exactly once when every gate passes', async () => {
+    const spy = watchRehydrate();
+    await run('Reply to ⟦PERSON_1⟧.', { rehydrate: spy });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('vault expiry is distinct from vault absence', () => {
+  it('refuses an expired mapping with 410 vault_expired', async () => {
+    const expiring = new InMemoryTokenVault();
+    const entry = await expiring.put(REQUEST_ID, { '⟦PERSON_1⟧': 'Taro Yamada' }, 0);
+
+    const error = await refusal('Reply to ⟦PERSON_1⟧.', {
+      vault: expiring,
+      vaultGeneration: entry.generation,
+    });
+
+    expect(error.kind).toBe('vault_expired');
+    expect(error.status).toBe(410);
+  });
+
+  it('refuses an absent mapping with 409 vault_missing', async () => {
+    const error = await refusal('Reply to ⟦PERSON_1⟧.', { vault: new InMemoryTokenVault() });
+
+    expect(error.kind).toBe('vault_missing');
+    expect(error.status).toBe(409);
+  });
+});
+
+describe('judge categories are a closed enum', () => {
+  it('drops a free-text category rather than forwarding it', async () => {
+    // A judge answering with a real name is the disclosure channel this closes:
+    // categories reach the logs and the public refusal body verbatim.
+    const error = await refusal('Reply to ⟦PERSON_1⟧.', {
+      judge: () => Promise.resolve({ leak: true, categories: ['Taro Yamada', 'PERSON'] }),
+    });
+
+    expect(error.categories).toEqual(['PERSON']);
+    expect(JSON.stringify(error.categories)).not.toContain('Taro Yamada');
   });
 });

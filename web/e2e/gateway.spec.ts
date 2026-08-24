@@ -102,6 +102,14 @@ test.describe('the four trust dimensions', () => {
     // Approval was removed entirely; there is nothing to click.
     await expect(page.locator('#approve')).toHaveCount(0);
   });
+
+  test('qualifies the tier with what was actually confirmed', async ({ page }) => {
+    // A bare "machine-confirmed" reads as a claim about the whole answer. All
+    // that was checked is that the tokenized core response leaked no raw
+    // identifier, so the label has to say so.
+    await expect(page.locator('#tier-scope')).toHaveText(': leak-policy only');
+    await expect(page.locator('.derived')).toContainText('not that the answer is correct');
+  });
 });
 
 test.describe('correlation ids', () => {

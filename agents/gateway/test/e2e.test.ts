@@ -13,6 +13,7 @@ import {
   findTokens,
   InMemoryTokenVault,
   initTelemetry,
+  liveEntry,
   loadConfig,
   parse as parseOkf,
   resetTelemetryForTests,
@@ -29,7 +30,7 @@ import { createApp as createSynthesisApp } from '@privacy-gateway/synthesis/serv
 import { InMemoryAnswerStore } from '@privacy-gateway/synthesis/store';
 import type express from 'express';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createApp } from '../src/server.ts';
+import { createApp, createApp as createGatewayApp } from '../src/server.ts';
 
 const CORE_BASE_URL = 'http://core.test';
 
@@ -287,8 +288,8 @@ describe('the boundary', () => {
     const second = (await (await ask('mail hanako@example.co.jp')).json()) as AskResponse;
 
     expect(first.request_id).not.toBe(second.request_id);
-    expect(await vault.get(first.request_id)).not.toBeNull();
-    expect(Object.values((await vault.get(second.request_id))?.mapping ?? {})).toEqual([
+    expect(liveEntry(await vault.get(first.request_id))).not.toBeNull();
+    expect(Object.values(liveEntry(await vault.get(second.request_id))?.mapping ?? {})).toEqual([
       'hanako@example.co.jp',
     ]);
   });
@@ -635,5 +636,118 @@ describe('failure handling', () => {
 
     expect(response.status).toBe(413);
     expect(promptsSeenByCore).toHaveLength(0);
+  });
+});
+
+describe('the deadline cancels the work, not only the wait (P1)', () => {
+  /** A gateway whose downstream calls hang until their own signal aborts. */
+  function hangingApp(deadlineMs: number) {
+    const observed: { core?: AbortSignal | undefined; synthesis?: AbortSignal | undefined } = {};
+
+    const app = createGatewayApp({
+      config: testConfig(),
+      deadlineMs,
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      extractSpans: () => Promise.resolve([]),
+      callCore: (_prompt, _requestId, signal) => {
+        observed.core = signal;
+        // Never resolves on its own: only the deadline can end this request,
+        // which is exactly the state the old Promise.race left running.
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            reject(new Error('aborted'));
+          });
+        });
+      },
+      callSynthesis: (_input, signal) => {
+        observed.synthesis = signal;
+        return Promise.reject(new Error('unreachable'));
+      },
+    });
+
+    return { app, observed };
+  }
+
+  it('aborts the in-flight Core call when the deadline fires', async () => {
+    const { app, observed } = hangingApp(50);
+    const listener = app.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/ask`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'hello' }),
+    });
+    listener.close();
+
+    expect(response.status).toBe(504);
+    expect(observed.core).toBeDefined();
+    // The mock observes cancellation itself: the request downstream is really
+    // over, not merely no longer awaited.
+    expect(observed.core?.aborted).toBe(true);
+    expect(observed.synthesis).toBeUndefined();
+  });
+
+  it('hands every hop the same request-scoped signal', async () => {
+    const seen: AbortSignal[] = [];
+    const app = createGatewayApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      extractSpans: (_text, signal) => {
+        if (signal !== undefined) seen.push(signal);
+        return Promise.resolve([]);
+      },
+      callCore: (_prompt, _requestId, signal) => {
+        if (signal !== undefined) seen.push(signal);
+        return Promise.resolve('Reply to nobody.');
+      },
+      callSynthesis: (_input, signal) => {
+        if (signal !== undefined) seen.push(signal);
+        return Promise.reject(new Error('stop here'));
+      },
+    });
+
+    const listener = app.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    await fetch(`http://127.0.0.1:${port}/v1/ask`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'hello' }),
+    });
+    listener.close();
+
+    expect(seen).toHaveLength(3);
+    expect(new Set(seen).size).toBe(1);
+  });
+
+  it('aborts anything still in flight once the response has been sent', async () => {
+    let captured: AbortSignal | undefined;
+    const app = createGatewayApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      extractSpans: () => Promise.resolve([]),
+      callCore: (_prompt, _requestId, signal) => {
+        captured = signal;
+        return Promise.resolve('Reply to nobody.');
+      },
+      callSynthesis: () => Promise.reject(new Error('stop here')),
+    });
+
+    const listener = app.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    await fetch(`http://127.0.0.1:${port}/v1/ask`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'hello' }),
+    });
+    listener.close();
+
+    expect(captured?.aborted).toBe(true);
   });
 });

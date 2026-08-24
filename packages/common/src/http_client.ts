@@ -51,7 +51,70 @@ export class IdTokenError extends Error {
   }
 }
 
-/** Whether a target needs a Google ID token, given only its URL. */
+/**
+ * Raised when an https target is not one of the fleet's configured services.
+ *
+ * Typed so a caller can distinguish "we refused to authenticate this" from "we
+ * could not obtain a token", which are different faults with different fixes.
+ */
+export class UnknownAudienceError extends Error {
+  readonly event = 'auth.audience.rejected';
+  readonly origin: string;
+
+  constructor(origin: string) {
+    super(
+      `refusing to attach a fleet ID token to ${origin}: it is not a configured service origin`,
+    );
+    this.name = 'UnknownAudienceError';
+    this.origin = origin;
+  }
+}
+
+/**
+ * Origins this process is allowed to present a Google-signed ID token to.
+ *
+ * Built from the configured service URLs at startup. Why an allowlist and not
+ * "any https URL": a token minted for this fleet's service identity is a bearer
+ * credential, and a single mistyped `SYNTHESIS_BASE_URL` would have handed it to
+ * whatever host the typo named. The token is worthless to a correct callee and
+ * dangerous to an arbitrary one, so the safe default is to send none and fail.
+ */
+const allowedOrigins = new Set<string>();
+
+/**
+ * Declare which origins may receive an ID token.
+ *
+ * Called once per process from `loadConfig` consumers with the configured Core,
+ * Synthesis and Gemma base URLs. An unparseable or non-https entry is skipped:
+ * it names no IAM-protected service.
+ */
+export function setIdTokenAudienceAllowlist(urls: readonly (string | undefined)[]): void {
+  allowedOrigins.clear();
+  for (const url of urls) {
+    if (url === undefined || url.trim() === '') continue;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol === 'https:') allowedOrigins.add(parsed.origin);
+    } catch {
+      // A malformed URL configures no reachable service; config validation
+      // reports it separately.
+    }
+  }
+}
+
+/** The declared origins, for tests and for a startup log line. */
+export function idTokenAudienceAllowlist(): string[] {
+  return [...allowedOrigins].sort();
+}
+
+/**
+ * Whether a target needs a Google ID token, given only its URL.
+ *
+ * True only for https. Plain http is only ever local development: a non-loopback
+ * http target is still not given a token — there is no IAM in front of it to
+ * satisfy — but it is a configuration smell rather than something to
+ * authenticate.
+ */
 export function requiresIdToken(targetUrl: string): boolean {
   let url: URL;
   try {
@@ -59,11 +122,23 @@ export function requiresIdToken(targetUrl: string): boolean {
   } catch {
     return false;
   }
-  if (url.protocol === 'https:') return true;
-  // Plain http is only ever local development. A non-loopback http target is
-  // still not given a token — there is no IAM in front of it to satisfy — but
-  // it is a configuration smell rather than something to authenticate.
-  return false;
+  return url.protocol === 'https:';
+}
+
+/**
+ * Whether `targetUrl` is a configured service origin.
+ *
+ * An empty allowlist means none was declared — a local `just dev` run, or a test
+ * — so every https origin is allowed and the previous behaviour holds. Once a
+ * process declares one, anything outside it is refused.
+ */
+export function isAllowedAudience(targetUrl: string): boolean {
+  if (allowedOrigins.size === 0) return true;
+  try {
+    return allowedOrigins.has(new URL(targetUrl).origin);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -139,6 +214,9 @@ function idTokenClientFor(audience: string): Promise<IdTokenClient> {
  */
 export async function idTokenHeaders(targetUrl: string): Promise<Record<string, string>> {
   const audience = audienceFor(targetUrl);
+  // Checked before the token is minted, not after: the point is that the
+  // credential is never created for an origin this fleet does not talk to.
+  if (!isAllowedAudience(targetUrl)) throw new UnknownAudienceError(audience);
   try {
     const client = await idTokenClientFor(audience);
     // google-auth-library returns a `Headers` in v10 and a plain record in v9;
@@ -150,7 +228,7 @@ export async function idTokenHeaders(targetUrl: string): Promise<Record<string, 
     }
     return { authorization };
   } catch (error) {
-    if (error instanceof IdTokenError) throw error;
+    if (error instanceof IdTokenError || error instanceof UnknownAudienceError) throw error;
     throw new IdTokenError(audience, error);
   }
 }
@@ -225,21 +303,32 @@ export async function authorizedFetch(
   const timer = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
+
   // A caller-supplied signal still wins: both can abort the same request.
-  signal?.addEventListener('abort', () => {
+  //
+  // An already-aborted signal is handled first — `addEventListener` never fires
+  // for an event that has already happened, so the old code started a request
+  // that the caller had already cancelled. The listener is removed in `finally`
+  // because a long-lived request-scoped controller accumulates one listener per
+  // hop otherwise, and Node warns (then leaks) past ten.
+  const abort = (): void => {
     controller.abort();
-  });
+  };
+  if (signal?.aborted === true) abort();
+  else signal?.addEventListener('abort', abort, { once: true });
 
   try {
     return await impl(targetUrl, { ...init, headers: resolved, signal: controller.signal });
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
 }
 
-/** Clears the cached ID token clients. Test-only. */
+/** Clears the cached ID token clients and the audience allowlist. Test-only. */
 export function resetIdTokenCache(): void {
   idTokenClients.clear();
+  allowedOrigins.clear();
   authClient = undefined;
 }
 

@@ -21,6 +21,7 @@
 
 import { trace } from '@opentelemetry/api';
 import type { AgentName } from './config.ts';
+import { isPiiCategory, type PiiCategory } from './schema.ts';
 
 export type Severity = 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
 
@@ -31,8 +32,24 @@ const SEVERITY_ORDER: Record<Severity, number> = {
   ERROR: 40,
 };
 
-/** How an allowed field's value is coerced before it is written. */
-type FieldKind = 'id' | 'enum' | 'number' | 'boolean' | 'string_list' | 'count_map' | 'hash';
+/**
+ * How an allowed field's value is coerced before it is written.
+ *
+ * `enum` and `category_list` are closed domains, not "any short string": the
+ * previous shapes truncated whatever they were given, so a Gemma-controlled
+ * category or a stray header became a log disclosure channel. `id` and `hash`
+ * now validate syntax rather than length, for the same reason.
+ */
+type FieldKind =
+  | 'id'
+  | 'enum'
+  | 'number'
+  | 'boolean'
+  | 'category_list'
+  | 'token_list'
+  | 'enum_list'
+  | 'count_map'
+  | 'hash';
 
 /**
  * Every field a log line may carry, and the shape it is forced into.
@@ -77,22 +94,47 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   finding_count: 'number',
   text_length: 'number',
   tokens_withheld: 'number',
-  finding_kinds: 'string_list',
+  dropped_categories: 'number',
+  finding_kinds: 'category_list',
   ok: 'boolean',
   leak: 'boolean',
   stale: 'boolean',
-  categories: 'string_list',
-  findings: 'string_list',
-  withheld: 'string_list',
-  unresolved_tokens: 'string_list',
-  invented_tokens: 'string_list',
-  issues: 'string_list',
+  categories: 'category_list',
+  findings: 'category_list',
+  withheld: 'category_list',
+  unresolved_tokens: 'token_list',
+  invented_tokens: 'token_list',
+  // Configuration keys only. `config.ts` builds this list from key names and
+  // error codes; a rejected *value* never reaches it.
+  issues: 'enum_list',
   counts_by_category: 'count_map',
   response_hash: 'hash',
   masked_prompt_hash: 'hash',
   attester_sha256: 'hash',
   computation_sha256: 'hash',
 };
+
+/** Syntax a UUID-shaped id must match. Every one is minted server-side. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/** Trace ids are 32 hex characters, span ids 16 (W3C `traceparent`). */
+const TRACE_ID_RE = /^[0-9a-f]{16}$|^[0-9a-f]{32}$/u;
+
+/** A SHA-256 digest as it is logged. */
+const SHA256_RE = /^[0-9a-f]{64}$/u;
+
+/**
+ * Enum values this code can emit.
+ *
+ * Not enumerated one by one — event and refusal names are added constantly —
+ * but constrained in *shape*: a lowercase identifier with dots, underscores or
+ * dashes. Model output, prompt fragments and exception messages all fail it, so
+ * an unlisted value is dropped rather than truncated into the line.
+ */
+const ENUM_RE = /^[A-Za-z][A-Za-z0-9._/:-]{0,63}$/u;
+
+/** A masked placeholder, the only token shape that may be named in a log. */
+const TOKEN_RE = /^⟦[A-Z_]+_\d+⟧$/u;
 
 /** Fields every log line may carry; `event` is the searchable discriminator. */
 export interface LogFields {
@@ -112,16 +154,27 @@ function coerce(kind: FieldKind, value: unknown): unknown {
     case 'boolean':
       return typeof value === 'boolean' ? value : undefined;
     case 'id':
-    case 'enum':
-    case 'hash':
-      // Bounded so an inbound header that slipped through validation cannot
-      // become an unbounded log line.
-      return typeof value === 'string' ? value.slice(0, 128) : undefined;
-    case 'string_list':
-      return Array.isArray(value)
+      // Validated, not truncated: every id here is server-minted, so anything
+      // that is not a UUID or a W3C trace/span id arrived from somewhere it
+      // should not have and is dropped rather than logged in part.
+      return typeof value === 'string' && (UUID_RE.test(value) || TRACE_ID_RE.test(value))
         ? value
-            .filter((item): item is string => typeof item === 'string')
-            .map((item) => item.slice(0, 128))
+        : undefined;
+    case 'hash':
+      return typeof value === 'string' && SHA256_RE.test(value) ? value : undefined;
+    case 'enum':
+      return typeof value === 'string' && ENUM_RE.test(value) ? value : undefined;
+    case 'category_list':
+      return Array.isArray(value)
+        ? value.filter((item): item is PiiCategory => isPiiCategory(item))
+        : undefined;
+    case 'token_list':
+      return Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string' && TOKEN_RE.test(item))
+        : undefined;
+    case 'enum_list':
+      return Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string' && ENUM_RE.test(item))
         : undefined;
     case 'count_map': {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
@@ -191,28 +244,15 @@ export class Logger {
     return new Logger(this.options, { ...this.bound, ...fields });
   }
 
-  debug(message: string, fields?: LogFields): void {
-    this.log('DEBUG', message, fields);
-  }
-
-  info(message: string, fields?: LogFields): void {
-    this.log('INFO', message, fields);
-  }
-
-  warn(message: string, fields?: LogFields): void {
-    this.log('WARNING', message, fields);
-  }
-
-  error(message: string, fields?: LogFields): void {
-    this.log('ERROR', message, fields);
-  }
-
   /**
    * Emit one structured event.
    *
-   * `event` is the stable identifier the log-investigation guide searches on
-   * (`skills/pgw-logs/LOGS.md` §5), so it doubles as the human-readable message
-   * when no separate message is worth writing.
+   * This is the **only** way to write a log line. There is deliberately no
+   * `info(message)` / `error(message)` pair: a free-text message bypassed the
+   * field allowlist entirely, so any call site that interpolated a value — a
+   * response fragment, a header, an exception message — wrote it straight into
+   * the log. `event` is the stable identifier the log-investigation guide
+   * searches on (`skills/pgw-logs/LOGS.md` §5) and it *is* the message.
    */
   event(event: string, fields: LogFields = {}, severity: Severity = 'INFO'): void {
     this.log(severity, event, { ...fields, event });
@@ -224,10 +264,9 @@ export class Logger {
     const merged = { ...this.bound, ...fields };
     const entry: Record<string, unknown> = {
       severity,
-      // The message is always a literal at the call site (an event name or a
-      // fixed sentence), never interpolated user text; bounding it keeps that
-      // true even if someone breaks the convention.
-      message: message.slice(0, 256),
+      // The message is the event name, which passes the same enum check every
+      // other field does. Nothing else can reach it.
+      message: ENUM_RE.test(message) ? message : 'event',
       time: new Date().toISOString(),
       agent: this.options.agent,
       ...selectFields(merged),

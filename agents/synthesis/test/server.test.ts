@@ -12,6 +12,7 @@ import {
   TRUST_MACHINE_CONFIRMED,
   TRUST_UNVERIFIED,
   trustTier,
+  WITHHELD_BODY_MARKER,
   type Config,
 } from '@privacy-gateway/common';
 import type express from 'express';
@@ -251,5 +252,148 @@ describe('routes that no longer exist', () => {
       body: JSON.stringify({ approver: 'kei' }),
     });
     expect(response.status).toBe(404);
+  });
+});
+
+describe('a refusal serves and stores no rejected Core text (P0)', () => {
+  const LEAKY = 'Write to leaked.person@example.com about ⟦PERSON_1⟧.';
+
+  async function refuse() {
+    const response = await synthesize(cleanRequest({ core_answer: LEAKY }));
+    expect(response.status).toBe(422);
+    return response;
+  }
+
+  it('keeps the rejected body out of the stored record entirely', async () => {
+    await refuse();
+
+    const record = await store.get(REQUEST_ID);
+    expect(record).not.toBeNull();
+    expect(JSON.stringify(record)).not.toContain('leaked.person@example.com');
+    expect(record?.coreResponse).toBe(WITHHELD_BODY_MARKER);
+  });
+
+  it('serves the withheld marker from the core-response route, not the text', async () => {
+    await refuse();
+
+    const response = await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/core-response.md`);
+    const body = await response.text();
+    expect(body).toBe(WITHHELD_BODY_MARKER);
+    expect(body).not.toContain('leaked.person@example.com');
+  });
+
+  it('serves an evidence document that names no rejected value', async () => {
+    await refuse();
+
+    const response = await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/evidence`);
+    const markdown = await response.text();
+    expect(markdown).not.toContain('leaked.person@example.com');
+    expect(markdown).toContain(WITHHELD_BODY_MARKER);
+    // The mapping values were never in the document either.
+    expect(markdown).not.toContain('Taro Yamada');
+    expect(markdown).not.toContain('taro@example.co.jp');
+  });
+
+  it('leaves the refused document unverified and draft', async () => {
+    await refuse();
+
+    const markdown = await (await fetch(`${baseUrl}/v1/requests/${REQUEST_ID}/evidence`)).text();
+    const metadata = parseOkf(markdown).metadata;
+
+    expect(metadata['status']).toBe('draft');
+    expect(trustTier(metadata)).toBe(TRUST_UNVERIFIED);
+  });
+
+  it('reports only closed-enum categories in the refusal body', async () => {
+    const body = (await (await refuse()).json()) as { categories: string[]; error: string };
+    expect(body.error).toBe('leak_check_failed');
+    expect(body.categories).toEqual(['EMAIL']);
+  });
+});
+
+describe('evidence expiry matches the vault entry exactly', () => {
+  it('stores the record with the document’s own stale_after', async () => {
+    // Recomputing `now + TTL` at persistence time let the service serve a record
+    // past the freshness the document advertises.
+    await synthesize(cleanRequest());
+
+    const record = await store.get(REQUEST_ID);
+    const staleAfter = parseOkf(record?.okf ?? '').metadata['stale_after'];
+
+    expect(typeof staleAfter).toBe('string');
+    expect(record?.expiresAt.toISOString().slice(0, 19)).toBe(
+      new Date(staleAfter as string).toISOString().slice(0, 19),
+    );
+
+    const live = await vault.get(REQUEST_ID);
+    expect(live.state).toBe('live');
+    expect(record?.expiresAt.toISOString().slice(0, 19)).toBe(
+      (live.state === 'live' ? live.entry.expiresAt : new Date(0)).toISOString().slice(0, 19),
+    );
+  });
+});
+
+describe('vault state maps onto distinct statuses', () => {
+  it('answers 410 vault_expired for a mapping that aged out', async () => {
+    const expiring = new InMemoryTokenVault();
+    const entry = await expiring.put(REQUEST_ID, { '⟦PERSON_1⟧': 'Taro Yamada' }, 0);
+    const expiredApp = await createApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'synthesis', write: () => undefined }),
+      vault: expiring,
+      store: new InMemoryAnswerStore(),
+    });
+    const listener = expiredApp.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/synthesize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(cleanRequest({ vault_generation: entry.generation })),
+    });
+    listener.close();
+
+    expect(response.status).toBe(410);
+    expect(((await response.json()) as { error: string }).error).toBe('vault_expired');
+  });
+
+  it('answers 409 vault_missing when no mapping was ever written', async () => {
+    const emptyApp = await createApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'synthesis', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      store: new InMemoryAnswerStore(),
+    });
+    const listener = emptyApp.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/synthesize`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(cleanRequest()),
+    });
+    listener.close();
+
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('vault_missing');
+  });
+});
+
+describe('the attestation digests are usable in this build', () => {
+  it('records 64-hex digests, never the string unavailable', async () => {
+    const response = await synthesize(cleanRequest());
+    const body = (await response.json()) as { markdown: string };
+    const block = parseOkf(body.markdown).metadata['attestation'] as Record<string, unknown>;
+
+    for (const key of [
+      'attester_sha256',
+      'computation_sha256',
+      'masked_prompt_sha256',
+      'core_response_sha256',
+    ]) {
+      expect(block[key], key).toMatch(/^[0-9a-f]{64}$/u);
+    }
   });
 });

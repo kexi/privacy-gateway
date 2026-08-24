@@ -22,7 +22,70 @@ export type TrustTier = z.infer<typeof TrustTierSchema>;
 export const AnswerStatusSchema = z.enum(['draft', 'stable', 'deprecated']);
 export type AnswerStatus = z.infer<typeof AnswerStatusSchema>;
 
+// --- categories ---------------------------------------------------------------
+
+/**
+ * Every category this fleet's tokenizer can allocate a placeholder for.
+ *
+ * Closed on purpose. `categories` travels from a Gemma judge response into logs
+ * and into the public refusal body, so an open `z.array(z.string())` made a
+ * model-controlled string a disclosure channel: a judge that answered
+ * `categories: ["Taro Yamada"]` would have printed a real name into both. A
+ * value outside this set is dropped, never truncated and never emitted.
+ */
+export const PII_CATEGORIES = [
+  'EMAIL',
+  'PHONE',
+  'CREDIT_CARD',
+  'MY_NUMBER',
+  'IPV4',
+  'API_KEY',
+  'AWS_KEY',
+  'JWT',
+  'PERSON',
+  'ADDRESS',
+  'ORGANIZATION',
+] as const;
+
+export const PiiCategorySchema = z.enum(PII_CATEGORIES);
+export type PiiCategory = z.infer<typeof PiiCategorySchema>;
+
+/** True when `value` names a category this fleet recognises. */
+export function isPiiCategory(value: unknown): value is PiiCategory {
+  return typeof value === 'string' && (PII_CATEGORIES as readonly string[]).includes(value);
+}
+
+/**
+ * Keep only recognised categories, reporting how many were discarded.
+ *
+ * The count is kept because silently shortening a list would hide a judge that
+ * has started answering in free text.
+ */
+export function filterPiiCategories(values: readonly unknown[]): {
+  categories: PiiCategory[];
+  dropped: number;
+} {
+  const categories: PiiCategory[] = [];
+  let dropped = 0;
+  for (const value of values) {
+    if (isPiiCategory(value)) categories.push(value);
+    else dropped += 1;
+  }
+  return { categories, dropped };
+}
+
 // --- attestation -------------------------------------------------------------
+
+/**
+ * A SHA-256 digest as it appears on the wire: 64 lowercase hex characters.
+ *
+ * Why not `z.string()`: the previous shape accepted the literal `unavailable`
+ * that a mispackaged image produced, so a document could name a digest nobody
+ * could ever fetch while still carrying `verified`.
+ */
+export const Sha256HexSchema = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/u, 'must be 64 lowercase hex characters');
 
 /** Verdict from the deterministic attester (`knowledge/references/attesters/leak_check.ts`). */
 export const AttestationSchema = z
@@ -34,15 +97,13 @@ export const AttestationSchema = z
     judge: z
       .object({
         leak: z.boolean().nullable().optional(),
-        categories: z.array(z.string()).optional(),
-        error: z.string().optional(),
-        raw: z.string().optional(),
+        categories: z.array(PiiCategorySchema).optional(),
       })
       .passthrough()
       .optional(),
     unresolved_tokens: z.array(z.string()).optional(),
     /** Categories left masked on purpose by the disclosure policy. */
-    withheld: z.array(z.string()).optional(),
+    withheld: z.array(PiiCategorySchema).optional(),
   })
   .passthrough();
 export type Attestation = z.infer<typeof AttestationSchema>;
@@ -57,15 +118,15 @@ export type Attestation = z.infer<typeof AttestationSchema>;
 export const AttestationBlockSchema = z
   .object({
     computation: z.string(),
-    computation_sha256: z.string(),
-    attester_sha256: z.string(),
-    masked_prompt_sha256: z.string(),
-    core_response_sha256: z.string(),
+    computation_sha256: Sha256HexSchema,
+    attester_sha256: Sha256HexSchema,
+    masked_prompt_sha256: Sha256HexSchema,
+    core_response_sha256: Sha256HexSchema,
     verdict: z.enum(['pass', 'fail']),
     checked_at: z.string(),
     request_id: z.string(),
     trace_id: z.string().optional(),
-    withheld: z.array(z.string()).optional(),
+    withheld: z.array(PiiCategorySchema).optional(),
   })
   .passthrough();
 export type AttestationBlock = z.infer<typeof AttestationBlockSchema>;
@@ -83,10 +144,10 @@ export type ConsistencyReport = z.infer<typeof ConsistencyReportSchema>;
 /** The receipt the executor procedure specifies, minus the response body. */
 export const ReceiptSummarySchema = z.object({
   request_id: z.string(),
-  masked_prompt_hash: z.string(),
-  response_hash: z.string(),
-  findings: z.array(z.string()),
-  attester_sha256: z.string(),
+  masked_prompt_hash: Sha256HexSchema,
+  response_hash: Sha256HexSchema,
+  findings: z.array(PiiCategorySchema),
+  attester_sha256: Sha256HexSchema,
 });
 export type ReceiptSummary = z.infer<typeof ReceiptSummarySchema>;
 
@@ -208,7 +269,7 @@ export const ErrorResponseSchema = z.object({
   error: z.string(),
   message: z.string().optional(),
   request_id: z.string().optional(),
-  categories: z.array(z.string()).optional(),
+  categories: z.array(PiiCategorySchema).optional(),
 });
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
 
@@ -257,7 +318,7 @@ export const ReleaseRefusalSchema = z.object({
   message: z.string(),
   request_id: z.string(),
   /** Category-level only; never a value, never the Core body. */
-  categories: z.array(z.string()),
+  categories: z.array(PiiCategorySchema),
   status_code: z.number().int(),
 });
 export type ReleaseRefusal = z.infer<typeof ReleaseRefusalSchema>;
@@ -345,9 +406,21 @@ export const SpanExtractionSchema = z.object({
 });
 export type SpanExtraction = z.infer<typeof SpanExtractionSchema>;
 
-/** Advisory verdict from the Gemma leak judge; never decides pass or fail. */
-export const LeakJudgeSchema = z.object({
-  leak: z.boolean(),
-  categories: z.array(z.string()).default([]),
-});
+/**
+ * Advisory verdict from the Gemma leak judge; never decides pass or fail.
+ *
+ * `categories` is parsed leniently and then narrowed: a model may emit any
+ * string, so unknown entries are discarded here rather than forwarded into logs
+ * and the public refusal body. `dropped_categories` records how many were
+ * discarded so a judge answering in prose is visible in the telemetry.
+ */
+export const LeakJudgeSchema = z
+  .object({
+    leak: z.boolean(),
+    categories: z.array(z.unknown()).default([]),
+  })
+  .transform((value) => {
+    const { categories, dropped } = filterPiiCategories(value.categories);
+    return { leak: value.leak, categories, dropped_categories: dropped };
+  });
 export type LeakJudge = z.infer<typeof LeakJudgeSchema>;

@@ -4,7 +4,7 @@
  * on both the headers and the message metadata.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   AgentCardOriginError,
   agentCardUrl,
@@ -12,6 +12,11 @@ import {
   resolveRpcUrl,
   sendMessage,
 } from '../src/a2a.ts';
+import {
+  resetIdTokenCache,
+  setIdTokenAudienceAllowlist,
+  UnknownAudienceError,
+} from '../src/http_client.ts';
 
 const BASE_URL = 'http://core.test';
 
@@ -250,5 +255,40 @@ describe('agent card rpc url origin', () => {
 
     // Only the card fetch happened; the prompt never left for the attacker.
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe('authentication faults keep their type through card lookup (P2)', () => {
+  const CLOUD_RUN = 'https://core-agent-abc.us-central1.run.app';
+
+  afterEach(() => {
+    resetIdTokenCache();
+  });
+
+  it('rethrows UnknownAudienceError instead of wrapping it in a generic Error', async () => {
+    // The gateway classifies this as `auth.audience.rejected`; the old
+    // catch-and-wrap turned it into "could not resolve an agent card", which
+    // points an operator at the callee rather than at the configuration.
+    setIdTokenAudienceAllowlist(['https://someone-else.run.app']);
+
+    const { fetchAgentCard } = await import('../src/a2a.ts');
+    await expect(fetchAgentCard(CLOUD_RUN)).rejects.toBeInstanceOf(UnknownAudienceError);
+  });
+
+  it('does not try the second card path after an authentication fault', async () => {
+    // Trying `agent.json` cannot fix a credential problem; it only doubles the
+    // latency of a request that is already going to fail.
+    setIdTokenAudienceAllowlist(['https://someone-else.run.app']);
+    const calls: string[] = [];
+    const fetchImpl = ((url: string) => {
+      calls.push(url);
+      return Promise.resolve(Response.json({}));
+    }) as unknown as typeof fetch;
+
+    const { fetchAgentCard } = await import('../src/a2a.ts');
+    await expect(fetchAgentCard(CLOUD_RUN, { fetchImpl })).rejects.toBeInstanceOf(
+      UnknownAudienceError,
+    );
+    expect(calls).toEqual([]);
   });
 });

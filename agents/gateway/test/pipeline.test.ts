@@ -7,6 +7,7 @@
 import {
   findTokens,
   InMemoryTokenVault,
+  liveEntry,
   createLogger,
   PiiLeakError,
   type Detection,
@@ -149,7 +150,7 @@ describe('reserved placeholder syntax', () => {
 
   it('refuses before anything is written to the vault', async () => {
     await expect(run({ text: 'give me ⟦PERSON_1⟧' })).rejects.toThrow(ReservedSyntaxError);
-    expect(await vault.get(REQUEST_ID)).toBeNull();
+    expect(await vault.get(REQUEST_ID)).toEqual({ state: 'missing' });
   });
 
   it('refuses a half-open probe as well', async () => {
@@ -160,7 +161,7 @@ describe('reserved placeholder syntax', () => {
 describe('vault', () => {
   it('holds the mapping after the request, keyed by the request id', async () => {
     await run();
-    const entry = await vault.get(REQUEST_ID);
+    const entry = liveEntry(await vault.get(REQUEST_ID));
     expect(Object.values(entry?.mapping ?? {})).toContain('taro@example.co.jp');
   });
 
@@ -173,8 +174,10 @@ describe('vault', () => {
     // the numbering.
     expect(first.maskedPrompt).toContain('⟦EMAIL_1⟧');
     expect(second.maskedPrompt).toContain('⟦EMAIL_1⟧');
-    expect(Object.values((await vault.get('r-a'))?.mapping ?? {})).toEqual(['taro@example.co.jp']);
-    expect(Object.values((await vault.get('r-b'))?.mapping ?? {})).toEqual([
+    expect(Object.values(liveEntry(await vault.get('r-a'))?.mapping ?? {})).toEqual([
+      'taro@example.co.jp',
+    ]);
+    expect(Object.values(liveEntry(await vault.get('r-b'))?.mapping ?? {})).toEqual([
       'hanako@example.co.jp',
     ]);
   });
@@ -190,13 +193,15 @@ describe('what Synthesis is handed', () => {
   it('passes the tokenizer allocation, not tokens scraped from the prompt', async () => {
     await run({ text: 'mail taro@example.co.jp' });
 
-    const entry = await vault.get(REQUEST_ID);
+    const entry = liveEntry(await vault.get(REQUEST_ID));
     expect(lastSynthesisInput?.knownTokens).toEqual(Object.keys(entry?.mapping ?? {}));
   });
 
   it('passes the exact generation the gateway wrote', async () => {
     await run();
-    expect(lastSynthesisInput?.vaultGeneration).toBe((await vault.get(REQUEST_ID))?.generation);
+    expect(lastSynthesisInput?.vaultGeneration).toBe(
+      liveEntry(await vault.get(REQUEST_ID))?.generation,
+    );
   });
 });
 

@@ -23,8 +23,11 @@ import {
   initTelemetry,
   IdTokenError,
   loadConfig,
+  UnknownAudienceError,
   PiiLeakError,
+  ReleaseRefusalSchema,
   sendMessage,
+  setIdTokenAudienceAllowlist,
   SPAN,
   SynthesizeResponseSchema,
   uuidv7,
@@ -42,7 +45,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ExtractionFailedError, extractUnstructured } from './agent.ts';
-import { ask, ReservedSyntaxError, type AskResult } from './pipeline.ts';
+import { ask, RequestAbortedError, ReservedSyntaxError, type AskResult } from './pipeline.ts';
 
 /** Cloud Run injects PORT. Locally 8081 sits between web (5173) and core (8082). */
 const DEFAULT_PORT = 8081;
@@ -84,13 +87,27 @@ export interface CreateAppOptions {
   readonly config: Config;
   readonly logger: Logger;
   /** Injected by tests so the whole route surface runs without a network. */
-  readonly callCore?: ((maskedPrompt: string, requestId: string) => Promise<string>) | undefined;
-  readonly callSynthesis?: ((input: SynthesisInput) => Promise<SynthesizeResponse>) | undefined;
+  readonly callCore?:
+    | ((maskedPrompt: string, requestId: string, signal?: AbortSignal) => Promise<string>)
+    | undefined;
+  readonly callSynthesis?:
+    | ((input: SynthesisInput, signal?: AbortSignal) => Promise<SynthesizeResponse>)
+    | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
-  readonly extractSpans?: ((text: string) => Promise<Detection[]>) | undefined;
+  readonly extractSpans?:
+    | ((text: string, signal?: AbortSignal) => Promise<Detection[]>)
+    | undefined;
   readonly vault?: TokenVault | undefined;
   /** Injectable clock so the rate-limit test does not sleep. */
   readonly now?: (() => number) | undefined;
+  /**
+   * Overrides the configured deadline.
+   *
+   * Injectable so the cancellation test can fire it in milliseconds; the config
+   * value is in whole seconds, and a one-second wait per assertion would make
+   * the suite slow enough to be skipped.
+   */
+  readonly deadlineMs?: number | undefined;
 }
 
 interface SynthesisInput {
@@ -192,28 +209,37 @@ export function createApp(options: CreateAppOptions): express.Application {
   mountWebUi(app, config);
 
   /** Calls Core over the standard A2A protocol, propagating the correlation ids. */
-  async function callCore(maskedPrompt: string, requestId: string): Promise<string> {
+  async function callCore(
+    maskedPrompt: string,
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     if (options.callCore !== undefined) {
-      return options.callCore(maskedPrompt, requestId);
+      return options.callCore(maskedPrompt, requestId, signal);
     }
     const reply = await sendMessage(coreBase, maskedPrompt, {
       requestId,
       contextId: requestId,
       timeoutMs: config.requestTimeoutMs,
       fetchImpl,
+      ...(signal === undefined ? {} : { signal }),
     });
     return reply.text;
   }
 
   /** Calls Synthesis over HTTP: the deterministic path (see the module docstring). */
-  async function callSynthesis(input: SynthesisInput): Promise<SynthesizeResponse> {
-    if (options.callSynthesis !== undefined) return options.callSynthesis(input);
+  async function callSynthesis(
+    input: SynthesisInput,
+    signal?: AbortSignal,
+  ): Promise<SynthesizeResponse> {
+    if (options.callSynthesis !== undefined) return options.callSynthesis(input, signal);
 
     const response = await authorizedFetch(`${synthesisBase}/v1/synthesize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       requestId: input.requestId,
       fetchImpl,
+      ...(signal === undefined ? {} : { signal }),
       body: JSON.stringify({
         request_id: input.requestId,
         masked_prompt: input.maskedPrompt,
@@ -265,13 +291,27 @@ export function createApp(options: CreateAppOptions): express.Application {
 
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
 
-    // One deadline for the whole chain. Without it a hung Gemma or Core pins a
-    // worker for as long as the socket stays open.
+    // One deadline for the whole chain, expressed as a real cancellation.
+    //
+    // `Promise.race` alone only stopped waiting: the Core, Synthesis and Gemma
+    // calls kept running, kept spending model budget and kept persisting
+    // evidence after the caller had already been answered 504. The controller
+    // below is passed down every hop, so the timeout aborts the work as well as
+    // the wait.
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, options.deadlineMs ?? config.requestDeadlineMs);
+    timer.unref?.();
+
     const deadline = new Promise<never>((_resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new DeadlineExceededError());
-      }, config.requestDeadlineMs);
-      timer.unref?.();
+      controller.signal.addEventListener(
+        'abort',
+        () => {
+          reject(new DeadlineExceededError());
+        },
+        { once: true },
+      );
     });
 
     try {
@@ -289,8 +329,11 @@ export function createApp(options: CreateAppOptions): express.Application {
                 text: parsed.data.text,
                 requestId: context.requestId,
                 vault,
-                callCore: (maskedPrompt) => callCore(maskedPrompt, context.requestId),
-                callSynthesis: (input) => callSynthesis({ ...input, requestId: context.requestId }),
+                signal: controller.signal,
+                callCore: (maskedPrompt, signal) =>
+                  callCore(maskedPrompt, context.requestId, signal),
+                callSynthesis: (input, signal) =>
+                  callSynthesis({ ...input, requestId: context.requestId }, signal),
                 coreActor,
                 extractSpans:
                   options.extractSpans ??
@@ -320,6 +363,11 @@ export function createApp(options: CreateAppOptions): express.Application {
       res.json(toPayload(result));
     } catch (error) {
       handleAskError(error, res, context);
+    } finally {
+      // Releases the timer and, on the success path, cancels anything still in
+      // flight behind the response that was already sent.
+      clearTimeout(timer);
+      controller.abort();
     }
   }
 
@@ -384,7 +432,9 @@ export function createApp(options: CreateAppOptions): express.Application {
       return;
     }
 
-    if (error instanceof DeadlineExceededError) {
+    // A step that stopped because the deadline fired is the same fact as the
+    // deadline itself; reporting it as an internal error would hide the cause.
+    if (error instanceof DeadlineExceededError || error instanceof RequestAbortedError) {
       context.logger.event('request.failed', { error_code: 'deadline_exceeded' }, 'ERROR');
       res.status(504).json({
         error: 'deadline_exceeded',
@@ -397,14 +447,20 @@ export function createApp(options: CreateAppOptions): express.Application {
     // A missing ID token is a deployment/credential fault on *our* side of the
     // hop, not a caller error, and it is indistinguishable from a downstream
     // outage to the client — so it reports as 502 under its own event name.
-    const isAuthFailure = error instanceof IdTokenError;
+    const isAuthFailure = error instanceof IdTokenError || error instanceof UnknownAudienceError;
     const status = isAuthFailure || error instanceof DownstreamError ? 502 : 500;
     context.logger.event(
-      isAuthFailure ? 'auth.id_token.failed' : 'request.failed',
+      isAuthFailure
+        ? error instanceof UnknownAudienceError
+          ? 'auth.audience.rejected'
+          : 'auth.id_token.failed'
+        : 'request.failed',
       {
         error_class: error instanceof Error ? error.name : 'unknown',
         error_code: isAuthFailure
-          ? 'id_token_unavailable'
+          ? error instanceof UnknownAudienceError
+            ? 'audience_rejected'
+            : 'id_token_unavailable'
           : status === 502
             ? 'downstream_error'
             : 'internal_error',
@@ -564,19 +620,18 @@ async function readRefusal(response: globalThis.Response): Promise<SynthesisRefu
   if (!isRefusalStatus) return null;
 
   try {
-    const body = (await response.json()) as {
-      error?: unknown;
-      message?: unknown;
-      categories?: unknown;
-    };
-    if (typeof body.error !== 'string') return null;
+    // Validated with the shared schema rather than a hand-written cast. The cast
+    // it replaces was the one boundary in the fleet that did not use zod, and it
+    // accepted whatever shape arrived — including a `categories` array of
+    // arbitrary strings, which is the disclosure channel the closed enum closes.
+    const parsed = ReleaseRefusalSchema.safeParse(await response.json());
+    if (!parsed.success) return null;
+
     return new SynthesisRefusedError(
-      body.error,
-      typeof body.message === 'string' ? body.message : 'the answer was not released',
+      parsed.data.error,
+      parsed.data.message,
       response.status,
-      Array.isArray(body.categories)
-        ? body.categories.filter((entry): entry is string => typeof entry === 'string')
-        : [],
+      parsed.data.categories,
     );
   } catch {
     return null;
@@ -628,6 +683,16 @@ function mountWebUi(app: express.Application, config: Config): void {
 /** Entry point. */
 export async function main(): Promise<void> {
   const config = loadConfig({ agent: 'gateway' });
+
+  // Exactly the three services this agent talks to. Anything else is refused a
+  // token rather than handed one: a mistyped base URL must not deliver this
+  // fleet's service identity to an arbitrary host.
+  setIdTokenAudienceAllowlist([
+    config.CORE_BASE_URL,
+    config.SYNTHESIS_BASE_URL,
+    config.GEMMA_BASE_URL,
+  ]);
+
   initTelemetry({
     agent: 'gateway',
     enabled: config.OTEL_ENABLED ?? false,

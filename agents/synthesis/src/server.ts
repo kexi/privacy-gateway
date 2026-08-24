@@ -14,7 +14,11 @@
 import { toA2a } from '@google/adk';
 import { AGENT_CARD_PATH, type AgentCard } from '@a2a-js/sdk';
 import {
+  ATTESTER_RESOURCE,
+  attesterSha256,
   buildVault,
+  COMPUTATION_RESOURCE,
+  computationSha256,
   contextFromHeaders,
   createLogger,
   currentTraceId,
@@ -22,9 +26,11 @@ import {
   loadConfig,
   REQUEST_ID_HEADER,
   resolveRequestId,
+  setIdTokenAudienceAllowlist,
   SPAN,
   SynthesizeRequestSchema,
   vaultTtlSeconds,
+  WITHHELD_BODY_MARKER,
   withContext,
   withSpan,
   type Config,
@@ -78,6 +84,24 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     res.status(200).json({ status: 'ok', agent: 'synthesis' });
   });
 
+  /**
+   * The attestation digests this build will record in every document.
+   *
+   * Exists so the digests can be checked without running a request: `just
+   * image-test` starts the production image and reads this route, which is the
+   * cheapest way to catch the packaging fault where `dist/`-only containers
+   * emitted the literal string `unavailable` while still claiming machine
+   * confirmation. It discloses nothing a served document does not already carry.
+   */
+  app.get('/v1/attestation', (_req, res) => {
+    res.status(200).json({
+      computation: COMPUTATION_RESOURCE,
+      attester_resource: ATTESTER_RESOURCE,
+      computation_sha256: computationSha256(),
+      attester_sha256: attesterSha256(),
+    });
+  });
+
   app.post('/v1/synthesize', (req, res, next) => {
     void handleSynthesize(req, res, next);
   });
@@ -94,7 +118,19 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     void handleArtifact(req, res, next, 'coreResponse');
   });
 
-  /** Persist the masked evidence. Called on release and on refusal alike. */
+  /**
+   * Persist the masked evidence. Called on release and on refusal alike.
+   *
+   * `coreResponse` is deliberately not a parameter of the refusal path: a
+   * refused body is the exact text a gate rejected, and the evidence routes are
+   * unauthenticated, so a refusal stores the `content withheld` marker in its
+   * place. What survives is the digest recorded in the document's `attestation`
+   * block, which still binds the record to the exchange.
+   *
+   * `expiresAt` is the vault entry's own expiry, taken from the document's
+   * `stale_after`, not `now + TTL`: computing a later expiry at persistence time
+   * let the service serve a record past the freshness the document claims.
+   */
   async function persist(
     requestId: string,
     result: SynthesisResult,
@@ -108,7 +144,7 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
         okf: result.markdown,
         maskedPrompt,
         coreResponse,
-        expiresAt: new Date(Date.now() + vaultTtlSeconds() * 1000),
+        expiresAt: staleAfterOf(result),
       };
       await store.put(record);
       scoped.event('okf.persist', {
@@ -150,6 +186,10 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
             vault,
             generatedBy: input.generated_by,
             logger: scoped,
+            // Express aborts this when the client disconnects, which is what the
+            // gateway's deadline does upstream. Without it a timed-out request
+            // kept calling Gemma and writing evidence after the caller had gone.
+            signal: abortSignalOf(req),
             ...(judge !== undefined ? { judge } : {}),
           });
 
@@ -209,7 +249,9 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     const evidence = (error as RefusalWithEvidence).evidence as SynthesisResult | undefined;
     if (evidence !== undefined) {
       try {
-        await persist(requestId, evidence, input.masked_prompt, input.core_answer, scoped);
+        // The Core body is replaced by the marker, never stored and never
+        // served: it is precisely the text a gate refused to release.
+        await persist(requestId, evidence, input.masked_prompt, WITHHELD_BODY_MARKER, scoped);
       } catch {
         // A store failure must not turn a clean refusal into a 500 that leaks
         // less information than the refusal itself would have.
@@ -283,11 +325,39 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
 }
 
 /**
+ * The signal Express aborts when the client goes away.
+ *
+ * Node 18+ exposes `AbortSignal` on the request; the guard keeps this working
+ * against a request double in a test that does not.
+ */
+function abortSignalOf(req: Request): AbortSignal | undefined {
+  const signal = (req as Request & { signal?: unknown }).signal;
+  return signal instanceof AbortSignal ? signal : undefined;
+}
+
+/**
  * The `:id` path segment. Present by construction: the handler only runs when
  * its route matched.
  */
 function requestParam(req: Request): string {
   return (req.params as Record<string, string | undefined>)['id'] ?? '';
+}
+
+/**
+ * The exact expiry the document itself advertises.
+ *
+ * Read back from the assembled frontmatter rather than recomputed, so the record
+ * and the `stale_after` a reader sees can never disagree. The TTL fallback
+ * covers only a document whose `stale_after` failed to parse, which the builder
+ * does not produce.
+ */
+export function staleAfterOf(result: SynthesisResult): Date {
+  const raw = result.document.metadata['stale_after'];
+  if (typeof raw === 'string') {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(Date.now() + vaultTtlSeconds() * 1000);
 }
 
 /**
@@ -363,6 +433,10 @@ async function mountA2a(app: express.Application, config: Config): Promise<void>
 /** Entry point. */
 export async function main(): Promise<void> {
   const config = loadConfig({ agent: 'synthesis' });
+
+  // Synthesis's only outbound hop is the Gemma judge.
+  setIdTokenAudienceAllowlist([config.GEMMA_BASE_URL]);
+
   initTelemetry({
     agent: 'synthesis',
     enabled: config.OTEL_ENABLED ?? false,

@@ -8,7 +8,7 @@
  * instead.
  */
 
-import type { FirestoreLike } from '@privacy-gateway/common';
+import type { EvidenceFirestoreLike } from '../src/store.ts';
 import { describe, expect, it } from 'vitest';
 import {
   buildAnswerStore,
@@ -32,12 +32,12 @@ function record(overrides: Partial<EvidenceRecord> = {}): EvidenceRecord {
 
 /** Minimal in-memory stand-in for the Firestore surface the store uses. */
 function fakeFirestore(): {
-  client: FirestoreLike;
+  client: EvidenceFirestoreLike;
   docs: Map<string, Record<string, unknown>>;
 } {
   const docs = new Map<string, Record<string, unknown>>();
 
-  const client: FirestoreLike = {
+  const client: EvidenceFirestoreLike = {
     collection: (name: string) => ({
       doc: (id: string) => {
         const key = `${name}/${id}`;

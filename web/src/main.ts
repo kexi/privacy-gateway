@@ -104,9 +104,20 @@ function renderDimensions(response: AskResponse, tier: TrustTier): void {
       none: 'no authenticated principal exists on this gateway, so no human review is possible',
     }),
   ];
+  // The tier value is the OKF SPEC §5.3 term and stays verbatim, but the label
+  // beside it names the *scope* of what was confirmed. A bare
+  // "machine-confirmed" reads as a claim about the whole answer, when all that
+  // was checked is a narrow leak-policy property: the tokenized core response
+  // carried no raw identifier of its own. It is not a factual validation.
+  const scope =
+    tier === 'machine-confirmed'
+      ? '<span class="tier-scope" id="tier-scope">: leak-policy only</span>'
+      : '';
   dimensionsPane.innerHTML = `<div class="dimensions-grid">${cells.join('')}</div>
-    <p class="derived">Derived trust tier: <code id="tier">${escapeHtml(tier)}</code>
-    <small>(from the OKF <code>verified</code> field, not from a stored score)</small></p>`;
+    <p class="derived">Derived trust tier: <code id="tier">${escapeHtml(tier)}</code>${scope}
+    <small>(from the OKF <code>verified</code> field, not from a stored score. The check
+    confirms only that the core response leaked no raw identifier — not that the answer is
+    correct.)</small></p>`;
 }
 
 function dimension(

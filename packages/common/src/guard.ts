@@ -3,8 +3,21 @@
  *
  * Immediately before sending to the Core Agent, the regex detection is run once
  * more and the request is refused if even a single piece of raw PII remains.
- * This redundancy structurally prevents a bug in the tokenizer, or an
- * unstructured span Gemma missed, from reaching Gemini.
+ *
+ * **What this can and cannot catch.** It re-runs the *same* deterministic
+ * patterns the tokenizer ran, so it catches a tokenizer bug — a substitution
+ * that failed to apply, a mapping that was dropped — over the structured
+ * categories those patterns cover: emails, phone numbers, card numbers, keys.
+ *
+ * It does **not** catch a personal name or a postal address that Gemma's span
+ * extraction missed. No regex can: those categories have no lexical form to
+ * match, which is why Gemma is asked about them in the first place. A false
+ * negative from the extractor passes through this guard unchanged. The fleet's
+ * answer to that risk is elsewhere — `ExtractionFailedError` refuses the request
+ * outright when Gemma is unusable, so the failure mode is a refusal rather than
+ * a silent send — but an extractor that confidently returns the wrong answer is
+ * a residual risk this guard does not close. See `docs/ARCHITECTURE.md` §
+ * "Pseudonymization, not anonymization".
  */
 
 import { detect, type Detection } from './tokenizer.ts';

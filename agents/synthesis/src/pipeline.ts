@@ -2,10 +2,17 @@
  * The Synthesis pipeline: gate -> attest -> release -> OKF assembly.
  *
  * Every gate runs *before* rehydration and every one of them can stop the
- * request. Nothing here degrades: if the vault mapping is missing, the wrong
- * generation, or incomplete; if Core invented a placeholder; if the leak check
- * fails; or if the Gemma judge flags a leak or cannot answer — the pipeline
- * throws and no rehydrated text is produced, returned, or stored.
+ * request. That ordering is literal, not aspirational: `rehydrateWithPolicy` is
+ * reached exactly once, after the vault, consistency, deterministic and judge
+ * gates have all passed. Token resolvability is checked beforehand against the
+ * mapping's *keys* only, so a request that would have produced dangling
+ * placeholders is refused without ever materializing a value.
+ *
+ * A refusal is auditable but not disclosing. The evidence document a refusal
+ * carries holds no Core body at all — only the digests, the closed-enum findings
+ * and a `content withheld` marker — because the rejected text is precisely the
+ * text that failed the policy, and persisting it under the audit trail's name
+ * would recreate the leak the gate just stopped.
  *
  * The only LLM in the path is the Gemma judge, and its influence is asymmetric:
  * `leak: true` or "no opinion" blocks the release, while `leak: false` adds no
@@ -21,22 +28,27 @@ import {
 import {
   attesterSha256,
   buildGatewayAnswer,
+  categoryOf,
   COMPUTATION_RESOURCE,
   computationSha256,
   currentTraceId,
   dump,
+  filterPiiCategories,
+  getTracer,
   findTokens,
   freshness,
   leakCheckActor,
   rehydrateWithPolicy,
   SPAN,
   trustTier,
+  WITHHELD_BODY_MARKER,
   withheldCategories,
   withSpan,
   type Attestation,
   type ConsistencyReport,
   type Logger,
   type OkfDocument,
+  type PiiCategory,
   type ReceiptSummary,
   type TokenVault,
   type TrustDimensions,
@@ -54,7 +66,10 @@ export function actor(version = '0.1.0'): string {
  * `leak: null` means the judge had no usable opinion — a transport failure, a
  * timeout, or an unparseable answer. It is treated exactly like `true`.
  */
-export type LeakJudge = (text: string) => Promise<{ leak: boolean | null; categories?: string[] }>;
+export type LeakJudge = (
+  text: string,
+  signal?: AbortSignal,
+) => Promise<{ leak: boolean | null; categories?: readonly string[] }>;
 
 /** Why a release was refused, and the HTTP status that expresses it. */
 export type RefusalKind =
@@ -91,14 +106,15 @@ const REFUSAL_STATUS: Readonly<Record<RefusalKind, number>> = {
 export class ReleaseRefusedError extends Error {
   readonly kind: RefusalKind;
   readonly status: number;
-  readonly categories: readonly string[];
+  /** Closed-enum categories only; an unrecognised name is dropped, not truncated. */
+  readonly categories: readonly PiiCategory[];
 
-  constructor(kind: RefusalKind, message: string, categories: readonly string[] = []) {
+  constructor(kind: RefusalKind, message: string, categories: readonly unknown[] = []) {
     super(message);
     this.name = 'ReleaseRefusedError';
     this.kind = kind;
     this.status = REFUSAL_STATUS[kind];
-    this.categories = categories;
+    this.categories = filterPiiCategories(categories).categories;
   }
 }
 
@@ -122,6 +138,8 @@ export interface FullReceipt {
   readonly response_hash: string;
   readonly findings: string[];
   readonly response: string;
+  /** The prompt itself, so the attester re-derives its hash instead of trusting one. */
+  readonly masked_prompt: string;
 }
 
 /**
@@ -141,6 +159,7 @@ export function buildReceipt(
     response_hash: responseHash(response),
     findings: scanForLeaks(response),
     response,
+    masked_prompt: maskedPrompt,
   };
 }
 
@@ -185,13 +204,182 @@ export interface SynthesizeOptions {
   readonly logger?: Logger | undefined;
   /** Categories the disclosure policy withholds; defaults to the env policy. */
   readonly withhold?: readonly string[] | undefined;
+  /**
+   * The rehydration step, injectable.
+   *
+   * Exists so a test can observe *whether* it was reached, which is the whole
+   * content of the "every gate runs before rehydration" guarantee: asserting on
+   * the returned answer cannot distinguish "never rehydrated" from "rehydrated
+   * and then discarded", and those are exactly the two states the review found
+   * the pipeline confusing.
+   */
+  readonly rehydrate?: typeof rehydrateWithPolicy | undefined;
+  /** The caller's deadline. Cancels the judge call and stops the pipeline. */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * Everything the OKF document and the receipt need, derived once.
+ *
+ * Built for the release path and for the refusal path alike, from the *masked*
+ * inputs only, so the same helper can produce an auditable record without the
+ * refusal branch ever touching a rehydrated string.
+ */
+interface EvidenceInputs {
+  readonly requestId: string;
+  readonly maskedPrompt: string;
+  readonly coreAnswer: string;
+  readonly staleAfter: Date;
+  readonly checkedAt: Date;
+  readonly coreActor: string;
+  readonly traceId: string | undefined;
+}
+
+/**
+ * Assemble the result object.
+ *
+ * `bodyIsWithheld` decides what the document's body holds: on release it is the
+ * still-masked Core answer, on refusal it is the `content withheld` marker. The
+ * `attestation` digests are computed over the real Core answer in both cases —
+ * they are what lets an auditor holding the original prove which exchange the
+ * refusal was about without the store retaining that text.
+ */
+function assemble(
+  inputs: EvidenceInputs,
+  attestation: Attestation,
+  consistency: ConsistencyReport,
+  verdictFindings: readonly PiiCategory[],
+  answer: string,
+  withheldCategoriesList: readonly PiiCategory[],
+  bodyIsWithheld: boolean,
+): SynthesisResult {
+  const span = getTracer().startSpan(SPAN.okfBuild, {
+    attributes: { request_id: inputs.requestId },
+  });
+  try {
+    return assembleWithin(
+      inputs,
+      attestation,
+      consistency,
+      verdictFindings,
+      answer,
+      withheldCategoriesList,
+      bodyIsWithheld,
+    );
+  } finally {
+    span.end();
+  }
+}
+
+/**
+ * The assembly itself.
+ *
+ * Split from the span wrapper because `withSpan` is async and every caller here
+ * is synchronous; the document build touches no I/O, so awaiting it would only
+ * add a microtask between the last gate and the record it produces.
+ */
+function assembleWithin(
+  inputs: EvidenceInputs,
+  attestation: Attestation,
+  consistency: ConsistencyReport,
+  verdictFindings: readonly PiiCategory[],
+  answer: string,
+  withheldCategoriesList: readonly PiiCategory[],
+  bodyIsWithheld: boolean,
+): SynthesisResult {
+  const { requestId, maskedPrompt, coreAnswer, checkedAt } = inputs;
+
+  const document = buildGatewayAnswer({
+    requestId,
+    maskedAnswerBody: bodyIsWithheld ? WITHHELD_BODY_MARKER : coreAnswer,
+    coreActor: inputs.coreActor,
+    generatedBy: actor(),
+    verifiedBy: leakCheckActor(),
+    staleAfter: inputs.staleAfter,
+    attestation,
+    evidence: {
+      computation: COMPUTATION_RESOURCE,
+      computationSha256: computationSha256(),
+      attesterSha256: attesterSha256(),
+      maskedPromptSha256: responseHash(maskedPrompt),
+      coreResponseSha256: responseHash(coreAnswer),
+      checkedAt,
+      withheld: withheldCategoriesList,
+    },
+    ...(inputs.traceId !== undefined ? { traceId: inputs.traceId } : {}),
+  });
+
+  const receipt: ReceiptSummary = {
+    request_id: requestId,
+    masked_prompt_hash: responseHash(maskedPrompt),
+    response_hash: responseHash(coreAnswer),
+    findings: [...verdictFindings],
+    attester_sha256: attesterSha256(),
+  };
+
+  return {
+    document,
+    markdown: dump(document),
+    answer,
+    attestation,
+    consistency,
+    receipt,
+    trustTier: trustTier(document.metadata),
+    dimensions: {
+      policy_verdict: attestation.ok ? 'pass' : 'fail',
+      document_status:
+        (document.metadata['status'] as TrustDimensions['document_status']) ?? 'draft',
+      freshness: freshness(document.metadata, checkedAt),
+      // The public gateway authenticates nobody, so nothing can name a reviewer.
+      review_identity: 'none',
+    },
+  };
+}
+
+/**
+ * Which placeholders would fail to resolve, without materializing any value.
+ *
+ * Only the mapping's *keys* are consulted. Calling the rehydrator to find out
+ * would defeat the ordering guarantee this pipeline exists to keep: a request
+ * that is about to be refused must never have had its real values assembled into
+ * a string, not even one that is then thrown away.
+ */
+export function unresolvableTokens(
+  coreAnswer: string,
+  mappingKeys: ReadonlySet<string>,
+  withhold: ReadonlySet<string>,
+): { unresolved: string[]; withheld: string[]; withheldCategories: PiiCategory[] } {
+  const unresolved: string[] = [];
+  const withheld: string[] = [];
+
+  for (const placeholder of findTokens(coreAnswer)) {
+    const category = categoryOf(placeholder);
+    if (category !== null && withhold.has(category)) {
+      withheld.push(placeholder);
+      continue;
+    }
+    if (!mappingKeys.has(placeholder)) unresolved.push(placeholder);
+  }
+
+  return {
+    unresolved: unresolved.sort(),
+    withheld: withheld.sort(),
+    withheldCategories: filterPiiCategories([
+      ...new Set(withheld.map((token) => categoryOf(token))),
+    ]).categories.sort(),
+  };
 }
 
 /**
  * Verify Core's output and, only if every gate passes, release it.
  *
+ * The order is fixed and load-bearing: vault -> consistency -> deterministic
+ * attester -> judge -> resolvability -> *one* rehydration. Nothing before the
+ * last step reads a mapping value.
+ *
  * @throws ReleaseRefusedError on any failed gate. The caller maps `.status` onto
- *   the HTTP response and persists the (answer-free) evidence document.
+ *   the HTTP response and persists the evidence document, whose body is the
+ *   `content withheld` marker rather than the rejected text.
  */
 export async function synthesize(options: SynthesizeOptions): Promise<SynthesisResult> {
   const { requestId, maskedPrompt, coreAnswer, logger } = options;
@@ -199,14 +387,24 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
 
   // --- gate 1: the vault mapping must exist, be live, and be the exact
   //     generation the gateway wrote. -------------------------------------
-  const entry = await options.vault.get(requestId);
-  if (entry === null) {
+  const lookup = await options.vault.get(requestId);
+  if (lookup.state === 'missing') {
     logger?.event('release.refused', { refusal: 'vault_missing' }, 'ERROR');
     throw new ReleaseRefusedError(
       'vault_missing',
-      'no live token mapping for this request; the answer cannot be restored',
+      'no token mapping for this request; the answer cannot be restored',
     );
   }
+  if (lookup.state === 'expired') {
+    // Distinct from missing on purpose: the mapping existed and aged out, which
+    // is a 410, and a caller can tell that retrying will not help.
+    logger?.event('release.refused', { refusal: 'vault_expired' }, 'ERROR');
+    throw new ReleaseRefusedError(
+      'vault_expired',
+      'the token mapping for this request has expired; the answer cannot be restored',
+    );
+  }
+  const entry = lookup.entry;
   if (entry.generation !== options.vaultGeneration) {
     logger?.event(
       'release.refused',
@@ -220,6 +418,36 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   }
   const mapping = entry.mapping;
   const staleAfter = entry.expiresAt;
+
+  const traceId = currentTraceId();
+  const withhold = new Set(options.withhold ?? withheldCategories());
+
+  const inputs: EvidenceInputs = {
+    requestId,
+    maskedPrompt,
+    coreAnswer,
+    staleAfter,
+    checkedAt,
+    coreActor: options.generatedBy,
+    traceId,
+  };
+
+  /** Refuse, carrying an evidence document whose body holds no Core text. */
+  const refuse = (
+    kind: RefusalKind,
+    message: string,
+    attestation: Attestation,
+    consistency: ConsistencyReport,
+    findings: readonly PiiCategory[],
+    categories: readonly unknown[] = [],
+  ): never => {
+    const evidence = assemble(inputs, attestation, consistency, findings, '', [], true);
+    const error = new ReleaseRefusedError(kind, message, categories) as ReleaseRefusedError & {
+      evidence: SynthesisResult;
+    };
+    error.evidence = evidence;
+    throw error;
+  };
 
   // --- gate 2: Core must not have invented placeholders. ------------------
   const consistency = checkConsistency(options.knownTokens, coreAnswer);
@@ -235,29 +463,61 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       return Promise.resolve(result);
     },
   );
+  const verdictFindings = filterPiiCategories(verdict.findings).categories;
 
   const attestation: Attestation = {
     ok: verdict.ok && consistency.ok,
     reason: verdict.ok ? consistency.reason : verdict.reason,
-    findings: verdict.findings,
+    findings: verdictFindings,
     details: verdict.details,
   };
 
   logger?.event('attest.verdict', {
     verdict: attestation.ok ? 'pass' : 'fail',
-    findings: verdict.findings,
+    findings: verdictFindings,
   });
+
+  if (!consistency.ok) {
+    attestation.ok = false;
+    logger?.event(
+      'release.refused',
+      { refusal: 'invented_token', invented_tokens: consistency.invented_tokens },
+      'ERROR',
+    );
+    refuse(
+      'invented_token',
+      consistency.reason ?? 'invented placeholders',
+      attestation,
+      consistency,
+      verdictFindings,
+    );
+  }
+  if (!verdict.ok) {
+    attestation.ok = false;
+    logger?.event(
+      'release.refused',
+      { refusal: 'leak_check_failed', findings: verdictFindings },
+      'ERROR',
+    );
+    refuse(
+      'leak_check_failed',
+      'the leak check failed',
+      attestation,
+      consistency,
+      verdictFindings,
+      verdictFindings,
+    );
+  }
 
   // --- gate 4: the Gemma judge, asymmetrically. ---------------------------
   //
   // The judge sees the pre-rehydration body. Showing it the rehydrated one would
   // hand real PII to a model and would make "there is a leak" the always-correct
   // answer, draining the signal of meaning.
-  let judgeBlocked: RefusalKind | null = null;
   if (options.judge !== undefined) {
     const opinion = await withSpan(SPAN.judgeGemma, { request_id: requestId }, async () => {
       try {
-        const result = await options.judge?.(coreAnswer);
+        const result = await options.judge?.(coreAnswer, options.signal);
         return result ?? { leak: null };
       } catch (error) {
         logger?.event(
@@ -269,132 +529,78 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       }
     });
 
-    attestation.judge = opinion;
-    logger?.event('judge.gemma', { leak: opinion.leak ?? null });
+    const judgeCategories = filterPiiCategories(opinion.categories ?? []).categories;
+    attestation.judge = { leak: opinion.leak ?? null, categories: judgeCategories };
+    logger?.event('judge.gemma', { leak: opinion.leak ?? null, categories: judgeCategories });
 
     // `false` deliberately does nothing: a probabilistic model may veto a
     // release, but it may never be the reason one is trusted.
-    if (opinion.leak === true) judgeBlocked = 'judge_flagged';
-    else if (opinion.leak === null) judgeBlocked = 'judge_unavailable';
+    const judgeBlocked: RefusalKind | null =
+      opinion.leak === true ? 'judge_flagged' : opinion.leak === null ? 'judge_unavailable' : null;
+
+    if (judgeBlocked !== null) {
+      attestation.ok = false;
+      attestation.reason ??=
+        judgeBlocked === 'judge_flagged'
+          ? 'the advisory judge flagged a possible leak'
+          : 'the advisory judge returned no usable verdict';
+      logger?.event('release.refused', { refusal: judgeBlocked }, 'ERROR');
+      refuse(
+        judgeBlocked,
+        judgeBlocked === 'judge_flagged'
+          ? 'the advisory judge flagged a possible leak'
+          : 'the advisory judge returned no usable verdict',
+        attestation,
+        consistency,
+        verdictFindings,
+        judgeCategories,
+      );
+    }
   }
 
-  // --- assemble the evidence document, which is built either way. ---------
-  //
-  // It holds the *masked* answer only, so it is safe to persist whether or not
-  // the release goes ahead — a refusal must still leave an auditable record.
-  const traceId = currentTraceId();
-  const withhold = options.withhold ?? withheldCategories();
+  // --- gate 5: every placeholder must be resolvable, checked against the
+  //     mapping's keys only. No value is read here. -----------------------
+  const resolvability = unresolvableTokens(coreAnswer, new Set(Object.keys(mapping)), withhold);
+  if (resolvability.unresolved.length > 0) {
+    attestation.ok = false;
+    attestation.unresolved_tokens = [...resolvability.unresolved];
+    attestation.reason ??= 'the response references placeholders absent from the vault';
+    logger?.event(
+      'release.refused',
+      { refusal: 'unresolved_token', unresolved_tokens: resolvability.unresolved },
+      'ERROR',
+    );
+    refuse(
+      'unresolved_token',
+      'the response references unknown placeholders',
+      attestation,
+      consistency,
+      verdictFindings,
+    );
+  }
+
+  // --- every gate has passed. This is the single rehydration. -------------
+  const rehydrate = options.rehydrate ?? rehydrateWithPolicy;
   const released = await withSpan(SPAN.rehydrate, { request_id: requestId }, (span) => {
-    const restored = rehydrateWithPolicy(coreAnswer, mapping, { withhold });
+    const restored = rehydrate(coreAnswer, mapping, { withhold: [...withhold] });
     span.setAttribute('tokens_unknown', restored.unresolved.length);
     span.setAttribute('tokens_withheld', restored.withheld.length);
     return Promise.resolve(restored);
   });
 
-  const releaseOk = attestation.ok && judgeBlocked === null && released.unresolved.length === 0;
-  if (!releaseOk) {
-    attestation.ok = false;
-    if (judgeBlocked !== null) {
-      attestation.reason ??=
-        judgeBlocked === 'judge_flagged'
-          ? 'the advisory judge flagged a possible leak'
-          : 'the advisory judge returned no usable verdict';
-    }
-    if (released.unresolved.length > 0) {
-      attestation.unresolved_tokens = [...released.unresolved];
-      attestation.reason ??= 'the response references placeholders absent from the vault';
-    }
-  }
-  if (released.withheldCategories.length > 0) {
-    attestation.withheld = [...released.withheldCategories];
+  if (resolvability.withheldCategories.length > 0) {
+    attestation.withheld = [...resolvability.withheldCategories];
   }
 
-  const document = await withSpan(SPAN.okfBuild, { request_id: requestId }, () =>
-    Promise.resolve(
-      buildGatewayAnswer({
-        requestId,
-        maskedAnswerBody: coreAnswer,
-        coreActor: options.generatedBy,
-        generatedBy: actor(),
-        verifiedBy: leakCheckActor(),
-        staleAfter,
-        attestation,
-        evidence: {
-          computation: COMPUTATION_RESOURCE,
-          computationSha256: computationSha256(),
-          attesterSha256: attesterSha256(),
-          maskedPromptSha256: responseHash(maskedPrompt),
-          coreResponseSha256: responseHash(coreAnswer),
-          checkedAt,
-          withheld: released.withheldCategories,
-        },
-        ...(traceId !== undefined ? { traceId } : {}),
-      }),
-    ),
-  );
-
-  const receipt: ReceiptSummary = {
-    request_id: requestId,
-    masked_prompt_hash: responseHash(maskedPrompt),
-    response_hash: responseHash(coreAnswer),
-    findings: verdict.findings,
-    attester_sha256: attesterSha256(),
-  };
-
-  const result: SynthesisResult = {
-    document,
-    markdown: dump(document),
-    answer: released.text,
+  const result = assemble(
+    inputs,
     attestation,
     consistency,
-    receipt,
-    trustTier: trustTier(document.metadata),
-    dimensions: {
-      policy_verdict: attestation.ok ? 'pass' : 'fail',
-      document_status:
-        (document.metadata['status'] as TrustDimensions['document_status']) ?? 'draft',
-      freshness: freshness(document.metadata, checkedAt),
-      // The public gateway authenticates nobody, so nothing can name a reviewer.
-      review_identity: 'none',
-    },
-  };
-
-  // --- the release decision. ---------------------------------------------
-  if (!consistency.ok) {
-    logger?.event(
-      'release.refused',
-      { refusal: 'invented_token', invented_tokens: consistency.invented_tokens },
-      'ERROR',
-    );
-    throw refusal('invented_token', consistency.reason ?? 'invented placeholders', result);
-  }
-  if (!verdict.ok) {
-    logger?.event(
-      'release.refused',
-      { refusal: 'leak_check_failed', findings: verdict.findings },
-      'ERROR',
-    );
-    throw refusal('leak_check_failed', 'the leak check failed', result, verdict.findings);
-  }
-  if (judgeBlocked !== null) {
-    logger?.event('release.refused', { refusal: judgeBlocked }, 'ERROR');
-    throw refusal(
-      judgeBlocked,
-      judgeBlocked === 'judge_flagged'
-        ? 'the advisory judge flagged a possible leak'
-        : 'the advisory judge returned no usable verdict',
-      result,
-      attestation.judge?.categories ?? [],
-    );
-  }
-  if (released.unresolved.length > 0) {
-    logger?.event(
-      'release.refused',
-      { refusal: 'unresolved_token', unresolved_tokens: released.unresolved },
-      'ERROR',
-    );
-    throw refusal('unresolved_token', 'the response references unknown placeholders', result);
-  }
+    verdictFindings,
+    released.text,
+    resolvability.withheldCategories,
+    false,
+  );
 
   logger?.event('release.ok', {
     tokens_resolved: findTokens(coreAnswer).length - released.withheld.length,
@@ -406,24 +612,11 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
 /**
  * A refusal that still carries the evidence document.
  *
- * The caller persists `evidence` — the masked record of what happened — and
- * returns the status, so a blocked request is auditable without any part of the
- * unsafe body reaching a response or the store.
+ * The caller persists `evidence` — the masked record of what happened, whose
+ * body is the `content withheld` marker — and returns the status, so a blocked
+ * request is auditable without any part of the unsafe body reaching a response,
+ * the store, or the evidence routes.
  */
 export interface RefusalWithEvidence extends ReleaseRefusedError {
   readonly evidence: SynthesisResult;
-}
-
-function refusal(
-  kind: RefusalKind,
-  message: string,
-  result: SynthesisResult,
-  categories: readonly string[] = [],
-): RefusalWithEvidence {
-  const error = new ReleaseRefusedError(kind, message, categories) as ReleaseRefusedError & {
-    evidence: SynthesisResult;
-  };
-  // The released answer must not travel with the refusal.
-  error.evidence = { ...result, answer: '' };
-  return error;
 }

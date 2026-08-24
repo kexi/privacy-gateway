@@ -30,19 +30,22 @@ import {
 } from '@privacy-gateway/common';
 
 /** Sends the masked prompt to Core and returns its masked answer. */
-export type CoreCaller = (maskedPrompt: string) => Promise<string>;
+export type CoreCaller = (maskedPrompt: string, signal?: AbortSignal) => Promise<string>;
 
 /** Calls Synthesis with the exchange and returns its verified, rehydrated result. */
-export type SynthesisCaller = (input: {
-  maskedPrompt: string;
-  coreAnswer: string;
-  generatedBy: string;
-  knownTokens: readonly string[];
-  vaultGeneration: number;
-}) => Promise<SynthesizeResponse>;
+export type SynthesisCaller = (
+  input: {
+    maskedPrompt: string;
+    coreAnswer: string;
+    generatedBy: string;
+    knownTokens: readonly string[];
+    vaultGeneration: number;
+  },
+  signal?: AbortSignal,
+) => Promise<SynthesizeResponse>;
 
 /** Extracts unstructured spans (names, addresses) that the regexes cannot see. */
-export type SpanExtractor = (text: string) => Promise<Detection[]>;
+export type SpanExtractor = (text: string, signal?: AbortSignal) => Promise<Detection[]>;
 
 /**
  * The masking step.
@@ -97,6 +100,23 @@ export interface AskOptions {
   readonly extractSpans?: SpanExtractor | undefined;
   readonly tokenize?: Tokenize | undefined;
   readonly logger: Logger;
+  /**
+   * The request-scoped deadline.
+   *
+   * Passed down every hop and checked between steps. `Promise.race` alone only
+   * stopped *waiting*: the underlying Core, Synthesis and Gemma calls kept
+   * running, kept spending model budget and kept writing evidence long after the
+   * caller had already received a 504.
+   */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/** Raised when the request-scoped deadline fired between two pipeline steps. */
+export class RequestAbortedError extends Error {
+  constructor() {
+    super('the request was cancelled before this step could run');
+    this.name = 'RequestAbortedError';
+  }
 }
 
 /**
@@ -108,7 +128,19 @@ export interface AskOptions {
  *   called.
  */
 export async function ask(options: AskOptions): Promise<AskResult> {
-  const { logger, requestId, vault } = options;
+  const { logger, requestId, vault, signal } = options;
+
+  /**
+   * Stop between steps once the deadline has fired.
+   *
+   * Checked at every boundary rather than only at the hops that accept a signal:
+   * the Gemma extractor runs through the ADK runner, which has no cancellation
+   * seam, so the only way to stop the work that would follow it is to refuse to
+   * do that work.
+   */
+  const checkpoint = (): void => {
+    if (signal?.aborted === true) throw new RequestAbortedError();
+  };
 
   // 0. Reject the reserved syntax before anything else.
   //
@@ -127,10 +159,11 @@ export async function ask(options: AskOptions): Promise<AskResult> {
 
   const extra = await withSpan(SPAN.maskGemma, { request_id: requestId }, async (span) => {
     if (options.extractSpans === undefined) return [];
-    const spans = await options.extractSpans(options.text);
+    const spans = await options.extractSpans(options.text, signal);
     span.setAttribute('span_count', spans.length);
     return spans;
   });
+  checkpoint();
 
   const tokenize: Tokenize = options.tokenize ?? ((text, spans) => tokenizer.tokenize(text, spans));
 
@@ -144,6 +177,7 @@ export async function ask(options: AskOptions): Promise<AskResult> {
 
   // 2. Store in the vault. From here on the mapping exists only inside the boundary.
   const entry = await vault.put(requestId, result.mapping, vaultTtlSeconds());
+  checkpoint();
 
   // 3. Egress guard: rerun the deterministic detection just before sending
   //    (defense in depth).
@@ -172,11 +206,12 @@ export async function ask(options: AskOptions): Promise<AskResult> {
     async () => {
       const startedAt = Date.now();
       logger.event('a2a.core.send', {});
-      const answer = await options.callCore(maskedPrompt);
+      const answer = await options.callCore(maskedPrompt, signal);
       logger.event('a2a.core.recv', { duration_ms: Date.now() - startedAt, status: 'ok' });
       return answer;
     },
   );
+  checkpoint();
 
   // 5. Synthesis, inside the boundary, verifies and rehydrates it into an OKF
   //    document. It is handed the tokenizer's own token set rather than
@@ -188,13 +223,16 @@ export async function ask(options: AskOptions): Promise<AskResult> {
   );
 
   const synthesis = await withSpan(SPAN.synthesisCall, { request_id: requestId }, async (span) => {
-    const response = await options.callSynthesis({
-      maskedPrompt,
-      coreAnswer,
-      generatedBy: options.coreActor,
-      knownTokens,
-      vaultGeneration: entry.generation,
-    });
+    const response = await options.callSynthesis(
+      {
+        maskedPrompt,
+        coreAnswer,
+        generatedBy: options.coreActor,
+        knownTokens,
+        vaultGeneration: entry.generation,
+      },
+      signal,
+    );
     span.setAttribute('verdict', response.attestation.ok ? 'pass' : 'fail');
     span.setAttribute('trust_tier', response.trust_tier);
     return response;

@@ -17,16 +17,25 @@
  *       "masked_prompt_hash": "<sha256 of the masked prompt sent to core>",
  *       "response_hash": "<sha256 of the response text>",
  *       "findings": ["EMAIL", ...],
- *       "response": "<the response text the runner checked>"
+ *       "response": "<the response text the runner checked>",
+ *       "masked_prompt": "<the masked prompt itself>"
  *     }
  *
- * `response` is carried so the attester can re-derive the verdict independently
- * instead of trusting the runner; `masked_prompt_hash` binds the verdict to the
- * exact prompt that produced the response, so a receipt cannot be replayed
- * against a different exchange.
+ * `response` and `masked_prompt` are carried so the attester can re-derive both
+ * hashes itself instead of trusting the runner. The previous version accepted
+ * any non-empty `masked_prompt_hash`, which meant the prompt binding was
+ * *asserted* by the runner rather than *attested* by this code — a receipt could
+ * name any prompt at all and still pass.
+ *
+ * `masked_prompt` is optional so an older receipt still verifies its response,
+ * but a receipt without it is reported as `prompt_bound: false` in the details
+ * and a replay tool is expected to treat that as an incomplete attestation.
  */
 
 import { createHash } from 'node:crypto';
+
+/** A SHA-256 digest: 64 lowercase hex characters, and nothing else. */
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
 
 /**
  * These patterns are a subset of the gateway tokenizer's, with the same intent.
@@ -61,6 +70,7 @@ export const RECEIPT_FIELDS = [
   'response_hash',
   'findings',
   'response',
+  'masked_prompt',
 ] as const;
 
 /** The receipt an executor must produce for this computation. */
@@ -70,6 +80,7 @@ export interface Receipt {
   response_hash?: unknown;
   findings?: unknown;
   response?: unknown;
+  masked_prompt?: unknown;
   [key: string]: unknown;
 }
 
@@ -166,12 +177,46 @@ export function verify(receipt: unknown): Verdict {
     };
   }
 
-  if (typeof record.masked_prompt_hash !== 'string' || record.masked_prompt_hash === '') {
+  if (
+    typeof record.masked_prompt_hash !== 'string' ||
+    !SHA256_HEX.test(record.masked_prompt_hash)
+  ) {
     return {
       ok: false,
-      reason: 'receipt masked_prompt_hash must be a non-empty string',
+      reason: 'receipt masked_prompt_hash must be 64 lowercase hex characters',
       findings: [],
       details: { receipt_keys: Object.keys(record).sort() },
+    };
+  }
+
+  if (typeof record.response_hash !== 'string' || !SHA256_HEX.test(record.response_hash)) {
+    return {
+      ok: false,
+      reason: 'receipt response_hash must be 64 lowercase hex characters',
+      findings: [],
+      details: { receipt_keys: Object.keys(record).sort() },
+    };
+  }
+
+  // Binding: recompute the prompt hash from the prompt itself. Accepting the
+  // runner's word for it made the "this verdict is about that prompt" claim
+  // unattested, so a receipt could be replayed against a different exchange.
+  const maskedPrompt = record.masked_prompt;
+  if (typeof maskedPrompt !== 'string') {
+    return {
+      ok: false,
+      reason: 'receipt masked_prompt must be a string so the prompt hash can be re-derived',
+      findings: [],
+      details: { receipt_keys: Object.keys(record).sort() },
+    };
+  }
+  const actualPromptHash = responseHash(maskedPrompt);
+  if (record.masked_prompt_hash !== actualPromptHash) {
+    return {
+      ok: false,
+      reason: 'masked_prompt_hash does not match the masked prompt text',
+      findings: [],
+      details: { claimed: record.masked_prompt_hash, actual: actualPromptHash },
     };
   }
 
@@ -214,7 +259,9 @@ export function verify(receipt: unknown): Verdict {
     details: {
       request_id: record.request_id,
       response_hash: actualHash,
-      masked_prompt_hash: record.masked_prompt_hash,
+      masked_prompt_hash: actualPromptHash,
+      // Both hashes were re-derived here, not taken from the runner.
+      prompt_bound: true,
     },
   };
 }

@@ -111,13 +111,21 @@ agent-card service:
 logs-local request_id file="/tmp/pgw-dev.log":
     jq -c 'select(.request_id=="{{ request_id }}")' {{ file }}
 
-# Prove IAM is enforced on the private services: 403 without a token, 200 with one
+# Prove the private services are unreachable from outside the VPC (run from a laptop)
 verify-auth:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The submission gate asks for exactly this evidence: a private endpoint
-    # refuses an anonymous caller and accepts an authenticated one. Both halves
-    # matter — a 403 alone could just mean the service is broken.
+    # What this half of the check can honestly prove, and no more.
+    #
+    # core-agent, synthesis-agent and gemma-serving all use **internal ingress**.
+    # Ingress is evaluated before IAM, so a request from a laptop is refused at
+    # the network edge whether or not it carries a valid ID token — 403 both
+    # ways is the correct result, and a 200 here would mean the ingress setting
+    # had regressed. Expecting 200 with a token (as this recipe used to) was
+    # asking for evidence the architecture makes impossible.
+    #
+    # The other half — an authenticated call actually succeeding — can only be
+    # observed from inside the VPC. Run `just verify-auth-internal` for that.
     #
     # /healthz is probed rather than the Agent Card because every service has it,
     # including gemma-serving, which speaks no A2A.
@@ -134,20 +142,14 @@ verify-auth:
       anon=$(curl -s -o /dev/null -w '%{http_code}' "${url}/healthz" || true)
 
       # The audience must be the callee URL; a token minted for anything else is
-      # rejected even when the caller is an Owner.
+      # rejected even when the caller is an Owner. It is still refused here,
+      # because internal ingress stops the request before IAM sees the token.
       token=$(gcloud auth print-identity-token --audiences="$url")
       authed=$(curl -s -o /dev/null -w '%{http_code}' \
         -H "Authorization: Bearer ${token}" "${url}/healthz" || true)
 
-      # gemma-serving is internal-ingress, so even a valid token is refused from
-      # a laptop: 403 both ways is the correct, expected result there.
-      if [ "$svc" = "gemma-serving" ]; then
-        expected="403/403 (internal ingress: unreachable from outside, as designed)"
-        [ "$anon" = "403" ] && [ "$authed" = "403" ] || fail=1
-      else
-        expected="403/200"
-        [ "$anon" = "403" ] && [ "$authed" = "200" ] || fail=1
-      fi
+      expected="403/403 (internal ingress: unreachable from a laptop, as designed)"
+      [ "$anon" = "403" ] && [ "$authed" = "403" ] || fail=1
       printf '%-18s no-auth=%s with-id-token=%s  expected %s\n' "$svc" "$anon" "$authed" "$expected"
     done
 
@@ -161,7 +163,39 @@ verify-auth:
       [ "$anon" = "200" ] || fail=1
     fi
 
-    [ "$fail" -eq 0 ] && echo "OK: auth boundary behaves as designed" || { echo "FAIL: see above"; exit 1; }
+    [ "$fail" -eq 0 ] \
+      && echo "OK: private services refuse every caller from outside the VPC; run 'just verify-auth-internal' for the IAM-success half" \
+      || { echo "FAIL: see above"; exit 1; }
+
+# Prove IAM *accepts* an authorized caller, from inside the VPC (Cloud Run Job)
+verify-auth-internal:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The complement to `verify-auth`. A 403 from a laptop only proves the door
+    # is shut; this proves it opens for the right identity.
+    #
+    # It has to run inside the VPC, because the private services use internal
+    # ingress: a caller on the public internet is refused at the network edge
+    # before IAM is consulted, so no laptop-side test can ever observe the
+    # success case. The job below runs on the same Direct VPC egress path the
+    # Gateway uses, with the Gateway's own service account, so a 200 here is the
+    # exact hop the fleet makes in production.
+    #
+    # Terraform declares the job (`infra/terraform/verify_job.tf`); this recipe
+    # only executes it. If it is not deployed, the manual path is documented in
+    # docs/DEPLOY.md §"Verifying IAM from inside the VPC".
+    if ! gcloud run jobs describe verify-auth \
+      --project "{{ PROJECT_ID }}" --region "{{ REGION }}" >/dev/null 2>&1; then
+      echo "verify-auth job is not deployed."
+      echo "Apply infra/terraform (just tf-apply), or follow the manual path in docs/DEPLOY.md."
+      exit 1
+    fi
+
+    gcloud run jobs execute verify-auth \
+      --project "{{ PROJECT_ID }}" --region "{{ REGION }}" --wait
+
+    echo "Job finished. Read its output with:"
+    echo "  just logs-service verify-auth 30"
 
 # Smoke-test the deployed Gateway end to end with a fixed PII sample
 smoke:
@@ -177,7 +211,9 @@ smoke:
 
     # Fixed sample so the expected placeholders are deterministic. The values are
     # obviously synthetic; see .gitleaks.toml for the allow-list entry.
-    body='{"prompt":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}'
+    # /v1/ask accepts `{"text": ...}` and nothing else: the request schema is
+    # `strict()`, so a stray `prompt` or `session_id` is a 400, not a warning.
+    body='{"text":"Reply to Taro Yamada (taro@example.com, 090-1234-5678) about his order."}'
 
     response=$(mktemp)
     trap 'rm -f "$response"' EXIT

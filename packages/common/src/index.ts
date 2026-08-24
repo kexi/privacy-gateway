@@ -33,6 +33,7 @@ export {
   isStale,
   nowIso,
   parse,
+  REQUEST_ARTIFACT_BASE,
   SourceSchema,
   TRUST_HUMAN_REVIEWED,
   TRUST_MACHINE_CONFIRMED,

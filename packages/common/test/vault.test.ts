@@ -4,19 +4,19 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { buildVault, InMemoryTokenVault, isExpired } from '../src/vault.ts';
+import { buildVault, InMemoryTokenVault, isExpired, liveEntry } from '../src/vault.ts';
 
 describe('in-memory vault', () => {
   it('reads back a stored mapping', async () => {
     const vault = new InMemoryTokenVault();
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
 
-    const entry = await vault.get('s1');
+    const entry = liveEntry(await vault.get('s1'));
     expect(entry?.mapping).toEqual({ '⟦EMAIL_1⟧': 'a@b.co' });
   });
 
-  it('returns nothing for an unknown session', async () => {
-    expect(await new InMemoryTokenVault().get('nope')).toBeNull();
+  it('reports an unknown session as missing, not expired', async () => {
+    expect(await new InMemoryTokenVault().get('nope')).toEqual({ state: 'missing' });
   });
 
   it('isolates sessions from each other', async () => {
@@ -24,8 +24,8 @@ describe('in-memory vault', () => {
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
     await vault.put('s2', { '⟦EMAIL_1⟧': 'c@d.co' }, 60);
 
-    expect((await vault.get('s1'))?.mapping['⟦EMAIL_1⟧']).toBe('a@b.co');
-    expect((await vault.get('s2'))?.mapping['⟦EMAIL_1⟧']).toBe('c@d.co');
+    expect(liveEntry(await vault.get('s1'))?.mapping['⟦EMAIL_1⟧']).toBe('a@b.co');
+    expect(liveEntry(await vault.get('s2'))?.mapping['⟦EMAIL_1⟧']).toBe('c@d.co');
   });
 
   it('merges instead of replacing on a second write', async () => {
@@ -33,7 +33,7 @@ describe('in-memory vault', () => {
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
     await vault.put('s1', { '⟦PHONE_1⟧': '090-1234-5678' }, 60);
 
-    const entry = await vault.get('s1');
+    const entry = liveEntry(await vault.get('s1'));
     expect(Object.keys(entry?.mapping ?? {}).sort()).toEqual(['⟦EMAIL_1⟧', '⟦PHONE_1⟧']);
   });
 
@@ -46,17 +46,31 @@ describe('in-memory vault', () => {
     expect(second.expiresAt.getTime()).toBe(first.expiresAt.getTime());
   });
 
-  it('stops serving an expired entry', async () => {
+  it('reports an expired entry as expired, distinctly from missing', async () => {
+    // Synthesis maps expired onto 410 and missing onto 409, so the two must not
+    // collapse into one result: a caller has to be able to tell that the mapping
+    // once existed and that retrying will not bring it back.
+    const vault = new InMemoryTokenVault();
+    const stored = await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 0);
+
+    const lookup = await vault.get('s1');
+    expect(lookup.state).toBe('expired');
+    expect(lookup.state === 'expired' && lookup.expiresAt.getTime()).toBe(
+      stored.expiresAt.getTime(),
+    );
+  });
+
+  it('serves no mapping for an expired entry', async () => {
     const vault = new InMemoryTokenVault();
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 0);
-    expect(await vault.get('s1')).toBeNull();
+    expect(liveEntry(await vault.get('s1'))).toBeNull();
   });
 
   it('forgets a deleted session', async () => {
     const vault = new InMemoryTokenVault();
     await vault.put('s1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60);
     await vault.delete('s1');
-    expect(await vault.get('s1')).toBeNull();
+    expect(await vault.get('s1')).toEqual({ state: 'missing' });
   });
 
   it('reports its own expiry on the entry', async () => {
@@ -72,7 +86,7 @@ describe('in-memory vault', () => {
     const vault = new InMemoryTokenVault();
     expect((await vault.put('r1', { '⟦EMAIL_1⟧': 'a@b.co' }, 60)).generation).toBe(1);
     expect((await vault.put('r1', { '⟦PHONE_1⟧': '090-1234-5678' }, 60)).generation).toBe(2);
-    expect((await vault.get('r1'))?.generation).toBe(2);
+    expect(liveEntry(await vault.get('r1'))?.generation).toBe(2);
   });
 
   it('restarts the generation after expiry rather than continuing it', async () => {

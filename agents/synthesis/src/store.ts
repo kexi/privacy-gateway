@@ -16,7 +16,18 @@
  * `cat`, and decomposing it risks dropping unknown keys on the round trip.
  */
 
-import type { FirestoreLike } from '@privacy-gateway/common';
+import type { FirestoreDocLike } from '@privacy-gateway/common';
+
+/**
+ * The Firestore surface the evidence store uses.
+ *
+ * Narrower than the vault's on purpose: one document per request is written
+ * exactly once, so there is no read-modify-write to make atomic and no reason to
+ * demand `runTransaction` here.
+ */
+export interface EvidenceFirestoreLike {
+  collection(name: string): { doc(id: string): FirestoreDocLike };
+}
 
 /** The masked artifacts retained for one request. */
 export interface EvidenceRecord {
@@ -60,13 +71,13 @@ export class InMemoryAnswerStore implements AnswerStore {
 
 export interface FirestoreAnswerStoreOptions {
   readonly collection?: string | undefined;
-  readonly client?: FirestoreLike | undefined;
+  readonly client?: EvidenceFirestoreLike | undefined;
   readonly projectId?: string | undefined;
 }
 
 export class FirestoreAnswerStore implements AnswerStore {
   private readonly collectionName: string;
-  private client: FirestoreLike | undefined;
+  private client: EvidenceFirestoreLike | undefined;
   private readonly projectId: string | undefined;
 
   constructor(options: FirestoreAnswerStoreOptions = {}) {
@@ -77,12 +88,12 @@ export class FirestoreAnswerStore implements AnswerStore {
   }
 
   /** Created lazily so importing this module never opens a client. */
-  private async resolveClient(): Promise<FirestoreLike> {
+  private async resolveClient(): Promise<EvidenceFirestoreLike> {
     if (this.client !== undefined) return this.client;
     const { Firestore } = await import('@google-cloud/firestore');
     const created =
       this.projectId !== undefined ? new Firestore({ projectId: this.projectId }) : new Firestore();
-    this.client = created as unknown as FirestoreLike;
+    this.client = created as unknown as EvidenceFirestoreLike;
     return this.client;
   }
 

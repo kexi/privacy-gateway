@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { audienceFor, authorizedFetch } from './http_client.ts';
+import { audienceFor, authorizedFetch, IdTokenError, UnknownAudienceError } from './http_client.ts';
 import { AgentCardSchema, JsonRpcResponseSchema, type AgentCard } from './schema.ts';
 
 /**
@@ -34,6 +34,8 @@ export interface A2aClientOptions {
   readonly contextId?: string | undefined;
   readonly timeoutMs?: number | undefined;
   readonly fetchImpl?: typeof fetch | undefined;
+  /** Cancels the card lookup and the RPC when the caller's deadline fires. */
+  readonly signal?: AbortSignal | undefined;
   /**
    * Whether to attach a Google-signed ID token. Defaults to on for https URLs,
    * which is exactly the Cloud Run case; a local http service has no IAM check
@@ -55,6 +57,7 @@ export async function fetchAgentCard(
         ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
         ...(options.requestId === undefined ? {} : { requestId: options.requestId }),
         ...(options.useIdToken === undefined ? {} : { useIdToken: options.useIdToken }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
       if (response.status === 404) continue;
       if (!response.ok) {
@@ -63,6 +66,12 @@ export async function fetchAgentCard(
       }
       return AgentCardSchema.parse(await response.json());
     } catch (error) {
+      // An authentication fault is a credential problem on *our* side of the
+      // hop, not a missing card, and trying the next path cannot fix it.
+      // Rethrowing it typed is what lets the gateway report
+      // `auth.id_token.failed` instead of a generic downstream error — the
+      // classification the old catch-and-wrap threw away.
+      if (error instanceof IdTokenError || error instanceof UnknownAudienceError) throw error;
       lastError = error;
     }
   }
@@ -116,6 +125,7 @@ export async function sendMessage(
     timeoutMs: options.timeoutMs ?? 120_000,
     ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
     ...(options.useIdToken === undefined ? {} : { useIdToken: options.useIdToken }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
 
   if (!response.ok) {

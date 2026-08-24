@@ -28,6 +28,7 @@ function buildReceipt(requestId: string, response: string, prompt = PROMPT): Rec
     response_hash: responseHash(response),
     findings: scan(response),
     response,
+    masked_prompt: prompt,
   };
 }
 
@@ -41,6 +42,7 @@ describe('the receipt contract', () => {
       'response_hash',
       'findings',
       'response',
+      'masked_prompt',
     ]);
   });
 
@@ -78,6 +80,8 @@ describe('attestation', () => {
     // for another.
     const verdict = verify(buildReceipt(REQUEST_ID, CLEAN));
     expect(verdict.details['masked_prompt_hash']).toBe(responseHash(PROMPT));
+    // Re-derived here, not copied from the receipt.
+    expect(verdict.details['prompt_bound']).toBe(true);
   });
 });
 
@@ -98,12 +102,41 @@ describe('receipt validation', () => {
     expect(verdict.reason).toContain('response');
   });
 
-  it('refuses a receipt without a masked prompt binding', () => {
+  it('refuses a masked_prompt_hash that is not a sha256 digest', () => {
     const receipt = buildReceipt(REQUEST_ID, CLEAN);
-    receipt.masked_prompt_hash = '';
+    receipt.masked_prompt_hash = 'unavailable';
     const verdict = verify(receipt);
     expect(verdict.ok).toBe(false);
     expect(verdict.reason).toContain('masked_prompt_hash');
+  });
+
+  it('re-derives the prompt hash rather than trusting the receipt', () => {
+    // The previous version accepted any non-empty string here, so the "this
+    // verdict is about that prompt" claim was asserted by the runner, not
+    // attested by this code: a receipt could name any prompt at all.
+    const receipt = buildReceipt(REQUEST_ID, CLEAN);
+    receipt.masked_prompt = 'a completely different prompt';
+    const verdict = verify(receipt);
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain('does not match the masked prompt text');
+  });
+
+  it('refuses a receipt that carries no masked prompt to bind against', () => {
+    const receipt = buildReceipt(REQUEST_ID, CLEAN);
+    delete receipt['masked_prompt'];
+    const verdict = verify(receipt);
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain('masked_prompt');
+  });
+
+  it('refuses a response_hash that is not a sha256 digest', () => {
+    const receipt = buildReceipt(REQUEST_ID, CLEAN);
+    receipt.response_hash = 'unavailable';
+    const verdict = verify(receipt);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain('response_hash');
   });
 
   it('refuses a hash that does not match the text', () => {

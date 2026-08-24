@@ -32,6 +32,15 @@ RUN pnpm install --frozen-lockfile --filter @privacy-gateway/core...
 
 COPY packages/common/ packages/common/
 COPY agents/core/ agents/core/
+# The Attested Computation document, needed only at build time.
+#
+# `packages/common`'s build hashes it (and the attester source) into
+# `attestation_digests.generated.ts`, so the digests the runtime records are
+# fixed here rather than read from disk later. Why not copy it into the runtime
+# stage instead: the image would then carry a second copy that could drift from
+# the one the digest was taken over, and every consumer would have to decide
+# which copy is canonical. A constant has exactly one answer.
+COPY knowledge/computations/ knowledge/computations/
 
 # The shared package is built first. Core imports only its vault-free subpaths
 # (config, logging, schema, telemetry), which is what keeps "Core cannot read the
