@@ -36,17 +36,17 @@
   "exports": {
     "./server": {
       "development": "./src/server.ts",
-      "types": "./dist/server.d.ts",
+      "types": "./src/server.ts",
       "default": "./dist/server.js"
     },
     "./store": {
       "development": "./src/store.ts",
-      "types": "./dist/store.d.ts",
+      "types": "./src/store.ts",
       "default": "./dist/store.js"
     },
     "./pipeline": {
       "development": "./src/pipeline.ts",
-      "types": "./dist/pipeline.d.ts",
+      "types": "./src/pipeline.ts",
       "default": "./dist/pipeline.js"
     }
   }

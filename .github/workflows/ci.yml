@@ -110,8 +110,13 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
 
-      - name: just fmt-check
-        run: just fmt-check
+      # Why not `just fmt-check`: it also runs fmt-nix-check / fmt-ts-check /
+      # fmt-python-check / tf-fmt-check, whose tools are absent on this runner.
+      # nixfmt drift is covered by the `nix flake check` job, oxfmt by the
+      # TypeScript job, ruff by the Python job and terraform fmt by the
+      # Terraform job. `just fmt-check` stays complete for local use.
+      - name: just fmt-just-check
+        run: just fmt-just-check
 
       - name: just check-recipe-docs
         run: just check-recipe-docs
@@ -165,16 +170,17 @@ jobs:
           reporter: github-pr-check
           fail_level: error
 
-      - name: Install pinact
+      # The action installs pinact itself (via aqua, with SLSA verification) and
+      # runs it. Why not a separate `pinact run` step: the CLI is only on PATH
+      # inside the action, so invoking it afterwards fails with "command not
+      # found". verify + fix:false check the pinned SHAs against their version
+      # comments without rewriting; skip_push keeps the read-only GITHUB_TOKEN.
+      - name: pinact verify
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         with:
-          version: v4.1.0
-
-      - name: pinact verify
-        # Verify each pinned SHA matches its version comment; do not rewrite.
-        run: pinact run --verify --check
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          verify: 'true'
+          fix: 'false'
+          skip_push: 'true'
 
   secrets:
     name: Secret scanning

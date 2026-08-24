@@ -287,11 +287,15 @@ just tf-validate                 # backend も認証情報も不要
 | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `python`    | `clients/` の ruff check / format、PEP 723 ヘッダ検査                                                                    |
 | `node`      | `pnpm-lock.yaml` がある場合のみ。pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E（chromium） |
-| `just`      | just fmt-check、check-recipe-docs、`just --list`                                                                         |
+| `just`      | just fmt-just-check、check-recipe-docs、`just --list`                                                                    |
 | `actions`   | actionlint、pinact verify                                                                                                |
 | `terraform` | `infra/terraform` の terraform fmt -check、terraform validate、tflint                                                    |
 | `secrets`   | gitleaks（全履歴）                                                                                                       |
 | `nix`       | `nix flake check`、devShell のビルド確認                                                                                 |
+
+`just` ジョブは `fmt-check` ではなく `fmt-just-check` を実行する。
+このランナーには他のフォーマッタ（nixfmt / oxfmt / ruff / terraform）が入っておらず、
+それぞれ専用ジョブで検査済みのため。ローカルの `just fmt-check` は従来どおり全部を見る。
 
 外部 Action の `uses:` はすべて完全な commit SHA に固定してある
 （タグは書き換え可能なので、SHA でなければ供給元の乗っ取りに対して無防備になる）。

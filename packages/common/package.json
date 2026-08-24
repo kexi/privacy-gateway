@@ -6,32 +6,32 @@
   "exports": {
     ".": {
       "development": "./src/index.ts",
-      "types": "./dist/index.d.ts",
+      "types": "./src/index.ts",
       "default": "./dist/index.js"
     },
     "./logging": {
       "development": "./src/logging.ts",
-      "types": "./dist/logging.d.ts",
+      "types": "./src/logging.ts",
       "default": "./dist/logging.js"
     },
     "./config": {
       "development": "./src/config.ts",
-      "types": "./dist/config.d.ts",
+      "types": "./src/config.ts",
       "default": "./dist/config.js"
     },
     "./schema": {
       "development": "./src/schema.ts",
-      "types": "./dist/schema.d.ts",
+      "types": "./src/schema.ts",
       "default": "./dist/schema.js"
     },
     "./telemetry": {
       "development": "./src/telemetry.ts",
-      "types": "./dist/telemetry.d.ts",
+      "types": "./src/telemetry.ts",
       "default": "./dist/telemetry.js"
     },
     "./attesters/leak-check": {
       "development": "./src/attesters/leak_check.ts",
-      "types": "./dist/attesters/leak_check.d.ts",
+      "types": "./src/attesters/leak_check.ts",
       "default": "./dist/attesters/leak_check.js"
     }
   },

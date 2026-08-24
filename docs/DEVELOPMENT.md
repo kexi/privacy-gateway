@@ -291,11 +291,15 @@ with a comment explaining why.
 | ----------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `python`    | ruff check / format over `clients/`, PEP 723 headers                                                                      |
 | `node`      | Only when `pnpm-lock.yaml` exists. pnpm install → oxlint → oxfmt --check → tsc → test → build → Playwright E2E (chromium) |
-| `just`      | just fmt-check, check-recipe-docs, `just --list`                                                                          |
+| `just`      | just fmt-just-check, check-recipe-docs, `just --list`                                                                     |
 | `actions`   | actionlint, pinact verify                                                                                                 |
 | `terraform` | terraform fmt -check, terraform validate, tflint over `infra/terraform`                                                   |
 | `secrets`   | gitleaks (full history)                                                                                                   |
 | `nix`       | `nix flake check`, devShell build                                                                                         |
+
+The `just` job runs `fmt-just-check` rather than the full `fmt-check`: the other
+formatters (nixfmt, oxfmt, ruff, terraform) are not installed on that runner and
+are each covered by their own job. `just fmt-check` stays complete locally.
 
 Every external action `uses:` is pinned to a full commit SHA, because tags are
 mutable and leave the supply chain open to takeover. After adding an action or

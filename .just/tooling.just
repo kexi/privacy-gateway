@@ -20,7 +20,9 @@ pin:
 
 # Verify pinned SHAs match their version comments (no rewriting)
 pin-verify:
-    pinact run --verify --check
+    # Why the token fallback: unauthenticated GitHub API calls are capped at
+    # 60/h, which pinact exhausts on a workflow with this many pinned actions.
+    GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}" pinact run --verify --check
 
 # Statically check the GitHub Actions workflows
 lint-actions:
