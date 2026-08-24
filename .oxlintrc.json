@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "import", "promise", "unicorn"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "env": {
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/node_modules/**",
+    "**/coverage/**",
+    "**/playwright-report/**",
+    "**/test-results/**",
+    ".direnv/**",
+    ".venv/**",
+    "web/dist/**"
+  ],
+  "rules": {
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_"
+      }
+    ],
+    "typescript/consistent-type-imports": "error",
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/no-array-sort": "off",
+    "unicorn/no-array-reverse": "off"
+  },
+  "overrides": [
+    {
+      "files": ["**/test/**/*.ts", "**/*.test.ts", "**/e2e/**/*.ts"],
+      "env": {
+        "vitest": true
+      },
+      "rules": {
+        "typescript/no-non-null-assertion": "off",
+        "typescript/no-explicit-any": "off"
+      }
+    },
+    {
+      "files": ["web/src/**/*.ts", "web/e2e/**/*.ts"],
+      "env": {
+        "browser": true
+      }
+    }
+  ]
+}

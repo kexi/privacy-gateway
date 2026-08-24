@@ -1,0 +1,106 @@
+<mxGraphModel dx="1400" dy="900" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="820" math="0" shadow="0" adaptiveColors="auto">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <mxCell id="title" value="Privacy-Preserving Multi-Agent Gateway — Google Cloud" style="text;html=1;fontSize=20;fontStyle=1;align=left;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="40" y="16" width="700" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="subtitle" value="Project all-thinkgs · region us-central1 · ADK agents over A2A" style="text;html=1;fontSize=12;align=left;verticalAlign=middle;fontColor=#6B6B6B;" vertex="1" parent="1">
+      <mxGeometry x="40" y="42" width="700" height="20" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="tb" value="TRUST BOUNDARY — raw PII never leaves this box" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;dashPattern=8 6;strokeWidth=3;strokeColor=#2E7D32;fillColor=#E8F5E9;verticalAlign=top;fontSize=13;fontStyle=1;fontColor=#1B5E20;align=left;spacingLeft=14;spacingTop=8;arcSize=4;" vertex="1" parent="1">
+      <mxGeometry x="240" y="90" width="620" height="640" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="user" value="User&#10;&#10;raw prompt with&#10;name / email / phone&#10;card / API key" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ECEFF1;strokeColor=#546E7A;fontSize=12;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="50" y="300" width="150" height="120" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="gw" value="Gateway Agent&#10;&#10;Cloud Run (public)&#10;sa-gateway&#10;&#10;detect PII → tokenize&#10;⟦PERSON_1⟧ ⟦EMAIL_1⟧" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="285" y="150" width="220" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="syn" value="Synthesis Agent&#10;&#10;Cloud Run (private)&#10;sa-synthesis&#10;&#10;leak check → rehydrate&#10;→ consistency verify" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F2FD;strokeColor=#1565C0;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="285" y="530" width="220" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="gemma" value="Gemma Serving&#10;&#10;Cloud Run GPU · NVIDIA L4&#10;Ollama · gemma3:12b&#10;sa-gemma&#10;&#10;--ingress internal" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3E0;strokeColor=#E65100;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="600" y="150" width="220" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="fs" value="Firestore — Token Vault&#10;&#10;collection: token_vault&#10;TTL field: expires_at&#10;&#10;session_id → {token: raw}&#10;+ append-only audit log" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF8E1;strokeColor=#F9A825;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="600" y="530" width="220" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="core" value="Core Agent&#10;&#10;Cloud Run (private)&#10;sa-core&#10;&#10;reasoning / planning / codegen&#10;over TOKENS ONLY" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE4EC;strokeColor=#AD1457;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="1010" y="270" width="230" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="gemini" value="Vertex AI — Gemini&#10;&#10;GOOGLE_GENAI_USE_VERTEXAI=1&#10;sees only masked text" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3E5F5;strokeColor=#6A1B9A;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="1010" y="470" width="230" height="110" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="okf" value="OKF v0.2 output&#10;&#10;type: Gateway Answer&#10;generated.by / verified&#10;status · stale_after" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E0F2F1;strokeColor=#00695C;fontSize=12;strokeWidth=2;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="50" y="530" width="150" height="140" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="noaccess" value="✕  sa-core has NO Firestore role&#10;structural guarantee, not a code convention" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFEBEE;strokeColor=#C62828;fontSize=11;fontStyle=1;fontColor=#B71C1C;dashed=1;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="905" y="620" width="410" height="60" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_user_gw" value="1. raw prompt" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#C62828;fontSize=11;fontColor=#C62828;fontStyle=1;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="user" target="gw">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_gw_gemma" value="span extraction" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#E65100;fontSize=11;fontColor=#E65100;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="gw" target="gemma">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_gw_fs" value="2. store mapping" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#F9A825;fontSize=11;fontColor=#B7791F;labelBackgroundColor=#FFFFFF;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="gw" target="fs">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points"><mxPoint x="450" y="420"/><mxPoint x="710" y="420"/></Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_gw_core" value="3. A2A — masked prompt + ID token" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=3;strokeColor=#2E7D32;fontSize=11;fontColor=#1B5E20;fontStyle=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;verticalAlign=bottom;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="gw" target="core">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points"><mxPoint x="395" y="120"/><mxPoint x="940" y="120"/><mxPoint x="940" y="312"/></Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_core_gemini" value="masked only" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#6A1B9A;fontSize=11;fontColor=#6A1B9A;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="core" target="gemini">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_core_syn" value="4. A2A — masked answer" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=3;strokeColor=#2E7D32;fontSize=11;fontColor=#1B5E20;fontStyle=1;exitX=0;exitY=0.8;exitDx=0;exitDy=0;entryX=1;entryY=0.25;entryDx=0;entryDy=0;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="core" target="syn">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points"><mxPoint x="880" y="382"/><mxPoint x="880" y="490"/><mxPoint x="540" y="490"/><mxPoint x="540" y="565"/></Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_syn_fs" value="5. rehydrate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#F9A825;fontSize=11;fontColor=#B7791F;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="syn" target="fs">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_syn_gemma" value="leak check&#10;consistency" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#E65100;fontSize=11;fontColor=#E65100;labelBackgroundColor=#FFFFFF;exitX=0.25;exitY=0;exitDx=0;exitDy=0;entryX=0.25;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="syn" target="gemma">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points"><mxPoint x="340" y="450"/><mxPoint x="655" y="450"/></Array>
+      </mxGeometry>
+    </mxCell>
+
+    <mxCell id="e_syn_okf" value="6. final answer&#10;+ audit trail" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#00695C;fontSize=11;fontColor=#00695C;fontStyle=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="syn" target="okf">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="e_okf_user" value="7. rehydrated" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;strokeColor=#00695C;fontSize=11;fontColor=#00695C;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" edge="1" parent="1" source="okf" target="user">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="legend" value="Legend&#10;&#10;━━  A2A hop (IAM ID token, run.invoker)&#10;━━  raw PII — inside boundary only&#10;━━  vault read / write (TTL expires_at)&#10;━━  Gemma inference (internal ingress)&#10;━━  masked text — safe to cross" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#9E9E9E;fontSize=11;align=left;verticalAlign=top;spacingLeft=10;spacingTop=6;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="50" y="90" width="150" height="150" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

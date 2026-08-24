@@ -1,0 +1,72 @@
+{
+  "name": "@privacy-gateway/common",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./logging": {
+      "development": "./src/logging.ts",
+      "types": "./dist/logging.d.ts",
+      "default": "./dist/logging.js"
+    },
+    "./config": {
+      "development": "./src/config.ts",
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    },
+    "./schema": {
+      "development": "./src/schema.ts",
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./telemetry": {
+      "development": "./src/telemetry.ts",
+      "types": "./dist/telemetry.d.ts",
+      "default": "./dist/telemetry.js"
+    },
+    "./attesters/leak-check": {
+      "development": "./src/attesters/leak_check.ts",
+      "types": "./dist/attesters/leak_check.d.ts",
+      "default": "./dist/attesters/leak_check.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "oxlint",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.11.0",
+    "@google-cloud/opentelemetry-cloud-trace-exporter": "^2.4.1",
+    "@google/adk": "2.0.0",
+    "@google/genai": "^2.9.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/core": "^2.0.0",
+    "@opentelemetry/resources": "^2.0.0",
+    "@opentelemetry/sdk-trace-base": "^2.0.0",
+    "@opentelemetry/sdk-trace-node": "^2.0.0",
+    "@opentelemetry/semantic-conventions": "^1.28.0",
+    "google-auth-library": "^9.15.0",
+    "uuid": "^11.0.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@opentelemetry/sdk-trace-node": "^2.0.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.5.3"
+}

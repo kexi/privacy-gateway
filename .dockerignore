@@ -1,0 +1,18 @@
+# Build context hygiene: these are large, host-specific, or rebuilt inside the image.
+.git/
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+coverage/
+**/coverage/
+*.tsbuildinfo
+.direnv/
+.env
+.env.*
+!.env.example
+playwright-report/
+test-results/
+result
+*-key.json
+service-account*.json

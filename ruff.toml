@@ -1,0 +1,15 @@
+# Ruff configuration.
+#
+# Python survives in this repository only as standalone PEP 723 scripts (the
+# gateway client, and any future one-off tools). The agents are all TypeScript,
+# so there is no package layout for ruff to understand -- just files.
+
+target-version = "py313"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "N", "UP", "B", "S", "C4", "SIM", "RUF"]
+
+[lint.per-file-ignores]
+# argparse dispatch assigns handlers via set_defaults, which ruff reads as unused.
+"clients/python/pgw.py" = []

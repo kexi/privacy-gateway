@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Restrict the default GITHUB_TOKEN to read-only.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Lint (standalone Python scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+
+      # Python survives only as standalone client scripts (PEP 723), so there is
+      # no project to `uv sync`; uvx runs ruff against ruff.toml directly.
+      - name: ruff check
+        run: uvx ruff check --output-format=github clients/
+
+      - name: ruff format --check
+        run: uvx ruff format --check clients/
+
+      - name: Install just
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+
+      - name: PEP 723 headers
+        run: just lint-pep723
+
+  detect:
+    name: Detect workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.check.outputs.web }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check for web workspace
+        id: check
+        # Keeps CI green while the lockfile does not exist yet.
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  node:
+    name: Lint & Build (TypeScript)
+    runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.web == 'true'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        # The pnpm workspace is root-defined, so install from the root.
+        run: pnpm install --frozen-lockfile
+
+      - name: oxlint
+        run: pnpm -r lint
+
+      - name: oxfmt --check
+        run: pnpm -r fmt:check
+
+      - name: tsc --noEmit
+        run: pnpm -r typecheck
+
+      - name: test
+        run: pnpm -r test
+
+      # Install the browser via Playwright's own CLI rather than a marketplace
+      # action, so the version always tracks the @playwright/test in the lockfile.
+      - name: Install Playwright chromium
+        run: pnpm -C web exec playwright install --with-deps chromium
+
+      - name: E2E (Playwright)
+        run: pnpm -C web test:e2e
+
+      - name: build
+        run: pnpm -r build
+
+  just:
+    name: Justfile hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install just
+        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+
+      - name: just fmt-check
+        run: just fmt-check
+
+      - name: just check-recipe-docs
+        run: just check-recipe-docs
+
+      - name: just --list
+        run: just --list
+
+  actions:
+    name: Workflow hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: actionlint
+        uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1.73.2
+        with:
+          reporter: github-pr-check
+          fail_level: error
+
+      - name: Install pinact
+        uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
+        with:
+          version: v4.1.0
+
+      - name: pinact verify
+        # Verify each pinned SHA matches its version comment; do not rewrite.
+        run: pinact run --verify --check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  secrets:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # gitleaks scans the full history, so disable the shallow clone.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  nix:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Set up Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
+      - name: devShell builds
+        run: nix develop --command just --list

@@ -1,0 +1,53 @@
+# gitleaks configuration.
+#
+# WHY THE ALLOWLIST EXISTS:
+# This project is a privacy gateway whose whole job is masking PII at a trust
+# boundary. To prove the masking and leak-check logic actually works, the test
+# fixtures and the knowledge/ policy docs deliberately embed FAKE PII (names,
+# emails, phone numbers) and FAKE API keys. These are non-existent dummy values,
+# so a finding on them is pure noise with nothing to remediate.
+# Rather than disabling detection wholesale, the allowlist is scoped to the
+# specific paths where those intentional fakes live.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "gcp-service-account-key"
+description = "GCP service account private key"
+regex = '''"private_key"\s*:\s*"-----BEGIN[^"]+PRIVATE KEY-----'''
+tags = ["gcp", "key"]
+
+[[rules]]
+id = "gcp-api-key"
+description = "Google API key"
+regex = '''AIza[0-9A-Za-z_\-]{35}'''
+tags = ["gcp", "key"]
+
+[allowlist]
+description = "Test and documentation assets that intentionally contain dummy PII / dummy keys"
+
+paths = [
+  # Fixtures for masking and leak-check tests (contain fake PII / fake keys).
+  '''(^|/)test/.*''',
+  '''(^|/)tests?/.*''',
+  '''(^|/)e2e/.*''',
+  '''.*\.(test|spec)\.ts$''',
+  '''.*/fixtures?/.*''',
+  # Policy and skill docs that quote fake PII as worked examples of what to mask.
+  '''^knowledge/.*''',
+  '''^skills/.*''',
+  '''^\.claude/skills/.*''',
+  '''^\.codex/skills/.*''',
+  # Lockfiles: long hash strings trip the high-entropy heuristics.
+  '''(^|/)flake\.lock$''',
+  '''(^|/)pnpm-lock\.yaml$''',
+]
+
+regexes = [
+  # Reserved example domains used in docs and tests (RFC 2606).
+  '''[A-Za-z0-9._%+-]+@example\.(com|org|net)''',
+  # Explicit placeholders.
+  '''(?i)(dummy|fake|sample|example|placeholder|redacted|xxxx+)[-_]?(key|token|secret|password)''',
+  '''YOUR_[A-Z_]+_HERE''',
+]

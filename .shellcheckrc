@@ -1,0 +1,11 @@
+# Scripts under infra/ are built around sourcing common.sh. Variables defined in
+# common.sh look unused within that file alone, so SC2034 fires as a false
+# positive. Enable source following and disable that one check.
+#
+# Why not per-file disable comments: a new comment would be needed for every
+# variable added to common.sh, which clutters the file and is easy to forget.
+disable=SC2034
+
+# Let shellcheck resolve `source` targets statically (also suppresses SC1091).
+external-sources=true
+source-path=SCRIPTDIR

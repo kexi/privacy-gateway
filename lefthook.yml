@@ -1,0 +1,84 @@
+# Lefthook configuration. The devShell's shellHook runs `lefthook install`, so
+# entering the shell via `nix develop` or direnv installs the Git hooks for you.
+#
+# pre-commit is optimised for speed and scopes to staged files wherever possible.
+# Anything heavy (the full test suite) belongs in pre-push.
+
+assert_lefthook_installed: true
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: gitleaks
+      # Scans only the staged diff, which is far faster than the full history.
+      run: gitleaks protect --staged --redact --config .gitleaks.toml
+
+    - name: ruff-check
+      glob: '*.py'
+      # Python survives only as standalone client scripts; ruff.toml at the root
+      # is the sole config, and uvx avoids needing a Python project here.
+      run: uvx ruff check --force-exclude {staged_files}
+
+    - name: ruff-format
+      glob: '*.py'
+      run: uvx ruff format --check --force-exclude {staged_files}
+
+    - name: pep723-header
+      # Standalone scripts are required to carry PEP 723 inline metadata.
+      glob:
+        - 'clients/**/*.py'
+        - 'knowledge/references/**/*.py'
+      run: ./.just/check-pep723.sh {staged_files}
+
+    - name: oxlint
+      glob: '*.{ts,tsx}'
+      # oxlint/oxfmt are pnpm devDependencies, so the workspace pins one version
+      # for everyone. The script skips when the workspace is not installed, but
+      # never swallows a real lint failure.
+      run: ./.just/web-check.sh lint {staged_files}
+
+    - name: oxfmt
+      glob: '*.{ts,tsx}'
+      run: ./.just/web-check.sh fmt-check {staged_files}
+
+    - name: typecheck
+      glob: '*.{ts,tsx}'
+      # tsc is per-package and cannot take a file list, so this runs the whole
+      # workspace rather than only the staged files.
+      run: ./.just/web-check.sh typecheck
+
+    - name: just-fmt
+      glob:
+        - 'justfile'
+        - '.just/*.just'
+      # Formatting and doc-comment rules cover every justfile at once, so these
+      # do not take {staged_files}.
+      run: just fmt-check
+
+    - name: just-recipe-docs
+      glob:
+        - 'justfile'
+        - '.just/*.just'
+      run: just check-recipe-docs
+
+    - name: actionlint
+      glob: '.github/workflows/*.{yml,yaml}'
+      run: actionlint {staged_files}
+
+    - name: pinact-verify
+      glob: '.github/workflows/*.{yml,yaml}'
+      # Verify the pinned SHA matches its version comment; do not rewrite.
+      run: pinact run --verify --check {staged_files}
+
+    - name: shellcheck
+      glob: 'infra/*.sh'
+      run: shellcheck --external-sources {staged_files}
+
+    - name: nixfmt
+      glob: '*.nix'
+      run: nixfmt --check {staged_files}
+
+pre-push:
+  jobs:
+    - name: vitest
+      run: pnpm -r test

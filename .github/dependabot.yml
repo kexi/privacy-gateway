@@ -1,0 +1,34 @@
+version: 2
+
+# Python is intentionally absent: it survives only as standalone PEP 723 client
+# scripts whose dependencies are declared inline, which dependabot cannot track.
+updates:
+  # GitHub Actions are SHA-pinned via pinact, so after dependabot bumps one,
+  # re-pin with `just pin`.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    cooldown:
+      default-days: 1
+    groups:
+      actions:
+        patterns: ['*']
+
+  # Only propose npm versions older than a day, matching pnpm's
+  # minimumReleaseAge=1440. This avoids supply-chain attacks, which typically
+  # surface as a malicious version published and yanked within hours.
+  # The pnpm workspace is root-defined, so directory points at /.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: 'chore(deps)'
+    cooldown:
+      default-days: 1
+    groups:
+      web:
+        patterns: ['*']

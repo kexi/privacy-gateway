@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Privacy-Preserving Gateway</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Privacy-Preserving Gateway</h1>
+        <p class="lede">
+          A frontier model reasons over tokenized text. The mapping back to real values never leaves
+          the trust boundary.
+        </p>
+      </header>
+
+      <section class="composer">
+        <label for="input">Request (in the clear)</label>
+        <textarea id="input" rows="7" spellcheck="false"></textarea>
+        <div class="actions">
+          <button id="submit" type="button">Send through the gateway</button>
+          <p id="status" class="status"></p>
+        </div>
+      </section>
+
+      <section id="results" hidden>
+        <div class="verdict">
+          <span id="tier" class="badge">unverified</span>
+          <span id="doc-status" class="badge">draft</span>
+          <button id="approve" type="button" class="secondary">Approve as human reviewer</button>
+        </div>
+
+        <div id="attestation" class="attestation"></div>
+
+        <div class="panes">
+          <article>
+            <h2>Masked prompt <small>sent to Gemini</small></h2>
+            <pre id="masked" class="pane"></pre>
+          </article>
+          <article>
+            <h2>Final answer <small>rehydrated for you</small></h2>
+            <pre id="answer" class="pane"></pre>
+          </article>
+        </div>
+
+        <div id="stats" class="stats"></div>
+
+        <div id="correlation" class="correlation"></div>
+
+        <details>
+          <summary>OKF document (audit record)</summary>
+          <pre id="okf" class="pane okf"></pre>
+        </details>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

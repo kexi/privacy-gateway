@@ -1,0 +1,22 @@
+packages:
+  - 'web'
+  - 'packages/common'
+  - 'agents/core'
+  - 'agents/gateway'
+  - 'agents/synthesis'
+
+# Postinstall scripts are blocked by default (pnpm 10+). Allow only the packages that
+# genuinely need one, and deny the rest: a build script is arbitrary code execution at
+# install time, so the default answer is "no".
+allowBuilds:
+  # esbuild links its platform-specific native binary in a postinstall step; Vite cannot
+  # build without it.
+  esbuild: true
+  # These install correctly without their scripts (protobufjs' script only regenerates
+  # artifacts that already ship prebuilt), so they stay blocked.
+  '@google/genai': false
+  protobufjs: false
+
+# Refuse any version published less than 24 hours ago (supply-chain cooldown).
+# pnpm 10+ reads this from pnpm-workspace.yaml rather than .npmrc.
+minimumReleaseAge: 1440
