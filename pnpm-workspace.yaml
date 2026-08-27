@@ -4,6 +4,7 @@ packages:
   - 'agents/core'
   - 'agents/gateway'
   - 'agents/synthesis'
+  - 'clients/mcp'
 
 # Postinstall scripts are blocked by default (pnpm 10+). Allow only the packages that
 # genuinely need one, and deny the rest: a build script is arbitrary code execution at

@@ -293,6 +293,8 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 | `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                            |
 | `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                       |
 | `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                 |
+| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                    |
+| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                              |
 | `GET`    | `/healthz`                           | 死活監視                                                                                                                  |
 
 セッションベースの API はもう存在しない: `GET /v1/sessions/{id}/answer`、
@@ -322,6 +324,62 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 | レート制限超過                                         | `429`                                   |
 | リクエストボディが大きすぎる                           | `413`                                   |
 | Gateway のデッドライン超過                             | `504`                                   |
+
+### OpenAI 互換クライアントで `privacy-gateway` をモデルとして使う
+
+既存の OpenAI 互換クライアントの `base_url` を Gateway に向け、モデルとして
+`privacy-gateway` を選ぶだけでよい。コード変更は不要で、上記のゲートはすべてそのまま適用される。
+
+```bash
+curl -sS http://localhost:8081/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+        "model": "privacy-gateway",
+        "messages": [
+          {"role": "system", "content": "You are terse."},
+          {"role": "user", "content": "Draft a reply to taro@example.co.jp about the failed charge."}
+        ]
+      }'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8081/v1", api_key="unused")
+completion = client.chat.completions.create(
+    model="privacy-gateway",
+    messages=[{"role": "user", "content": "Draft a reply about the failed charge."}],
+)
+print(completion.choices[0].message.content)
+```
+
+**メッセージのマッピング**: `system` と `user` の content を順序どおり空行区切りで連結し、
+パイプラインがマスクする単一のテキストにする。`assistant` ターンは破棄する——それはこの
+フリート自身の過去の出力であり、呼び出し側の履歴ではすでに復元済みであるため、送り返すと
+egress guard が守っている境界に生の値を押し戻すことになる。したがってマルチターンの文脈は
+**呼び出し側による連結**である。セッションが存在しないため、各リクエストは独立にマスクされ、
+独立に vault キーを持つ。
+
+**拡張フィールド**: `choices[0].message.content` が復元済み回答、`id` は
+`chatcmpl-<request_id>` であり、OpenAI 形式のレスポンスからでも evidence に到達できる。
+OpenAI スキーマでは表現できないプライバシー情報は `x_privacy_gateway` に載る:
+`request_id`, `trace_id`, `trust_tier`, `status`, `masked_prompt`, `withheld`。
+
+**拒否**は OpenAI のエラーオブジェクトとして返り、上表のステータスとカテゴリ所見を保持する。
+内容が謝罪文であるような `200` を返すことは決してない。
+
+**ストリーミング**（`stream: true`）はコンテンツチャンクを 1 つ返してから `[DONE]` を返す。
+これは手抜きではなく意図的な設計である: ゲートは fail-closed であり leak check は Core の
+**完全な**回答に対して実行されるため、生成順にトークンを流すと、リリース可否を決める verdict
+より前にテキストを出してしまう。呼び出し側が回答を半分描画した後に届く拒否は、拒否ではない。
+
+## MCP サーバ
+
+`clients/mcp` は、このフリートを任意の MCP クライアントに 3 つのツール——`pgw_ask`、
+`pgw_evidence`、`pgw_verify`——として公開する。エージェントは質問し、監査ドキュメントを読み、
+attestation を独立に再実行できる。拒否は例外ではなく構造化された結果として返るため、モデルは
+プライバシーゲートを迂回してリトライするのではなく、その内容を説明できる。Claude Desktop /
+Claude Code / Codex の設定は [`clients/mcp/README.ja.md`](clients/mcp/README.ja.md) にある。
 
 ## Python クライアント（言語非依存の利用例）
 

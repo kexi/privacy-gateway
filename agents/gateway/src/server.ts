@@ -45,6 +45,14 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ExtractionFailedError, extractUnstructured } from './agent.ts';
+import {
+  handleModels,
+  logChatStart,
+  parseChatRequest,
+  toChatCompletion,
+  toOpenAiError,
+  writeSseCompletion,
+} from './openai_compat.ts';
 import { ask, RequestAbortedError, ReservedSyntaxError, type AskResult } from './pipeline.ts';
 
 /** Cloud Run injects PORT. Locally 8081 sits between web (5173) and core (8082). */
@@ -194,6 +202,16 @@ export function createApp(options: CreateAppOptions): express.Application {
     void handleAsk(req, res, next);
   });
 
+  // The OpenAI-compatible façade. Same gates, same vault discipline; only the
+  // request and response shapes differ. See `openai_compat.ts` for the mapping.
+  app.get('/v1/models', (req, res) => {
+    handleModels(req, res, now);
+  });
+
+  app.post('/v1/chat/completions', (req, res, next) => {
+    void handleChatCompletions(req, res, next);
+  });
+
   app.get('/v1/requests/:id', (req, res, next) => {
     void handleEvidence(req, res, next);
   });
@@ -260,36 +278,36 @@ export function createApp(options: CreateAppOptions): express.Application {
     return SynthesizeResponseSchema.parse(await response.json());
   }
 
-  async function handleAsk(req: Request, res: Response, next: NextFunction): Promise<void> {
-    const context = contextOf(req);
-    if (context === undefined) return next();
-
+  /**
+   * True when this caller is over quota, having already been answered 429.
+   *
+   * Shared by both entry points: the OpenAI façade runs the same fleet and costs
+   * the same three model calls, so exempting it would just make the rate limit a
+   * suggestion.
+   */
+  function rateLimited(req: Request, res: Response, context: RequestContext): boolean {
     const callerKey = req.ip ?? 'unknown';
-    if (limiter.exceeded(callerKey)) {
-      context.logger.event('request.rate_limited', {}, 'WARNING');
-      res.status(429).json({
-        error: 'rate_limited',
-        message: 'too many requests; this demo gateway allows a limited rate per client',
-        request_id: context.requestId,
-      });
-      return;
-    }
+    if (!limiter.exceeded(callerKey)) return false;
 
-    const parsed = AskRequestSchema.safeParse(req.body);
-    if (!parsed.success) {
-      // `strict()` on the schema is what turns a leftover `session_id` into this
-      // 400 rather than a silently ignored field.
-      res.status(400).json({
-        error: 'invalid_request',
-        message: parsed.error.issues
-          .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
-          .join('; '),
-        request_id: context.requestId,
-      });
-      return;
-    }
+    context.logger.event('request.rate_limited', {}, 'WARNING');
+    res.status(429).json({
+      error: 'rate_limited',
+      message: 'too many requests; this demo gateway allows a limited rate per client',
+      request_id: context.requestId,
+    });
+    return true;
+  }
 
+  /**
+   * Run one request through the pipeline under the shared deadline.
+   *
+   * Extracted so `/v1/ask` and `/v1/chat/completions` cannot drift apart: every
+   * gate, the cancellation semantics and the span structure are defined once, and
+   * only the response shaping differs between the two callers.
+   */
+  async function runAsk(req: Request, context: RequestContext, text: string): Promise<AskResult> {
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
+    const routePath = req.path === '/v1/chat/completions' ? '/v1/chat/completions' : '/v1/ask';
 
     // One deadline for the whole chain, expressed as a real cancellation.
     //
@@ -315,18 +333,18 @@ export function createApp(options: CreateAppOptions): express.Application {
     });
 
     try {
-      const result = await Promise.race([
+      return await Promise.race([
         withContext(parentContext, () =>
           withSpan(
             SPAN.request,
-            { request_id: context.requestId, method: 'POST', path: '/v1/ask' },
+            { request_id: context.requestId, method: 'POST', path: routePath },
             async () => {
               const startedAt = Date.now();
               const scoped = context.logger;
-              scoped.event('request.start', { method: 'POST', path: '/v1/ask' });
+              scoped.event('request.start', { method: 'POST', path: routePath });
 
               const outcome = await ask({
-                text: parsed.data.text,
+                text,
                 requestId: context.requestId,
                 vault,
                 signal: controller.signal,
@@ -337,8 +355,8 @@ export function createApp(options: CreateAppOptions): express.Application {
                 coreActor,
                 extractSpans:
                   options.extractSpans ??
-                  ((text) =>
-                    extractUnstructured(text, {
+                  ((spanText) =>
+                    extractUnstructured(spanText, {
                       logger: scoped,
                       model: config.GEMMA_MODEL,
                       baseUrl: config.GEMMA_BASE_URL,
@@ -359,15 +377,116 @@ export function createApp(options: CreateAppOptions): express.Application {
         ),
         deadline,
       ]);
-
-      res.json(toPayload(result));
-    } catch (error) {
-      handleAskError(error, res, context);
     } finally {
       // Releases the timer and, on the success path, cancels anything still in
       // flight behind the response that was already sent.
       clearTimeout(timer);
       controller.abort();
+    }
+  }
+
+  /**
+   * The OpenAI-compatible completion endpoint.
+   *
+   * A refusal is reported as an OpenAI error object carrying the same status the
+   * native endpoint would use, so a stock client sees a real failure rather than
+   * a completion whose content happens to be an apology.
+   */
+  async function handleChatCompletions(
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const context = contextOf(req);
+    if (context === undefined) return next();
+    if (rateLimited(req, res, context)) return;
+
+    const parsed = parseChatRequest(req.body, context.requestId);
+    if (!parsed.ok) {
+      context.logger.event(
+        'openai.compat.chat.rejected',
+        { error_code: parsed.body.error.code ?? 'invalid_request' },
+        'WARNING',
+      );
+      res.status(parsed.status).json(parsed.body);
+      return;
+    }
+
+    logChatStart(context.logger, parsed.stream);
+
+    try {
+      const result = await runAsk(req, context, parsed.text);
+      const completion = toChatCompletion(result, now());
+
+      context.logger.event('openai.compat.chat.end', {
+        document_status: result.status,
+        trust_tier: result.trustTier,
+      });
+
+      if (parsed.stream) {
+        writeSseCompletion(res, completion);
+        return;
+      }
+      res.json(completion);
+    } catch (error) {
+      handleChatError(error, res, context);
+    }
+  }
+
+  /**
+   * Map a pipeline failure onto an OpenAI error object.
+   *
+   * The status and category list come from the same classification `/v1/ask`
+   * uses — `handleAskError` writes the native body, this writes the OpenAI one —
+   * so the two endpoints can never disagree about whether something was refused.
+   */
+  function handleChatError(error: unknown, res: Response, context: RequestContext): void {
+    const classified = classifyAskError(error);
+    context.logger.event(
+      'openai.compat.chat.refused',
+      {
+        error_code: classified.code,
+        ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
+      },
+      'ERROR',
+    );
+    res
+      .status(classified.status)
+      .json(
+        toOpenAiError(
+          classified.status,
+          classified.code,
+          classified.message,
+          context.requestId,
+          classified.categories,
+        ),
+      );
+  }
+
+  async function handleAsk(req: Request, res: Response, next: NextFunction): Promise<void> {
+    const context = contextOf(req);
+    if (context === undefined) return next();
+
+    if (rateLimited(req, res, context)) return;
+
+    const parsed = AskRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      // `strict()` on the schema is what turns a leftover `session_id` into this
+      // 400 rather than a silently ignored field.
+      res.status(400).json({
+        error: 'invalid_request',
+        message: parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+          .join('; '),
+        request_id: context.requestId,
+      });
+      return;
+    }
+
+    try {
+      res.json(toPayload(await runAsk(req, context, parsed.data.text)));
+    } catch (error) {
+      handleAskError(error, res, context);
     }
   }
 
@@ -379,96 +498,25 @@ export function createApp(options: CreateAppOptions): express.Application {
    * most detail a caller gets.
    */
   function handleAskError(error: unknown, res: Response, context: RequestContext): void {
-    if (error instanceof ReservedSyntaxError) {
-      context.logger.event('request.refused', { refusal: 'reserved_syntax' }, 'WARNING');
-      res.status(400).json({
-        error: 'reserved_syntax',
-        message: error.message,
-        request_id: context.requestId,
-      });
-      return;
-    }
+    const classified = classifyAskError(error);
 
-    if (error instanceof PiiLeakError) {
-      // Raw PII was about to cross the boundary. Stop with a 422 instead of sending.
-      context.logger.event(
-        'request.refused',
-        { refusal: 'egress_guard', categories: [...error.categories] },
-        'ERROR',
-      );
-      res.status(422).json({
-        error: 'outbound_guard_refused',
-        message: error.message,
-        categories: [...error.categories],
-        request_id: context.requestId,
-      });
-      return;
-    }
-
-    if (error instanceof ExtractionFailedError) {
-      // The regexes cannot see names or addresses, so an unusable extractor means
-      // the request's unstructured PII is unknown. Nothing was sent to Core.
-      context.logger.event('request.refused', { refusal: 'extraction_failed' }, 'ERROR');
-      res.status(502).json({
-        error: 'extraction_unavailable',
-        message: 'unstructured PII extraction is unavailable, so the request was not forwarded',
-        request_id: context.requestId,
-      });
-      return;
-    }
-
-    if (error instanceof SynthesisRefusedError) {
-      context.logger.event(
-        'request.refused',
-        { refusal: error.kind, categories: [...error.categories] },
-        'ERROR',
-      );
-      res.status(error.status).json({
-        error: error.kind,
-        message: error.message,
-        categories: [...error.categories],
-        request_id: context.requestId,
-      });
-      return;
-    }
-
-    // A step that stopped because the deadline fired is the same fact as the
-    // deadline itself; reporting it as an internal error would hide the cause.
-    if (error instanceof DeadlineExceededError || error instanceof RequestAbortedError) {
-      context.logger.event('request.failed', { error_code: 'deadline_exceeded' }, 'ERROR');
-      res.status(504).json({
-        error: 'deadline_exceeded',
-        message: 'the request exceeded the gateway deadline',
-        request_id: context.requestId,
-      });
-      return;
-    }
-
-    // A missing ID token is a deployment/credential fault on *our* side of the
-    // hop, not a caller error, and it is indistinguishable from a downstream
-    // outage to the client — so it reports as 502 under its own event name.
-    const isAuthFailure = error instanceof IdTokenError || error instanceof UnknownAudienceError;
-    const status = isAuthFailure || error instanceof DownstreamError ? 502 : 500;
     context.logger.event(
-      isAuthFailure
-        ? error instanceof UnknownAudienceError
-          ? 'auth.audience.rejected'
-          : 'auth.id_token.failed'
-        : 'request.failed',
+      classified.event,
       {
-        error_class: error instanceof Error ? error.name : 'unknown',
-        error_code: isAuthFailure
-          ? error instanceof UnknownAudienceError
-            ? 'audience_rejected'
-            : 'id_token_unavailable'
-          : status === 502
-            ? 'downstream_error'
-            : 'internal_error',
+        ...(classified.refusal !== undefined ? { refusal: classified.refusal } : {}),
+        ...(classified.errorCode !== undefined ? { error_code: classified.errorCode } : {}),
+        ...(classified.errorClass !== undefined ? { error_class: classified.errorClass } : {}),
+        ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
       },
-      'ERROR',
+      classified.severity,
     );
-    res.status(status).json({
-      error: status === 502 ? 'downstream_agent_failed' : 'internal_error',
+
+    res.status(classified.status).json({
+      error: classified.code,
+      // The opaque 5xx branches carry no message: an exception message can embed
+      // the value that caused it.
+      ...(classified.exposeMessage ? { message: classified.message } : {}),
+      ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
       request_id: context.requestId,
     });
   }
@@ -567,6 +615,141 @@ export function createApp(options: CreateAppOptions): express.Application {
   });
 
   return app;
+}
+
+/**
+ * One pipeline failure, classified once for both response shapes.
+ *
+ * `/v1/ask` renders this as the native error body and `/v1/chat/completions` as
+ * an OpenAI error object. Keeping the classification in one place is what stops
+ * the two endpoints from disagreeing about whether something was refused, and
+ * with which status — a compat endpoint that answered 200 where the native one
+ * answered 422 would be a way to launder a refusal into a completion.
+ */
+interface ClassifiedAskError {
+  readonly status: number;
+  /** The `error` field of the native body, and the OpenAI `code`. */
+  readonly code: string;
+  readonly message: string;
+  /** False for the opaque 5xx branches, whose messages are never released. */
+  readonly exposeMessage: boolean;
+  readonly categories: readonly string[];
+  readonly event: string;
+  readonly severity: 'WARNING' | 'ERROR';
+  readonly refusal?: string;
+  readonly errorCode?: string;
+  readonly errorClass?: string;
+}
+
+/**
+ * Map a failure onto a status.
+ *
+ * Every branch is a refusal to release something, so none of them carries the
+ * Core body, a mapping value, or an exception message. The category list is the
+ * most detail a caller gets.
+ */
+function classifyAskError(error: unknown): ClassifiedAskError {
+  if (error instanceof ReservedSyntaxError) {
+    return {
+      status: 400,
+      code: 'reserved_syntax',
+      message: error.message,
+      exposeMessage: true,
+      categories: [],
+      event: 'request.refused',
+      severity: 'WARNING',
+      refusal: 'reserved_syntax',
+    };
+  }
+
+  if (error instanceof PiiLeakError) {
+    // Raw PII was about to cross the boundary. Stop with a 422 instead of sending.
+    return {
+      status: 422,
+      code: 'outbound_guard_refused',
+      message: error.message,
+      exposeMessage: true,
+      categories: [...error.categories],
+      event: 'request.refused',
+      severity: 'ERROR',
+      refusal: 'egress_guard',
+    };
+  }
+
+  if (error instanceof ExtractionFailedError) {
+    // The regexes cannot see names or addresses, so an unusable extractor means
+    // the request's unstructured PII is unknown. Nothing was sent to Core.
+    return {
+      status: 502,
+      code: 'extraction_unavailable',
+      message: 'unstructured PII extraction is unavailable, so the request was not forwarded',
+      exposeMessage: true,
+      categories: [],
+      event: 'request.refused',
+      severity: 'ERROR',
+      refusal: 'extraction_failed',
+    };
+  }
+
+  if (error instanceof SynthesisRefusedError) {
+    return {
+      status: error.status,
+      code: error.kind,
+      message: error.message,
+      exposeMessage: true,
+      categories: [...error.categories],
+      event: 'request.refused',
+      severity: 'ERROR',
+      refusal: error.kind,
+    };
+  }
+
+  // A step that stopped because the deadline fired is the same fact as the
+  // deadline itself; reporting it as an internal error would hide the cause.
+  if (error instanceof DeadlineExceededError || error instanceof RequestAbortedError) {
+    return {
+      status: 504,
+      code: 'deadline_exceeded',
+      message: 'the request exceeded the gateway deadline',
+      exposeMessage: true,
+      categories: [],
+      event: 'request.failed',
+      severity: 'ERROR',
+      errorCode: 'deadline_exceeded',
+    };
+  }
+
+  // A missing ID token is a deployment/credential fault on *our* side of the
+  // hop, not a caller error, and it is indistinguishable from a downstream
+  // outage to the client — so it reports as 502 under its own event name.
+  const isAuthFailure = error instanceof IdTokenError || error instanceof UnknownAudienceError;
+  const status = isAuthFailure || error instanceof DownstreamError ? 502 : 500;
+  return {
+    status,
+    code: status === 502 ? 'downstream_agent_failed' : 'internal_error',
+    // Generic on purpose: this is the branch where the message could be an
+    // arbitrary exception string, so the caller gets the code and nothing else.
+    message:
+      status === 502
+        ? 'a downstream agent failed, so no answer was released'
+        : 'the gateway failed to complete the request',
+    exposeMessage: false,
+    categories: [],
+    event: isAuthFailure
+      ? error instanceof UnknownAudienceError
+        ? 'auth.audience.rejected'
+        : 'auth.id_token.failed'
+      : 'request.failed',
+    severity: 'ERROR',
+    errorCode: isAuthFailure
+      ? error instanceof UnknownAudienceError
+        ? 'audience_rejected'
+        : 'id_token_unavailable'
+      : status === 502
+        ? 'downstream_error'
+        : 'internal_error',
+    errorClass: error instanceof Error ? error.name : 'unknown',
+  };
 }
 
 /** A failure attributable to a downstream agent rather than to this one. */
@@ -676,7 +859,13 @@ function mountWebUi(app: express.Application, config: Config): void {
 
   app.use(express.static(webDir, { index: false }));
   app.get('/', (_req, res) => {
-    res.sendFile(entry);
+    // Sent relative to an explicit root, exactly as `express.static` above does
+    // it. Why not `res.sendFile(absolutePath)`: with no root, `send` splits the
+    // *entire* absolute path and refuses it if any segment starts with a dot —
+    // so a checkout under a dot-directory (a git worktree beneath `.claude/`,
+    // for one) served the assets but answered `/` with a 404 that looked like a
+    // routing bug rather than a path policy.
+    res.sendFile('index.html', { root: webDir });
   });
 }
 

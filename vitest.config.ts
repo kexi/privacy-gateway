@@ -24,12 +24,18 @@ const AGENT_BRANCH_THRESHOLD = 65;
 
 export default defineConfig({
   test: {
-    projects: ['packages/common', 'agents/core', 'agents/gateway', 'agents/synthesis'],
+    projects: [
+      'packages/common',
+      'agents/core',
+      'agents/gateway',
+      'agents/synthesis',
+      'clients/mcp',
+    ],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],
       reportsDirectory: 'coverage',
-      include: ['packages/*/src/**/*.ts', 'agents/*/src/**/*.ts'],
+      include: ['packages/*/src/**/*.ts', 'agents/*/src/**/*.ts', 'clients/mcp/src/**/*.ts'],
       exclude: ['**/dist/**', '**/*.d.ts', '**/*.config.ts'],
       // packages/common holds the masking, vault and OKF logic the guarantees
       // rest on, so it carries the stricter floor; the agents are thinner

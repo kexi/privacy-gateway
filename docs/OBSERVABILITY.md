@@ -150,6 +150,17 @@ Event names are stable identifiers; queries and dashboards depend on them.
 | `auth.id_token.failed`   | ERROR         | the Gateway could not obtain an ID token for a downstream call; a deployment/credential fault, reported as 502                                                                                        |
 | `server.start`           | INFO          | boot; model ids, vault backend, `trace_id`                                                                                                                                                            |
 
+The OpenAI-compatible façade (`POST /v1/chat/completions`) runs the same pipeline
+and therefore emits the same `request.*`, `mask.*`, `guard.*` and `a2a.*` events
+as `/v1/ask`. These four are additional, and identify the compat surface:
+
+| event                         | severity | meaning / what to check                                                                                                             |
+| ----------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `openai.compat.chat.start`    | INFO     | a compat request was accepted; `ok` carries whether the caller asked to stream. Never the message text                              |
+| `openai.compat.chat.end`      | INFO     | the compat response was shaped; `document_status`, `trust_tier`                                                                     |
+| `openai.compat.chat.refused`  | ERROR    | a gate refused; `error_code`, `categories`. The status matches what `/v1/ask` would have returned — the façade never downgrades one |
+| `openai.compat.chat.rejected` | WARNING  | the body failed validation before the pipeline ran; `error_code` is `invalid_request` or `empty_prompt`                             |
+
 There is no `approve.done` event: human approval does not exist in this system
 (see `ARCHITECTURE.md` §2).
 

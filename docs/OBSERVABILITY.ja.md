@@ -145,6 +145,17 @@ gcloud logging read 'resource.type="cloud_run_revision" jsonPayload.request_id="
 | `auth.id_token.failed`   | ERROR         | Gateway が下流呼び出し用の ID token を取得できなかった。デプロイ / 認証情報側の障害であり 502 として報告される                                                                                         |
 | `server.start`           | INFO          | 起動。モデル ID、vault バックエンド、`trace_id`                                                                                                                                                        |
 
+OpenAI 互換ファサード（`POST /v1/chat/completions`）は同じパイプラインを実行する
+ため、`/v1/ask` と同じ `request.*` / `mask.*` / `guard.*` / `a2a.*` イベントを出力
+する。以下の 4 つが互換面を識別する追加イベントである:
+
+| event                         | severity | 意味 / 確認事項                                                                                              |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `openai.compat.chat.start`    | INFO     | 互換リクエストを受理。`ok` は stream 要求の有無を表す。メッセージ本文は決して出力しない                      |
+| `openai.compat.chat.end`      | INFO     | 互換レスポンスを整形した。`document_status`, `trust_tier`                                                    |
+| `openai.compat.chat.refused`  | ERROR    | ゲートが拒否した。`error_code`, `categories`。status は `/v1/ask` と同一であり、ファサードが緩めることはない |
+| `openai.compat.chat.rejected` | WARNING  | パイプライン実行前にボディ検証で失敗。`error_code` は `invalid_request` または `empty_prompt`                |
+
 `approve.done` イベントは存在しない: このシステムに人間による承認は無い
 （`ARCHITECTURE.ja.md` §2 参照）。
 

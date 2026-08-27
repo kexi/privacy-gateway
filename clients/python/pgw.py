@@ -278,9 +278,15 @@ def _attestation_block(markdown: str) -> dict[str, str]:
     match = re.search(r"^attestation:\s*$\n((?:^[ \t]+.*$\n?)*)", front, re.MULTILINE)
     if match is None:
         return {}
+    # The key class must admit digits: every digest key ends in `sha256`, so a
+    # `[a-z_]+` class silently skips exactly the entries `verify` exists to
+    # check, leaving only `request_id` and `verdict` and reporting every digest
+    # as absent.
     return {
         key: value.strip().strip("\"'")
-        for key, value in re.findall(r"^\s+([a-z_]+):\s*(.+)$", match.group(1), re.MULTILINE)
+        for key, value in re.findall(
+            r"^[ \t]+([a-z_][a-z0-9_]*):[ \t]*(.+)$", match.group(1), re.MULTILINE
+        )
     }
 
 

@@ -264,6 +264,107 @@ export const HealthResponseSchema = z.object({
 });
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
+// --- OpenAI-compatible surface -----------------------------------------------
+
+/**
+ * The model id this gateway advertises on `GET /v1/models`.
+ *
+ * One id, not a passthrough of the underlying model names: a caller selects the
+ * *fleet*, and which Gemini or Gemma version runs behind the boundary is
+ * deployment topology the caller neither picks nor should depend on.
+ */
+export const OPENAI_MODEL_ID = 'privacy-gateway';
+
+/**
+ * One message of an OpenAI `chat/completions` body.
+ *
+ * `content` is required and must be a string: the multimodal array form carries
+ * image parts this fleet cannot mask, and accepting it would mean silently
+ * dropping content the caller believed was sent. Refusing it is the fail-closed
+ * reading.
+ */
+export const OpenAiChatMessageSchema = z
+  .object({
+    role: z.enum(['system', 'user', 'assistant']),
+    content: z.string(),
+    name: z.string().optional(),
+  })
+  .strip();
+export type OpenAiChatMessage = z.infer<typeof OpenAiChatMessageSchema>;
+
+/**
+ * `POST /v1/chat/completions`.
+ *
+ * Deliberately *not* `strict()`, unlike `AskRequestSchema`. An OpenAI client
+ * sends sampling knobs (`temperature`, `top_p`, `max_tokens`, …) unprompted, and
+ * rejecting the body for carrying them would make every stock SDK unusable. The
+ * unknown keys are stripped rather than honoured — this fleet does not forward
+ * sampling parameters — so nothing a caller sets here changes what Core sees.
+ *
+ * Why not accept `session_id`-like fields here either: there is still no session.
+ * Multi-turn context is whatever the caller concatenated into `messages`, and
+ * each request gets its own vault key.
+ */
+export const OpenAiChatCompletionRequestSchema = z
+  .object({
+    model: z.string().min(1),
+    messages: z.array(OpenAiChatMessageSchema).min(1, 'messages must not be empty'),
+    stream: z.boolean().optional(),
+  })
+  .strip();
+export type OpenAiChatCompletionRequest = z.infer<typeof OpenAiChatCompletionRequestSchema>;
+
+/**
+ * The privacy facts an OpenAI-shaped response cannot express.
+ *
+ * The OpenAI schema has nowhere to put a trust tier, a masked prompt or a
+ * withheld-category list, and dropping them would make the compatible endpoint a
+ * way to consume this fleet *without* the evidence that justifies trusting it.
+ * They travel in a namespaced extension field instead, which stock clients
+ * ignore and an aware client can read.
+ */
+export const OpenAiPrivacyExtensionSchema = z.object({
+  request_id: z.string(),
+  trace_id: z.string().optional(),
+  trust_tier: TrustTierSchema,
+  status: AnswerStatusSchema,
+  masked_prompt: z.string(),
+  withheld: z.array(PiiCategorySchema),
+});
+export type OpenAiPrivacyExtension = z.infer<typeof OpenAiPrivacyExtensionSchema>;
+
+export const OpenAiChatCompletionResponseSchema = z.object({
+  id: z.string(),
+  object: z.literal('chat.completion'),
+  created: z.number(),
+  model: z.string(),
+  choices: z.array(
+    z.object({
+      index: z.number(),
+      message: z.object({
+        role: z.literal('assistant'),
+        content: z.string(),
+      }),
+      finish_reason: z.string(),
+    }),
+  ),
+  x_privacy_gateway: OpenAiPrivacyExtensionSchema,
+});
+export type OpenAiChatCompletionResponse = z.infer<typeof OpenAiChatCompletionResponseSchema>;
+
+export const OpenAiModelSchema = z.object({
+  id: z.string(),
+  object: z.literal('model'),
+  created: z.number(),
+  owned_by: z.string(),
+});
+
+export const OpenAiModelListSchema = z.object({
+  object: z.literal('list'),
+  data: z.array(OpenAiModelSchema),
+});
+export type OpenAiModelList = z.infer<typeof OpenAiModelListSchema>;
+
 /** Error body returned by every route, so the UI has one shape to render. */
 export const ErrorResponseSchema = z.object({
   error: z.string(),
