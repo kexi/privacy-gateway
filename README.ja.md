@@ -86,6 +86,7 @@ packages/common/   # tokenizer, vault, OKF, guard, ログ, telemetry, zod スキ
 agents/gateway/    # ADK エージェント + HTTP 入口 + web/dist の配信
 agents/core/       # ADK エージェント（Gemini）+ A2A サーバ
 agents/synthesis/  # ADK エージェント + A2A サーバ + HTTP ルート
+services/kill-switch/  # コストキルスイッチ: 予算通知 → 支出を止める
 clients/python/    # pgw.py — 単一ファイルの PEP 723 クライアント（言語非依存の例）
 serving/gemma/     # Cloud Run GPU 用の Ollama Dockerfile
 web/               # デモ UI（マスク済みと最終回答の対比）+ Playwright スペック
@@ -94,7 +95,8 @@ infra/terraform/   # Terraform: Cloud Run、IAM、Firestore TTL、Artifact Regis
 ```
 
 workspace のパッケージは `web`、`packages/common`、`agents/core`、`agents/gateway`、
-`agents/synthesis`。
+`agents/synthesis`、`services/kill-switch`。キルスイッチが `agents/` ではなく `services/` に
+あるのは、推論フリートの一員ではないから — プロンプトも回答も vault エントリも一切見ない。
 
 相対 import は **`.ts` 拡張子**を付けて書く（`import { x } from './x.ts'`）。tsconfig の
 `allowImportingTsExtensions` + `rewriteRelativeImportExtensions` で有効化され、ビルド時に
@@ -446,7 +448,7 @@ Cloud Build で別途ビルドする。コマンド面は従来どおり `just` 
 ```bash
 just tf-bootstrap                 # state 用 GCS バケットを作成（初回のみ。gcloud で作る唯一のリソース）
 just tf-init                      # そのバケットを backend として Terraform を初期化
-just build                        # 4 つのイメージを Cloud Build でビルド・push
+just build                        # 5 つのイメージを Cloud Build でビルド・push
 just tf-plan gpu_enabled=false    # 変更内容を確認
 just tf-apply gpu_enabled=false   # GPU サービス以外をすべて適用
 just tf-apply                     # L4 クォータ承認後に gemma-serving を追加
@@ -459,6 +461,25 @@ just tf-destroy                   # 撤収（GPU の課金を最優先で止め�
 
 Core のサービスアカウントには意図的に Firestore ロールを **与えない**。Gemma のエンドポイントは
 内部 ingress のみ。サービス間呼び出しは ID トークンで認証する。
+
+### コストと自動キルスイッチ
+
+アイドル時は **$0**（全サービスがゼロスケールする）。全部起きている状態でも約
+**$1.64/時間** で、そのほとんどは GPU を積んだ `gemma-serving`。現実的に金を失う経路は
+テアダウンの忘れだけで、1 日放置すると **約 $39**。
+
+そこで、消し忘れは深夜 3 時に誰も読まないメールではなく自動処理で受け止める。
+**$50 の Cloud Billing budget** がしきい値超過（50% / 80% / 100%）のたびに Pub/Sub topic へ
+publish し、その push subscription が小さな `kill-switch` Cloud Run サービスを呼ぶ。
+100% 到達時に `gateway-agent` から `allUsers` invoker バインディングを外し、
+`gemma-serving` の max instances を 0 にする。どちらも冪等なので Pub/Sub の再配信は無害。
+100% 未満ならログを残すだけ。支出の原因を潰したあと `just restore-after-kill` で復旧する。
+
+なお、コストゲートはこのフリートの開示ゲートとは違って意図的に **fail closed にしない**。
+解釈できない通知はログに残して無視する。壊れたメッセージ 1 通でデモを止めるほうが、
+よほど障害そのものだから。budget の作成には**請求先アカウントに対する**
+`roles/billing.costsManager` が必要（プロジェクトの Owner では不足）。詳細は
+[docs/DEPLOY.ja.md](docs/DEPLOY.ja.md) の「自動コストキルスイッチ」節。
 
 ## 環境変数
 

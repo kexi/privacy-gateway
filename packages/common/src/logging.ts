@@ -95,8 +95,15 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   text_length: 'number',
   tokens_withheld: 'number',
   dropped_categories: 'number',
+  // Cost kill switch. Billing figures carry no PII: they are project-level
+  // aggregates in the billing account's currency, published by Google's own
+  // budget notifier rather than derived from any request.
+  cost_amount: 'number',
+  budget_amount: 'number',
+  budget_ratio: 'number',
   finding_kinds: 'category_list',
   ok: 'boolean',
+  already_applied: 'boolean',
   leak: 'boolean',
   stale: 'boolean',
   categories: 'category_list',

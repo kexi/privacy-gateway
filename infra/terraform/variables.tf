@@ -142,3 +142,46 @@ variable "enable_verify_job" {
   type        = bool
   default     = true
 }
+
+# --- cost kill switch --------------------------------------------------------
+
+variable "kill_switch_enabled" {
+  description = <<-EOT
+    Declare the automatic cost kill switch (budget, Pub/Sub topic, push
+    subscription and the kill-switch Cloud Run service).
+
+    On by default. §5 of docs/DEPLOY.md puts a forgotten GPU at roughly $39/day,
+    which is the single realistic way this project loses money; an automatic
+    stop is worth more than the few cents the topic and the scale-to-zero
+    service cost at rest.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "billing_account" {
+  description = <<-EOT
+    Billing account the budget is created under, in `billingAccounts/XXXXXX-...`
+    form.
+
+    Creating a budget requires roles/billing.costsManager (or
+    roles/billing.admin) **on the billing account**, which is a different
+    resource from the project: project Owner is not sufficient. See the
+    "Automatic cost kill switch" section of docs/DEPLOY.md.
+  EOT
+  type        = string
+  default     = "billingAccounts/0136A5-03F510-FB783D"
+}
+
+variable "budget_usd" {
+  description = "Monthly budget in USD. Reaching 100% of it trips the kill switch."
+  type        = number
+  default     = 50
+
+  validation {
+    # A zero or negative budget would be tripped by the first cent of spend, and
+    # the ratio the service logs would divide by zero.
+    condition     = var.budget_usd > 0
+    error_message = "budget_usd must be greater than zero."
+  }
+}

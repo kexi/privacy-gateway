@@ -13,8 +13,16 @@
 
 import { z } from 'zod';
 
-/** The agent identity a process reports in every log line and span. */
-export const AgentNameSchema = z.enum(['gateway', 'core', 'synthesis']);
+/**
+ * The service identity a process reports in every log line and span.
+ *
+ * `kill-switch` is not a member of the reasoning fleet — it never sees a
+ * prompt, an answer or a vault entry. It is listed here because it emits the
+ * same structured logs as the agents do, and a separate enum would mean a
+ * second logger with a second allowlist: two places for a field to leak from
+ * instead of one.
+ */
+export const AgentNameSchema = z.enum(['gateway', 'core', 'synthesis', 'kill-switch']);
 export type AgentName = z.infer<typeof AgentNameSchema>;
 
 /** Model verified to exist on Vertex AI. */

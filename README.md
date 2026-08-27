@@ -84,6 +84,7 @@ packages/common/   # tokenizer, vault, OKF, guard, logging, telemetry, zod schem
 agents/gateway/    # ADK agent + HTTP entry + serves web/dist
 agents/core/       # ADK agent (Gemini) + A2A server
 agents/synthesis/  # ADK agent + A2A server + HTTP routes
+services/kill-switch/  # cost kill switch: budget notification -> stop spending
 clients/python/    # pgw.py — single-file PEP 723 client, the language-agnostic example
 serving/gemma/     # Ollama Dockerfile for Cloud Run GPU
 web/               # demo UI (masked vs final, side by side) + Playwright specs
@@ -91,8 +92,10 @@ knowledge/         # OKF v0.2 bundle: policy, attested computation, executor ski
 infra/terraform/   # Terraform: Cloud Run, IAM, Firestore TTL, Artifact Registry
 ```
 
-The workspace packages are `web`, `packages/common`, `agents/core`, `agents/gateway` and
-`agents/synthesis`.
+The workspace packages are `web`, `packages/common`, `agents/core`, `agents/gateway`,
+`agents/synthesis` and `services/kill-switch`. The kill switch sits under `services/` rather
+than `agents/` because it is not a member of the reasoning fleet: it never sees a prompt, an
+answer or a vault entry.
 
 Relative imports carry the **`.ts` extension** (`import { x } from './x.ts'`), enabled by
 `allowImportingTsExtensions` + `rewriteRelativeImportExtensions`; tsc rewrites them to `.js`
@@ -442,7 +445,7 @@ are built separately by Cloud Build. `just` remains the only command surface.
 ```bash
 just tf-bootstrap                 # create the GCS state bucket (once; the only gcloud-made resource)
 just tf-init                      # initialise Terraform against that bucket
-just build                        # build and push the four images with Cloud Build
+just build                        # build and push the five images with Cloud Build
 just tf-plan gpu_enabled=false    # review the changes
 just tf-apply gpu_enabled=false   # apply everything except the GPU service
 just tf-apply                     # add gemma-serving once the L4 quota is granted
@@ -455,6 +458,25 @@ can be deployed while the Cloud Run L4 quota request is still pending.
 
 Core's service account deliberately has **no** Firestore role; the Gemma serving endpoint
 uses internal-only ingress; service-to-service calls authenticate with ID tokens.
+
+### Cost, and the automatic kill switch
+
+Idle costs **$0** — every service scales to zero. With everything warm the fleet runs about
+**$1.64/hour**, essentially all of it the GPU-backed `gemma-serving`. The one realistic way
+to lose money here is forgetting the teardown: left up for a day, that is **~$39**.
+
+So a forgotten teardown is handled automatically rather than by an email nobody reads at 3am.
+A **$50 Cloud Billing budget** publishes every threshold crossing (50% / 80% / 100%) to a
+Pub/Sub topic, whose push subscription calls a small `kill-switch` Cloud Run service. At 100%
+it removes the `allUsers` invoker binding from `gateway-agent` and forces `gemma-serving` to
+zero max instances — both idempotent, so Pub/Sub redelivery is harmless. Below 100% it only
+logs. Restore with `just restore-after-kill` once the underlying spend is fixed.
+
+Note that a cost gate deliberately does **not** fail closed the way this fleet's disclosure
+gates do: a notification it cannot parse is logged and ignored, because taking the demo
+offline over a malformed message would itself be the outage. Creating the budget needs
+`roles/billing.costsManager` **on the billing account** (project Owner is not enough); see
+[docs/DEPLOY.md](docs/DEPLOY.md) § "Automatic cost kill switch".
 
 ## Environment variables
 

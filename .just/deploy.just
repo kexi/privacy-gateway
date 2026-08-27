@@ -117,7 +117,7 @@ build *services:
     ar_path="{{ region }}-docker.pkg.dev/{{ project_id }}/{{ ar_repo }}"
     targets=({{ services }})
     if [ ${#targets[@]} -eq 0 ]; then
-      targets=(gemma core gateway synthesis)
+      targets=(gemma core gateway synthesis kill-switch)
     fi
     # Why a temp file rather than --config=/dev/stdin with an inline heredoc:
     # just re-indents recipe bodies, which would corrupt the YAML.
@@ -125,9 +125,14 @@ build *services:
     trap 'rm -f "$cfg"' EXIT
     for t in "${targets[@]}"; do
       image="${ar_path}/${t}:{{ image_tag }}"
+      # `dir` is the Cloud Build context; `dockerfile` is the path within it.
+      # The kill switch lives under services/ rather than agents/ because it is
+      # not a member of the reasoning fleet: it never sees a prompt or a vault
+      # entry, it only stops the fleet from spending money.
       case "$t" in
         gemma) dir="serving/gemma" ;;
-        core|gateway|synthesis) dir="agents/${t}" ;;
+        core|gateway|synthesis) dir="agents/${t}"; dockerfile="agents/${t}/Dockerfile" ;;
+        kill-switch) dir="services/kill-switch"; dockerfile="services/kill-switch/Dockerfile" ;;
         *) echo "unknown target: $t" >&2; exit 1 ;;
       esac
       echo "==> building ${t} -> ${image}"
@@ -148,14 +153,14 @@ build *services:
           '  diskSizeGb: 100' \
           'timeout: 3600s' > "$cfg"
       else
-        # The agents share packages/common (and the gateway also builds web/),
-        # so the repository root is the build context and only the Dockerfile
-        # path differs.
+        # The agents and the kill switch share packages/common (and the gateway
+        # also builds web/), so the repository root is the build context and
+        # only the Dockerfile path differs.
         dir="."
         printf '%s\n' \
           'steps:' \
           '  - name: gcr.io/cloud-builders/docker' \
-          "    args: ['build', '-f', 'agents/${t}/Dockerfile', '-t', '${image}', '.']" \
+          "    args: ['build', '-f', '${dockerfile}', '-t', '${image}', '.']" \
           'images:' \
           "  - '${image}'" \
           'options:' \
@@ -269,3 +274,68 @@ quota-request:
       --project="{{ project_id }}" \
       --email="${EMAIL}" \
       --justification="${JUSTIFICATION}"
+
+# --- cost kill switch --------------------------------------------------------
+# An automatic stop for the one cost that can actually hurt: a gemma-serving
+# instance left running. See "Automatic cost kill switch" in docs/DEPLOY.md.
+
+# Exercise the kill-switch handler against a synthetic over-budget notification
+kill-switch-test mode="local":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Two modes, because they prove different things.
+    #
+    #   local   (default) runs the vitest suite. It proves the decision logic:
+    #           the >= boundary, idempotency under redelivery, and that a
+    #           malformed message changes nothing. Touches no cloud resource.
+    #
+    #   publish sends a real message through the real topic, which means the
+    #           real push subscription, the real OIDC token and the real
+    #           service. It therefore REALLY TRIPS THE KILL SWITCH: the gateway
+    #           loses its public invoker binding and gemma-serving is capped at
+    #           zero. This is state-changing and needs maintainer approval.
+    #           Recover with `just restore-after-kill`.
+    case "{{ mode }}" in
+      local)
+        pnpm --filter @privacy-gateway/kill-switch test
+        ;;
+      publish)
+        echo "!! This publishes a REAL over-budget notification to billing-kill-switch."
+        echo "!! The fleet will be taken offline. Recover with 'just restore-after-kill'."
+        read -r -p "Type 'kill' to continue: " confirm
+        [ "$confirm" = "kill" ] || { echo "aborted"; exit 1; }
+        # Shaped like a real budget notification: the service compares
+        # costAmount against budgetAmount and ignores which threshold fired.
+        gcloud pubsub topics publish billing-kill-switch \
+          --project="{{ project_id }}" \
+          --message='{"budgetDisplayName":"agentic-fleet-kill-switch","costAmount":60,"budgetAmount":50,"currencyCode":"USD","alertThresholdExceeded":1.0}'
+        echo "published; watch 'just logs-kill-switch' for killswitch.triggered"
+        ;;
+      *)
+        echo "unknown mode: {{ mode }} (expected 'local' or 'publish')" >&2
+        exit 1
+        ;;
+    esac
+
+# Show what the kill switch has decided recently (triggered, under-budget, failures)
+logs-kill-switch:
+    gcloud logging read \
+      'resource.type="cloud_run_revision" resource.labels.service_name="kill-switch"' \
+      --project "{{ project_id }}" --freshness=24h --order=desc --limit=50 --format=json \
+      | jq -c '.[] | {t:.timestamp, sev:.severity, ev:.jsonPayload.event, cost:.jsonPayload.cost_amount, budget:.jsonPayload.budget_amount, ratio:.jsonPayload.budget_ratio}'
+
+# Undo a kill-switch trip: restore public access and the GPU max instances
+restore-after-kill *vars:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Terraform is the restore path, not a pair of gcloud commands, because
+    # Terraform already holds the desired state the switch deviated from: the
+    # allUsers invoker binding (iam.tf) and max_instance_count = 1 (cloudrun.tf).
+    # An apply re-asserts both and, unlike a hand-written gcloud, cannot restore
+    # one and forget the other.
+    #
+    # Deliberately not run by agents: it puts a public endpoint and a GPU back
+    # online, so a human reads the plan. Review it, then approve interactively.
+    echo "This re-opens the public gateway and restores gemma-serving's max instances."
+    echo "Fix the underlying spend first, or the switch will trip again."
+    just tf-apply {{ vars }}

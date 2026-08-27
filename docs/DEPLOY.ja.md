@@ -506,6 +506,95 @@ def a2a_headers(target_url: str) -> dict[str, str]:
 
 **GPU の消し忘れが唯一の事故要因。** 作業を終えたら必ず §10 のテアダウンを実行すること。
 Gemini（Vertex AI）はトークン課金で、デモ規模なら数十セント程度。
+そして、それでも消し忘れた場合の自動的な歯止めが次のキルスイッチ。
+
+### 自動コストキルスイッチ
+
+テアダウンの忘れは人間の失敗であり、深夜 3 時のメール通知では直らない。だから予算は
+**通知ではなくアクション**を駆動する:
+
+```
+Cloud Billing budget ($50)
+        │  しきい値超過のたび（50% / 80% / 100%）
+        ▼
+Pub/Sub topic  billing-kill-switch
+        │  push subscription + OIDC token (sa-kill-switch-push)
+        ▼
+Cloud Run service  kill-switch
+        │  costAmount >= budgetAmount ?
+        ├── no  → killswitch.under_budget をログに出すだけ
+        └── yes → gateway-agent から allUsers run.invoker を削除
+                  gemma-serving の max_instance_count を 0 にする
+```
+
+宣言は `infra/terraform/killswitch.tf`、ハンドラは `services/kill-switch/`。
+
+**判定方法。** どのしきい値ルールが発火したかを信用せず、通知に入っている `costAmount` と
+`budgetAmount` を直接比較する。数値ひとつ対数値ひとつなので、予算のルール構成が変わっても
+判定は変わらない。比較は `>=`、つまり予算にちょうど達した時点で使い切りとみなす。
+50% と 80% のルールは支出の推移を早めに Cloud Logging に出すためのもので、
+実際にスイッチを落とすのは 100% 超過だけ。
+
+**なぜ fail closed にしないか。** このフリートの開示ゲートはすべて、判断できないときは
+拒否する。データを推測で出すのは取り返しがつかないからだ。コストゲートは逆で、壊れた通知は
+ERROR でログに残し HTTP 400 を返して**何も変更しない**。不正なメッセージが 1 通届いただけで
+デモを止めるほうが、よほど障害そのものだから。
+
+**冪等性。** Pub/Sub は再配信する。どちらの操作も、目的の状態に達したあとは no-op になる
+（すでに存在しないメンバーの削除、すでに 0 の上限設定）ので、再配信されても API 読み取り
+1 回で何も変わらない。重複排除ストアは意図的に持たない — 「処理済み」と答えるキャッシュは、
+フリートが金を燃やしているまさにその瞬間に間違いうるものがひとつ増えるだけ。
+操作が**失敗**した場合は 500 を返して Pub/Sub に再配信させる。失敗した側だけがやり直され、
+成功済みの側は no-op になる。
+
+**必要なロール — プロジェクトではなく請求先アカウントに対して。**
+
+`google_billing_budget` の作成には `billingAccounts/0136A5-03F510-FB783D` に対する
+**`roles/billing.costsManager`**（または `roles/billing.admin`）が必要。請求先アカウントは
+Cloud Billing API 上の別リソースなので、**プロジェクトの Owner では権限が付かない**。
+未付与だと `terraform apply` がこのリソースだけ 403 で失敗する。
+
+```bash
+# 現在の権限を確認
+gcloud billing accounts get-iam-policy 0136A5-03F510-FB783D
+
+# 未付与なら付与する
+gcloud billing accounts add-iam-policy-binding 0136A5-03F510-FB783D \
+  --member="user:YOU@example.com" --role="roles/billing.costsManager"
+```
+
+ロールを付与できない場合は `just tf-apply kill_switch_enabled=false` で残りをデプロイする。
+budget / topic / subscription / kill-switch サービス以外はすべて通常どおり適用される。
+
+**キルスイッチ自身の権限。** `sa-kill-switch` が持つ `roles/run.admin` は
+**`gateway-agent` と `gemma-serving` の 2 サービスのみ**へのバインディングで、
+プロジェクト全体には決して付けない。公開 push エンドポイントから到達しうる ID が壊せるのは、
+それが止めるために存在する 2 サービスだけであるべきだから。Firestore ロールも
+Vertex AI ロールも持たない。push エンドポイント自体にも `allUsers` バインディングはなく、
+`sa-kill-switch-push` だけが invoke できる。匿名 POST はハンドラに届く前に Cloud Run が弾く。
+
+**テスト方法。**
+
+```bash
+just kill-switch-test            # vitest: しきい値の境界・冪等性・不正入力
+just logs-kill-switch            # 直近 24h にスイッチが何を判断したか
+```
+
+`just kill-switch-test publish` は実際の topic に本物の超過メッセージを送る。これは
+**本当にスイッチを落としてフリートをオフラインにする** — 状態変更を伴い、メンテナの承認が
+必要で、実行前に確認プロンプトが出る。配線をエンドツーエンドで確認するときだけ使う。
+
+**発動後の復旧。**
+
+```bash
+just restore-after-kill          # terraform apply: allUsers 再付与 + max instances 復元
+```
+
+`gcloud` を 2 回叩くのではなく Terraform を復旧経路にしているのは、スイッチが逸脱させた
+「あるべき状態」を Terraform がすでに保持しているから — `allUsers` invoker バインディング
+（`iam.tf`）と `max_instance_count = 1`（`cloudrun.tf`）。apply は両方を再表明するので、
+手書きコマンドと違って片方だけ直して片方を忘れることがない。**先に支出の原因を潰すこと。**
+さもないと次の通知でまた落ちる。このレシピはエージェントが実行してはいけない。
 
 ---
 

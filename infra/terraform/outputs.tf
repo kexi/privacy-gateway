@@ -28,6 +28,16 @@ output "deterministic_urls" {
   value       = local.run_url
 }
 
+output "kill_switch_url" {
+  description = "Cost kill switch push endpoint. Null when kill_switch_enabled is false."
+  value       = var.kill_switch_enabled ? google_cloud_run_v2_service.kill_switch[0].uri : null
+}
+
+output "kill_switch_topic" {
+  description = "Pub/Sub topic the billing budget publishes to. Null when kill_switch_enabled is false."
+  value       = var.kill_switch_enabled ? google_pubsub_topic.kill_switch[0].id : null
+}
+
 output "service_account_emails" {
   description = "Service account emails, keyed by account id."
   value       = { for id, sa in google_service_account.agents : id => sa.email }
