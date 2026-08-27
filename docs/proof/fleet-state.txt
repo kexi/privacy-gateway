@@ -1,0 +1,13 @@
+# Deployed fleet, project all-thinkgs / us-central1, captured 2026-08-28
+
+NAME             INGRESS   MIN  MAX  SERVICE_ACCOUNT
+gateway-agent all 0 3 sa-gateway@all-thinkgs.iam.gserviceaccount.com
+core-agent internal 0 3 sa-core@all-thinkgs.iam.gserviceaccount.com
+synthesis-agent internal 0 3 sa-synthesis@all-thinkgs.iam.gserviceaccount.com
+gemma-serving internal 0 1 sa-gemma@all-thinkgs.iam.gserviceaccount.com
+
+# gemma-serving GPU
+cpu=20;memory=80Gi;nvidia.com/gpu=1
+
+# min_instances=0 on every service: the fleet costs nothing while idle.
+# Cloud Run job 'verify-auth' is idle (bills only per execution).

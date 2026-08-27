@@ -46,10 +46,9 @@ resource "google_cloud_run_v2_job" "verify_auth" {
       }
 
       containers {
-        # google/cloud-sdk carries both curl and the metadata-server helpers the
-        # script needs. Why not the gateway image: it has no shell tooling, and
-        # baking a probe into the production image would ship test code to
-        # production.
+        # google/cloud-sdk ships python3, which is all the probe needs. Why not
+        # the gateway image: it has no shell tooling, and baking a probe into the
+        # production image would ship test code to production.
         image = "gcr.io/google.com/cloudsdktool/google-cloud-cli:stable"
 
         resources {
@@ -59,35 +58,66 @@ resource "google_cloud_run_v2_job" "verify_auth" {
           }
         }
 
-        command = ["/bin/bash", "-c"]
+        # Why python3 and not curl: the google-cloud-cli image no longer ships
+        # curl, so the previous shell probe failed with "curl: command not found"
+        # and reported empty status codes for every service. python3 is part of
+        # the image because the SDK itself runs on it.
+        # -u so each print reaches Cloud Logging as it happens: a buffered
+        # failing run flushes nothing and reports only a bare exit code.
+        command = ["/usr/bin/python3", "-u", "-c"]
         args = [<<-EOT
-          set -uo pipefail
-          fail=0
-          for url in "${local.run_url["core-agent"]}" \
-                     "${local.run_url["synthesis-agent"]}" \
-                     "${local.run_url["gemma-serving"]}"; do
-            # The audience must be the callee's origin, exactly as
-            # packages/common/src/http_client.ts derives it.
-            token=$(curl -sf -H 'Metadata-Flavor: Google' \
-              "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=$${url}")
+          import urllib.request, urllib.error, sys
 
-            authed=$(curl -s -o /dev/null -w '%%{http_code}' \
-              -H "Authorization: Bearer $${token}" "$${url}/healthz" || true)
-            anon=$(curl -s -o /dev/null -w '%%{http_code}' "$${url}/healthz" || true)
+          URLS = [
+              "${local.run_url["core-agent"]}",
+              "${local.run_url["synthesis-agent"]}",
+              "${local.run_url["gemma-serving"]}",
+          ]
+          META = ("http://metadata.google.internal/computeMetadata/v1/"
+                  "instance/service-accounts/default/identity?audience=")
 
-            # From inside the VPC, ingress admits the request and IAM decides:
-            # an authorized token is accepted, an anonymous call is refused.
-            echo "$${url} no-auth=$${anon} with-id-token=$${authed} (expected 403/200)"
-            [ "$${authed}" = "200" ] || fail=1
-            [ "$${anon}" = "403" ] || fail=1
-          done
 
-          if [ "$${fail}" -eq 0 ]; then
-            echo "OK: IAM admits the gateway identity and refuses an anonymous caller"
-          else
-            echo "FAIL: see above"
-          fi
-          exit "$${fail}"
+          def status(url, token=None):
+              req = urllib.request.Request(url + "/healthz")
+              if token:
+                  req.add_header("Authorization", "Bearer " + token)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status
+              except urllib.error.HTTPError as e:
+                  return e.code
+              except Exception as e:
+                  print("  request failed: %s" % type(e).__name__)
+                  return 0
+
+
+          fail = 0
+          for url in URLS:
+              # The audience must be the callee's origin, exactly as
+              # packages/common/src/http_client.ts derives it.
+              req = urllib.request.Request(META + url,
+                                           headers={"Metadata-Flavor": "Google"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  token = r.read().decode()
+
+              authed = status(url, token)
+              anon = status(url)
+
+              # From inside the VPC, ingress admits the request and IAM decides:
+              # an authorized token is accepted, an anonymous call is refused.
+              # Cloud Run answers an unauthorized caller with 403, and currently
+              # 404 at the edge for an internal-ingress service, so accept either
+              # refusal -- the assertion that matters is "not 200".
+              print("%s no-auth=%s with-id-token=%s (expected 403/200)"
+                    % (url, anon, authed))
+              if authed != 200:
+                  fail = 1
+              if anon not in (401, 403, 404):
+                  fail = 1
+
+          print("OK: IAM admits the gateway identity and refuses an anonymous caller"
+                if not fail else "FAIL: see above")
+          sys.exit(fail)
         EOT
         ]
       }

@@ -1,0 +1,56 @@
+{
+  "request_id": "01a043e6-afe3-7552-8c20-1f0b7f0a1831",
+  "trace_id": "8a3a4d14714ea9699a77fe46466b1e36",
+  "masked_prompt": "Draft a short polite status update for customer ⟦PERSON_1⟧ (⟦EMAIL_1⟧, ⟦PHONE_1⟧) telling him his order shipped.",
+  "okf": "---\ntype: Gateway Answer\ntitle: Gateway answer for request 01a043e6-afe3-7552-8c20-1f0b7f0a1831\ndescription: Masked evidence for one gateway exchange. The rehydrated answer is returned to the caller in the response body only and is not stored here.\ntags:\n  - gateway\n  - pii\n  - attested\nrequest_id: 01a043e6-afe3-7552-8c20-1f0b7f0a1831\nstatus: stable\ngenerated:\n  by: synthesis_agent/0.1.0\n  at: 2026-08-27T15:46:34Z\nstale_after: 2026-08-27T16:46:28Z\nsources:\n  - id: masked-prompt\n    resource: /v1/requests/01a043e6-afe3-7552-8c20-1f0b7f0a1831/masked-prompt.md\n    title: Masked prompt sent to the core agent\n    author: gateway_agent/tokenizer\n    last_modified: 2026-08-27T15:46:34Z\n  - id: core-response\n    resource: /v1/requests/01a043e6-afe3-7552-8c20-1f0b7f0a1831/core-response.md\n    title: Tokenized response returned by the core agent\n    author: core_agent/gemini-2.5-flash\n    last_modified: 2026-08-27T15:46:34Z\n  - id: pii-policy\n    resource: /policies/pii-masking.md\n    title: PII masking policy\n    author: human:kei\nattestation:\n  computation: /computations/leak-check.md\n  computation_sha256: efa7e03c46f5158efed2641a4988cb7f49a32792a67d563826be070946d6cdbc\n  attester_sha256: 8b427a667e6426be7061777d8c7952e57a816b8fbcd0410fdafea2e737529ce9\n  masked_prompt_sha256: ebb7229d566b1e6fcefeab0d7f3ab44cfe632d9c57af528fcaf9e282bb161ea9\n  core_response_sha256: 62845b6b985114823052ccb32550ad7e155e06d7eaabb08031260a7b647f380e\n  verdict: pass\n  checked_at: 2026-08-27T15:46:33Z\n  request_id: 01a043e6-afe3-7552-8c20-1f0b7f0a1831\n  trace_id: 8a3a4d14714ea9699a77fe46466b1e36\ntrace_id: 8a3a4d14714ea9699a77fe46466b1e36\nverified:\n  - by: process:leak-check@8b427a667e64\n    at: 2026-08-27T15:46:33Z\n---\n\n# Answer (masked)\n\nSubject: Your Order Has Shipped!\n\nDear ⟦PERSON_1⟧,\n\nWe're pleased to let you know that your recent order has shipped and is on its way! You will receive a separate email with tracking information shortly.\n\nThank you for your business.\n\nSincerely,\n[Your Company Name]\n\nCustomer details:\nEmail: ⟦EMAIL_1⟧\nPhone: ⟦PHONE_1⟧\n\nThe rehydrated form of this answer was returned to the caller in the API response and is\ndeliberately not stored. Only the masked text above, the hashes below, and the category\ncounts are retained.\n\n# Attestation\n\nLeak-policy check passed. It confirms only that the core agent's tokenized\nresponse carried no raw identifier of its own; it is not a factual validation of the\nanswer. The verdict was decided by the deterministic attester named in\n`attestation.attester_sha256`, following\n[the leak-check computation](/computations/leak-check.md), over the masked prompt and\ncore response whose digests are recorded in the `attestation` block.\n\nFindings:\n\n- (no findings)\n\nReplay it with `just verify-answer 01a043e6-afe3-7552-8c20-1f0b7f0a1831`.\n\nThe answer was produced from a masked prompt in which every detected identifier was\nreplaced by an opaque placeholder before it left the trust boundary.[^masked-prompt] The\ncore agent's tokenized response is the input the check ran over.[^core-response] Masking\nfollows the repository PII masking policy.[^pii-policy]\n\n[^masked-prompt]: Masked prompt sent to the core agent\n[^core-response]: Tokenized response returned by the core agent\n[^pii-policy]: PII masking policy\n",
+  "trust_tier": "machine-confirmed",
+  "status": "stable",
+  "dimensions": {
+    "policy_verdict": "pass",
+    "document_status": "stable",
+    "freshness": "fresh",
+    "review_identity": "none"
+  },
+  "attestation": {
+    "ok": true,
+    "reason": null,
+    "findings": [],
+    "details": {
+      "request_id": "01a043e6-afe3-7552-8c20-1f0b7f0a1831",
+      "response_hash": "62845b6b985114823052ccb32550ad7e155e06d7eaabb08031260a7b647f380e",
+      "masked_prompt_hash": "ebb7229d566b1e6fcefeab0d7f3ab44cfe632d9c57af528fcaf9e282bb161ea9",
+      "prompt_bound": true
+    },
+    "judge": {
+      "leak": false,
+      "categories": []
+    }
+  },
+  "consistency": {
+    "ok": true,
+    "invented_tokens": [],
+    "known_tokens": [
+      "⟦EMAIL_1⟧",
+      "⟦PERSON_1⟧",
+      "⟦PHONE_1⟧"
+    ],
+    "used_tokens": [
+      "⟦PERSON_1⟧",
+      "⟦EMAIL_1⟧",
+      "⟦PHONE_1⟧"
+    ],
+    "reason": null
+  },
+  "stats": {
+    "masked_count": 3,
+    "counts_by_category": {
+      "PERSON": 1,
+      "EMAIL": 1,
+      "PHONE": 1
+    },
+    "unstructured_spans": 1,
+    "vault_expires_at": "2026-08-27T16:46:28Z",
+    "vault_generation": 1,
+    "core_actor": "core_agent/gemini-2.5-flash"
+  }
+}

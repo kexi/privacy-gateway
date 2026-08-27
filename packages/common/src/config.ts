@@ -17,7 +17,11 @@ import { z } from 'zod';
 export const AgentNameSchema = z.enum(['gateway', 'core', 'synthesis']);
 export type AgentName = z.infer<typeof AgentNameSchema>;
 
-/** Model verified to exist on Vertex AI. */
+/**
+ * gemini-3.5-flash is published only on the global Vertex endpoint, so Core
+ * runs with GOOGLE_CLOUD_LOCATION=global (probed live 2026-08-28; the
+ * regional us-central1 endpoint 404s for it, and no 3.6/3.7 id exists yet).
+ */
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 /** Ollama tag pulled by `just pull-gemma`. */
 export const DEFAULT_GEMMA_MODEL = 'gemma3:12b';

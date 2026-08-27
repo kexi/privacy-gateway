@@ -37,6 +37,11 @@ locals {
     ANSWER_COLLECTION     = var.answers_collection
     GEMMA_MODEL           = var.gemma_model
     OTEL_ENABLED          = var.otel_enabled ? "1" : "0"
+    # Shared, not Core-only: the Gateway derives the OKF `core_actor`
+    # provenance string from it (`core_agent/${GEMINI_MODEL}`). Why not scope it
+    # to core-agent: the Gateway then fell back to its compiled-in default and
+    # every stored OKF document named a model Core had not actually called.
+    GEMINI_MODEL = var.gemini_model
   }
 
   # The three CPU agent services. They differ only in the fields below, so
@@ -56,8 +61,13 @@ locals {
       vpc_egress = true
       env = {
         # ADK takes the Vertex AI path rather than the AI Studio one.
+        # GEMINI_MODEL comes from common_env, which every agent receives.
         GOOGLE_GENAI_USE_VERTEXAI = "1"
-        GEMINI_MODEL              = var.gemini_model
+        # gemini-3.5-flash is published only on the global Vertex endpoint;
+        # the us-central1 regional endpoint 404s (probed 2026-08-28). Only the
+        # GenAI SDK reads this, so overriding it here does not move Firestore
+        # or anything else out of var.region.
+        GOOGLE_CLOUD_LOCATION = "global"
       }
     }
     "synthesis-agent" = {
