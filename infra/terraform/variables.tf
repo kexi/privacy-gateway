@@ -80,9 +80,12 @@ variable "vault_ttl_field" {
 }
 
 variable "gpu_type" {
+  # Why not nvidia-l4: Google declined our L4 quota request (regional
+  # exhaustion, 2026-08) and pointed at RTX PRO 6000, which also ships with
+  # 1000 milliGPU auto-granted per region, so no quota wait.
   description = "Cloud Run GPU accelerator attached to gemma-serving."
   type        = string
-  default     = "nvidia-l4"
+  default     = "nvidia-rtx-pro-6000"
 }
 
 variable "vpc_network" {

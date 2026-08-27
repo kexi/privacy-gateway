@@ -48,10 +48,10 @@ resource "google_cloud_run_v2_service" "gemma" {
     node_selector {
       accelerator = var.gpu_type
     }
-    # Dropping zonal redundancy cuts the L4 rate by roughly 36%
-    # (0.0002909 -> 0.0001867 USD/GPU-sec). Unit price beats redundancy for a
-    # single-instance demo service, and the quota requested
-    # (NvidiaL4GpuAllocNoZonalRedundancyPerProjectRegion) is the matching one.
+    # Dropping zonal redundancy cuts the GPU rate by roughly 36%
+    # (RTX PRO 6000: 0.00056913 -> 0.00036522 USD/GPU-sec). Unit price beats
+    # redundancy for a single-instance demo service, and the auto-granted
+    # no-zonal-redundancy milliGPU quota is the matching one.
     gpu_zonal_redundancy_disabled = true
     execution_environment         = "EXECUTION_ENVIRONMENT_GEN2"
 
@@ -64,8 +64,10 @@ resource "google_cloud_run_v2_service" "gemma" {
 
       resources {
         limits = {
-          cpu              = "8"
-          memory           = "32Gi"
+          # nvidia-rtx-pro-6000 mandates at least 20 CPU / 80 GiB per
+          # https://docs.cloud.google.com/run/docs/configuring/services/gpu
+          cpu              = "20"
+          memory           = "80Gi"
           "nvidia.com/gpu" = "1"
         }
         # Keep the CPU running outside requests so the model stays resident in
