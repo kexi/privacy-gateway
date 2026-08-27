@@ -20,14 +20,15 @@ answer with an audit document.
 Resolve the base URL: locally `http://localhost:8081` (`just dev`); deployed, run
 `just urls` in the repo, or ask the maintainer. All bodies are JSON.
 
-| Call | Meaning |
-|---|---|
-| `POST /v1/ask` `{"text": "..."}` | The whole flow. Returns `answer` (rehydrated, ephemeral), `masked_prompt`, `okf` (audit document), `trust_tier`, `status`, `attestation`, `request_id`, `trace_id`. |
-| `GET /v1/requests/<request_id>` | Stored masked evidence (OKF markdown). Never contains raw PII. |
-| `GET /v1/requests/<request_id>/masked-prompt.md` / `core-response.md` | The two masked source artifacts the OKF document cites. |
-| `GET /healthz` | Liveness. |
+| Call                                                                  | Meaning                                                                                                                                                             |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/ask` `{"text": "..."}`                                      | The whole flow. Returns `answer` (rehydrated, ephemeral), `masked_prompt`, `okf` (audit document), `trust_tier`, `status`, `attestation`, `request_id`, `trace_id`. |
+| `GET /v1/requests/<request_id>`                                       | Stored masked evidence (OKF markdown). Never contains raw PII.                                                                                                      |
+| `GET /v1/requests/<request_id>/masked-prompt.md` / `core-response.md` | The two masked source artifacts the OKF document cites.                                                                                                             |
+| `GET /healthz`                                                        | Liveness.                                                                                                                                                           |
 
 Notes:
+
 - `session_id` is not accepted; the server mints one id per request.
 - The literal characters `⟦` / `⟦` in input are rejected (400) — never construct
   placeholder syntax yourself.

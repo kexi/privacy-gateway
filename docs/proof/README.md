@@ -10,8 +10,8 @@ counts survive.
 
 ## The proof run
 
-| Field       | Value                                  |
-| ----------- | -------------------------------------- |
+| Field        | Value                                  |
+| ------------ | -------------------------------------- |
 | `request_id` | `01a043e6-afe3-7552-8c20-1f0b7f0a1831` |
 | `trace_id`   | `8a3a4d14714ea9699a77fe46466b1e36`     |
 | `trust_tier` | `machine-confirmed`                    |
@@ -30,14 +30,14 @@ Masked before it left the trust boundary:
 
 ## Files
 
-| File                    | What it shows                                                                                   |
-| ----------------------- | ----------------------------------------------------------------------------------------------- |
-| `gateway-answer.json`   | The full API response with `answer` removed. Masked prompt, attestation, consistency, stats.    |
-| `gateway-answer.okf.md` | The OKF v0.2 `Gateway Answer` document, whose body holds the **masked** answer.                 |
-| `logs-request.jsonl`    | Structured logs for the one `request_id`, showing all three agents on the same id.              |
-| `trace-spans.json`      | The Cloud Trace trace: 24 spans across gateway → core → synthesis.                              |
-| `sa-core-iam.txt`       | Core's service account roles — **no Firestore role**.                                           |
-| `fleet-state.txt`       | Ingress, min/max instances, service accounts, and the attached GPU.                             |
+| File                    | What it shows                                                                                |
+| ----------------------- | -------------------------------------------------------------------------------------------- |
+| `gateway-answer.json`   | The full API response with `answer` removed. Masked prompt, attestation, consistency, stats. |
+| `gateway-answer.okf.md` | The OKF v0.2 `Gateway Answer` document, whose body holds the **masked** answer.              |
+| `logs-request.jsonl`    | Structured logs for the one `request_id`, showing all three agents on the same id.           |
+| `trace-spans.json`      | The Cloud Trace trace: 24 spans across gateway → core → synthesis.                           |
+| `sa-core-iam.txt`       | Core's service account roles — **no Firestore role**.                                        |
+| `fleet-state.txt`       | Ingress, min/max instances, service accounts, and the attached GPU.                          |
 
 ## What the evidence establishes
 

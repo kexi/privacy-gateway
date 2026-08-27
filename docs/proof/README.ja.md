@@ -10,13 +10,13 @@
 
 ## 証跡となるリクエスト
 
-| フィールド    | 値                                     |
-| ------------ | -------------------------------------- |
-| `request_id` | `01a043e6-afe3-7552-8c20-1f0b7f0a1831` |
-| `trace_id`   | `8a3a4d14714ea9699a77fe46466b1e36`     |
-| `trust_tier` | `machine-confirmed`                    |
-| `status`     | `stable`                               |
-| レイテンシ    | エンドツーエンド 8.35 秒（Gemma ウォーム時） |
+| フィールド   | 値                                           |
+| ------------ | -------------------------------------------- |
+| `request_id` | `01a043e6-afe3-7552-8c20-1f0b7f0a1831`       |
+| `trace_id`   | `8a3a4d14714ea9699a77fe46466b1e36`           |
+| `trust_tier` | `machine-confirmed`                          |
+| `status`     | `stable`                                     |
+| レイテンシ   | エンドツーエンド 8.35 秒（Gemma ウォーム時） |
 
 公開 Gateway に送信したリクエスト:
 
@@ -30,14 +30,14 @@
 
 ## ファイル
 
-| ファイル                 | 内容                                                                       |
-| ----------------------- | -------------------------------------------------------------------------- |
+| ファイル                | 内容                                                                                          |
+| ----------------------- | --------------------------------------------------------------------------------------------- |
 | `gateway-answer.json`   | `answer` を除去した API レスポンス全体。マスク済みプロンプト、attestation、consistency、stats |
-| `gateway-answer.okf.md` | OKF v0.2 の `Gateway Answer` ドキュメント。本文は **マスク済み** の回答     |
-| `logs-request.jsonl`    | 単一の `request_id` に対する構造化ログ。3 エージェントすべてが同じ id を持つ |
-| `trace-spans.json`      | Cloud Trace のトレース。gateway → core → synthesis にまたがる 24 スパン      |
-| `sa-core-iam.txt`       | Core のサービスアカウントのロール一覧 — **Firestore ロールなし**            |
-| `fleet-state.txt`       | Ingress、最小/最大インスタンス数、サービスアカウント、接続された GPU         |
+| `gateway-answer.okf.md` | OKF v0.2 の `Gateway Answer` ドキュメント。本文は **マスク済み** の回答                       |
+| `logs-request.jsonl`    | 単一の `request_id` に対する構造化ログ。3 エージェントすべてが同じ id を持つ                  |
+| `trace-spans.json`      | Cloud Trace のトレース。gateway → core → synthesis にまたがる 24 スパン                       |
+| `sa-core-iam.txt`       | Core のサービスアカウントのロール一覧 — **Firestore ロールなし**                              |
+| `fleet-state.txt`       | Ingress、最小/最大インスタンス数、サービスアカウント、接続された GPU                          |
 
 ## この証跡が示すこと
 

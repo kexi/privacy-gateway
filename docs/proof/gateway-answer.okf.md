@@ -85,5 +85,7 @@ core agent's tokenized response is the input the check ran over.[^core-response]
 follows the repository PII masking policy.[^pii-policy]
 
 [^masked-prompt]: Masked prompt sent to the core agent
+
 [^core-response]: Tokenized response returned by the core agent
+
 [^pii-policy]: PII masking policy

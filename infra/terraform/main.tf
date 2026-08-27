@@ -20,6 +20,12 @@ resource "google_project_service" "required" {
     "iam.googleapis.com",
     "logging.googleapis.com",
     "cloudtrace.googleapis.com",
+    # The cost kill switch: a budget publishes to a Pub/Sub topic, whose push
+    # subscription calls the kill-switch service. Both stay enabled even when
+    # kill_switch_enabled is false, because for_each cannot depend on a value
+    # that is only known after apply and enabling an unused API costs nothing.
+    "billingbudgets.googleapis.com",
+    "pubsub.googleapis.com",
   ])
 
   project = var.project_id

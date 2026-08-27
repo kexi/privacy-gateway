@@ -517,7 +517,96 @@ is another reason to prefer that path.
 
 **Forgetting to shut down the GPU is the only real way to get hurt here.** Always run the
 teardown in section 10 when you finish. Gemini (Vertex AI) is billed per token and comes to
-a few tens of cents at demo scale.
+a few tens of cents at demo scale — and the kill switch below is the automatic backstop for
+the case where you forget anyway.
+
+### Automatic cost kill switch
+
+Forgetting the teardown is a human failure, and an email alert at 3am does not fix it. So the
+budget drives an **action**, not a notification:
+
+```
+Cloud Billing budget ($50)
+        │  every threshold crossing (50% / 80% / 100%)
+        ▼
+Pub/Sub topic  billing-kill-switch
+        │  push subscription + OIDC token (sa-kill-switch-push)
+        ▼
+Cloud Run service  kill-switch
+        │  costAmount >= budgetAmount ?
+        ├── no  → log killswitch.under_budget, change nothing
+        └── yes → remove allUsers run.invoker from gateway-agent
+                  set gemma-serving max_instance_count = 0
+```
+
+Declared in `infra/terraform/killswitch.tf`; the handler is `services/kill-switch/`.
+
+**How it decides.** The service compares `costAmount` against `budgetAmount` from the
+notification itself rather than trusting which threshold rule fired: one number against one
+number, regardless of how the budget's rules are configured. The comparison is `>=`, so a
+budget reached exactly is a budget exhausted. The 50% and 80% rules exist to put the spend
+trajectory into Cloud Logging early; only the 100% crossing trips the switch.
+
+**Why it does not fail closed.** Every disclosure gate in this fleet refuses when it cannot
+decide, because releasing data on a guess is unrecoverable. A cost gate is the opposite: a
+malformed notification is logged at ERROR, answered with HTTP 400 and **changes nothing**.
+Taking the demo offline because a bad message arrived would itself be the outage.
+
+**Idempotency.** Pub/Sub redelivers. Both operations are no-ops once the desired state is
+reached — removing a member that is already absent, setting a maximum that is already 0 — so
+a redelivered message costs one API read and changes nothing. There is deliberately no
+dedupe store: a cache that says "already handled" is one more thing that can be wrong at the
+moment the fleet is burning money. A mutation that _fails_ returns 500 so Pub/Sub retries,
+which finishes the half that failed and no-ops the half that succeeded.
+
+**Required role — on the billing account, not the project.**
+
+Creating `google_billing_budget` needs **`roles/billing.costsManager`** (or
+`roles/billing.admin`) on `billingAccounts/0136A5-03F510-FB783D`. A billing account is a
+separate resource in the Cloud Billing API: **project Owner does not confer it**, and
+`terraform apply` fails with a 403 on that one resource if it is missing.
+
+```bash
+# Check what you already hold
+gcloud billing accounts get-iam-policy 0136A5-03F510-FB783D
+
+# Grant it if not
+gcloud billing accounts add-iam-policy-binding 0136A5-03F510-FB783D \
+  --member="user:YOU@example.com" --role="roles/billing.costsManager"
+```
+
+If the role cannot be granted, deploy the rest with `just tf-apply kill_switch_enabled=false`;
+everything except the budget, topic, subscription and kill-switch service applies normally.
+
+**The switch's own permissions.** `sa-kill-switch` holds `roles/run.admin` on
+**`gateway-agent` and `gemma-serving` only** — per-service bindings, never project-wide. An
+identity reachable from a public push endpoint should be able to damage exactly the two
+services it exists to stop, and nothing else. It holds no Firestore role and no Vertex AI
+role. The push endpoint itself has no `allUsers` binding: only `sa-kill-switch-push` may
+invoke it, so an anonymous POST is rejected by Cloud Run before the handler runs.
+
+**Testing it.**
+
+```bash
+just kill-switch-test            # vitest: threshold boundary, idempotency, malformed input
+just logs-kill-switch            # what the switch has decided in the last 24h
+```
+
+`just kill-switch-test publish` sends a real over-budget message through the real topic. That
+**genuinely trips the switch and takes the fleet offline** — it is state-changing, requires
+maintainer approval, and prompts for confirmation. Use it only to prove the wiring end to end.
+
+**Restoring after a trip.**
+
+```bash
+just restore-after-kill          # terraform apply: re-adds allUsers, restores max instances
+```
+
+Terraform is the restore path rather than a pair of `gcloud` commands because it already
+holds the desired state the switch deviated from — the `allUsers` invoker binding (`iam.tf`)
+and `max_instance_count = 1` (`cloudrun.tf`). An apply re-asserts both and, unlike a
+hand-written command, cannot restore one and forget the other. **Fix the underlying spend
+first**, or the next notification trips the switch again. This recipe is never run by agents.
 
 ---
 

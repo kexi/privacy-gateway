@@ -29,16 +29,8 @@
   "consistency": {
     "ok": true,
     "invented_tokens": [],
-    "known_tokens": [
-      "⟦EMAIL_1⟧",
-      "⟦PERSON_1⟧",
-      "⟦PHONE_1⟧"
-    ],
-    "used_tokens": [
-      "⟦PERSON_1⟧",
-      "⟦EMAIL_1⟧",
-      "⟦PHONE_1⟧"
-    ],
+    "known_tokens": ["⟦EMAIL_1⟧", "⟦PERSON_1⟧", "⟦PHONE_1⟧"],
+    "used_tokens": ["⟦PERSON_1⟧", "⟦EMAIL_1⟧", "⟦PHONE_1⟧"],
     "reason": null
   },
   "stats": {
