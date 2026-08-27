@@ -93,4 +93,7 @@ pre-commit:
 pre-push:
   jobs:
     - name: vitest
-      run: pnpm -r test
+      # Root vitest projects only. Why not `pnpm -r test`: that recurses into
+      # web, whose `test` script is Playwright — slow, and flaky when it shares
+      # ports with the vitest E2E servers. Browser E2E stays a CI-only gate.
+      run: pnpm test
