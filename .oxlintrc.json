@@ -17,7 +17,8 @@
     "**/test-results/**",
     ".direnv/**",
     ".venv/**",
-    "web/dist/**"
+    "web/dist/**",
+    ".claude/worktrees"
   ],
   "rules": {
     "no-unused-vars": [
