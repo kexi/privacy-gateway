@@ -340,3 +340,23 @@ restore-after-kill *vars:
     echo "This re-opens the public gateway and restores gemma-serving's max instances."
     echo "Fix the underlying spend first, or the switch will trip again."
     just tf-apply {{ vars }}
+
+# Roll a new revision of already-deployed services from the latest images.
+# Why not tf-apply: the image tag is `latest`, so Terraform sees no diff after
+# a rebuild; Cloud Run only pulls the tag again when a new revision is forced.
+roll *services:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    targets=({{ services }})
+    if [ ${#targets[@]} -eq 0 ]; then
+      targets=(gateway-agent core-agent synthesis-agent)
+    fi
+    ar_path="{{ region }}-docker.pkg.dev/{{ project_id }}/{{ ar_repo }}"
+    for svc in "${targets[@]}"; do
+      img="${svc%-agent}"
+      [ "$svc" = "kill-switch" ] && img="kill-switch"
+      echo "==> rolling ${svc} from ${ar_path}/${img}:{{ image_tag }}"
+      gcloud run services update "$svc" --region "{{ region }}" --project "{{ project_id }}" \
+        --image "${ar_path}/${img}:{{ image_tag }}" --quiet >/dev/null
+      echo "    done: $(gcloud run services describe "$svc" --region "{{ region }}" --project "{{ project_id }}" --format='value(status.latestReadyRevisionName)')"
+    done
