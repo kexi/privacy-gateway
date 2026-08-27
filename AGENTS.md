@@ -66,6 +66,7 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 
 - `okf` — read before touching knowledge docs, audit records, Synthesis output schema, or anything with `sources/generated/verified/status/stale_after`. Shared body: `skills/okf/OKF.md`; wrappers in `.claude/skills/okf` and `.codex/skills/okf`.
 - `pgw-logs` — where logs/traces/audit records live and how to query them (`skills/pgw-logs/LOGS.md`). Use for any debugging by request_id / trace_id.
+- `pgw-client` — how agents and scripts consume the gateway (`skills/pgw-client/CLIENT.md`). Use when a task must route sensitive text through the fleet instead of an external LLM.
 - New skills follow the same layout: shared body under `skills/<name>/`, thin `SKILL.md` wrappers for both Claude Code and Codex.
 
 ## Git
