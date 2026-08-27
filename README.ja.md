@@ -469,7 +469,7 @@ Core のサービスアカウントには意図的に Firestore ロールを **�
 テアダウンの忘れだけで、1 日放置すると **約 $39**。
 
 そこで、消し忘れは深夜 3 時に誰も読まないメールではなく自動処理で受け止める。
-**$50 の Cloud Billing budget** がしきい値超過（50% / 80% / 100%）のたびに Pub/Sub topic へ
+**¥8,000 (~$50) の Cloud Billing budget** がしきい値超過（50% / 80% / 100%）のたびに Pub/Sub topic へ
 publish し、その push subscription が小さな `kill-switch` Cloud Run サービスを呼ぶ。
 100% 到達時に `gateway-agent` から `allUsers` invoker バインディングを外し、
 `gemma-serving` の max instances を 0 にする。どちらも冪等なので Pub/Sub の再配信は無害。

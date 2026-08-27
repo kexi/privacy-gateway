@@ -34,18 +34,13 @@ resource "google_pubsub_topic" "kill_switch" {
   depends_on = [google_project_service.required]
 }
 
-# The Cloud Billing budget service publishes as a Google-managed service agent,
-# which needs publisher rights on the topic. Without this the budget is created
-# successfully and then silently never delivers — the failure mode that makes a
-# kill switch worse than useless, because it looks installed.
-resource "google_pubsub_topic_iam_member" "billing_publisher" {
-  count = var.kill_switch_enabled ? 1 : 0
-
-  project = var.project_id
-  topic   = google_pubsub_topic.kill_switch[0].name
-  role    = "roles/pubsub.publisher"
-  member  = "serviceAccount:billing-budgets-pubsub@system.gserviceaccount.com"
-}
+# No explicit publisher grant for the budget service: connecting a budget to a
+# topic makes the Billing API grant its own service agent pubsub.publisher on
+# that topic (the caller needs pubsub.topics.setIamPolicy, which the applier
+# has). Why not grant it here: the agent has no stable, pre-provisioned email —
+# an explicit member for a guessed name fails the whole apply, as observed with
+# billing-budgets-pubsub@system.gserviceaccount.com. Delivery is verified after
+# apply by `just kill-switch-test`, so a silent non-delivery cannot hide.
 
 # --- budget ------------------------------------------------------------------
 
@@ -84,8 +79,8 @@ resource "google_billing_budget" "fleet" {
 
   amount {
     specified_amount {
-      currency_code = "USD"
-      units         = tostring(var.budget_usd)
+      currency_code = "JPY"
+      units         = tostring(var.budget_jpy)
     }
   }
 
@@ -116,7 +111,6 @@ resource "google_billing_budget" "fleet" {
 
   depends_on = [
     google_project_service.required,
-    google_pubsub_topic_iam_member.billing_publisher,
   ]
 }
 

@@ -11,6 +11,9 @@ data "google_project" "project" {
 # resolve the default network/subnet; the rest follow from the services below.
 resource "google_project_service" "required" {
   for_each = toset([
+    # Terraform reads project/service state through Resource Manager; with
+    # user_project_override those reads bill this project, so it must be on.
+    "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
     "run.googleapis.com",
     "artifactregistry.googleapis.com",

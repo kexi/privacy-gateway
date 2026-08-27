@@ -22,12 +22,20 @@ terraform {
   }
 }
 
+# user_project_override routes API quota to this project instead of the ADC
+# default. Why: billingbudgets.googleapis.com rejects user ADC without a quota
+# project, and pinning it here keeps every operator's apply working without
+# mutating their local `gcloud auth application-default` state.
 provider "google" {
-  project = var.project_id
-  region  = var.region
+  project               = var.project_id
+  region                = var.region
+  user_project_override = true
+  billing_project       = var.project_id
 }
 
 provider "google-beta" {
-  project = var.project_id
-  region  = var.region
+  project               = var.project_id
+  region                = var.region
+  user_project_override = true
+  billing_project       = var.project_id
 }

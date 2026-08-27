@@ -4,9 +4,11 @@
 # runtime stage) for the same reason: @google-cloud/run pulls in google-gax,
 # whose gRPC/protobuf path targets Node's runtime semantics.
 #
-# Why it does not copy knowledge/computations/ the way the Synthesis image does:
-# this service produces no OKF document and makes no attested claim. It reads a
-# billing number and calls two Cloud Run APIs.
+# The runtime image carries no knowledge/ bundle the way the Synthesis image
+# does: this service produces no OKF document and makes no attested claim. It
+# reads a billing number and calls two Cloud Run APIs. The BUILD stage still
+# needs knowledge/ because @privacy-gateway/common's build step hashes the
+# leak-check computation into generated digest constants.
 
 # ---------- build stage ----------
 FROM node:22-slim AS build
@@ -32,6 +34,7 @@ RUN pnpm install --frozen-lockfile --filter @privacy-gateway/kill-switch...
 
 COPY packages/common/ packages/common/
 COPY services/kill-switch/ services/kill-switch/
+COPY knowledge/ knowledge/
 
 # The workspace dependency is built first: the kill switch imports its compiled
 # config and logging output.

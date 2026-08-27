@@ -137,10 +137,12 @@ build *services:
       esac
       echo "==> building ${t} -> ${image}"
       if [ "$t" = "gemma" ]; then
-        # Baking the model into the image needs a bigger machine and a longer
-        # timeout: pulling 12b (~8.1GB) and writing the layer takes around 20
-        # minutes. An inline config is required because --tag and --build-arg
-        # cannot be combined on `gcloud builds submit`.
+        # Baking the model into the image needs a long timeout: pulling 12b
+        # (~8.1GB) and writing the layer takes around 20 minutes. An inline
+        # config is required because --tag and --build-arg cannot be combined
+        # on `gcloud builds submit`. Why the default machine type: this
+        # project's Cloud Build quota refuses E2_HIGHCPU_32 (verified on the
+        # first deploy); the default built the image in ~13 minutes.
         printf '%s\n' \
           'steps:' \
           '  - name: gcr.io/cloud-builders/docker' \
@@ -148,7 +150,6 @@ build *services:
           'images:' \
           "  - '${image}'" \
           'options:' \
-          '  machineType: E2_HIGHCPU_32' \
           '  logging: CLOUD_LOGGING_ONLY' \
           '  diskSizeGb: 100' \
           'timeout: 3600s' > "$cfg"

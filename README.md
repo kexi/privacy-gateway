@@ -466,7 +466,7 @@ Idle costs **$0** — every service scales to zero. With everything warm the fle
 to lose money here is forgetting the teardown: left up for a day, that is **~$39**.
 
 So a forgotten teardown is handled automatically rather than by an email nobody reads at 3am.
-A **$50 Cloud Billing budget** publishes every threshold crossing (50% / 80% / 100%) to a
+A **¥8,000 (~$50) Cloud Billing budget** publishes every threshold crossing (50% / 80% / 100%) to a
 Pub/Sub topic, whose push subscription calls a small `kill-switch` Cloud Run service. At 100%
 it removes the `allUsers` invoker binding from `gateway-agent` and forces `gemma-serving` to
 zero max instances — both idempotent, so Pub/Sub redelivery is harmless. Below 100% it only

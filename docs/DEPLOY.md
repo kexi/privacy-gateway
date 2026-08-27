@@ -526,7 +526,7 @@ Forgetting the teardown is a human failure, and an email alert at 3am does not f
 budget drives an **action**, not a notification:
 
 ```
-Cloud Billing budget ($50)
+Cloud Billing budget (¥8,000 (~$50))
         │  every threshold crossing (50% / 80% / 100%)
         ▼
 Pub/Sub topic  billing-kill-switch

@@ -514,7 +514,7 @@ Gemini（Vertex AI）はトークン課金で、デモ規模なら数十セン�
 **通知ではなくアクション**を駆動する:
 
 ```
-Cloud Billing budget ($50)
+Cloud Billing budget (¥8,000 (~$50))
         │  しきい値超過のたび（50% / 80% / 100%）
         ▼
 Pub/Sub topic  billing-kill-switch

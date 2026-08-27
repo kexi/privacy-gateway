@@ -173,15 +173,17 @@ variable "billing_account" {
   default     = "billingAccounts/0136A5-03F510-FB783D"
 }
 
-variable "budget_usd" {
-  description = "Monthly budget in USD. Reaching 100% of it trips the kill switch."
+variable "budget_jpy" {
+  # The billing account is denominated in JPY; a budget whose currency differs
+  # from the account's is rejected with 400 INVALID_ARGUMENT (observed live).
+  description = "Monthly budget in JPY. Reaching 100% of it trips the kill switch."
   type        = number
-  default     = 50
+  default     = 8000
 
   validation {
     # A zero or negative budget would be tripped by the first cent of spend, and
     # the ratio the service logs would divide by zero.
-    condition     = var.budget_usd > 0
-    error_message = "budget_usd must be greater than zero."
+    condition     = var.budget_jpy > 0
+    error_message = "budget_jpy must be greater than zero."
   }
 }
