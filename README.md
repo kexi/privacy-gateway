@@ -291,6 +291,8 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 | `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                      |
 | `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                              |
 | `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                             |
+| `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                 |
+| `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                     |
 | `GET`  | `/healthz`                           | liveness                                                                                                                    |
 
 There is no session-based API any more: `GET /v1/sessions/{id}/answer`,
@@ -320,6 +322,63 @@ artifacts are persisted.
 | Over the rate limit                                    | `429`                              |
 | Request body too large                                 | `413`                              |
 | Gateway deadline exceeded                              | `504`                              |
+
+### Use `privacy-gateway` as a model in any OpenAI-compatible client
+
+Point an existing OpenAI-compatible client at the gateway as its `base_url` and select
+`privacy-gateway` as the model. No code change, and every gate below still applies.
+
+```bash
+curl -sS http://localhost:8081/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+        "model": "privacy-gateway",
+        "messages": [
+          {"role": "system", "content": "You are terse."},
+          {"role": "user", "content": "Draft a reply to taro@example.co.jp about the failed charge."}
+        ]
+      }'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8081/v1", api_key="unused")
+completion = client.chat.completions.create(
+    model="privacy-gateway",
+    messages=[{"role": "user", "content": "Draft a reply about the failed charge."}],
+)
+print(completion.choices[0].message.content)
+```
+
+**Message mapping.** `system` and `user` contents are concatenated in order, separated by a
+blank line, into the one text the pipeline masks. `assistant` turns are dropped: they are the
+fleet's own prior output, already rehydrated in the caller's transcript, and feeding them back
+would push raw values at the boundary the egress guard exists to hold. Multi-turn context is
+therefore the caller's concatenation — each request is masked and vault-keyed independently,
+because [there are no sessions](#no-sessions).
+
+**Extension field.** `choices[0].message.content` is the rehydrated answer and `id` is
+`chatcmpl-<request_id>`, so the evidence stays reachable from an OpenAI-shaped response. The
+privacy facts the OpenAI schema cannot express travel in `x_privacy_gateway`: `request_id`,
+`trace_id`, `trust_tier`, `status`, `masked_prompt`, `withheld`.
+
+**Refusals** return an OpenAI error object with the status from the table above preserved and
+the category findings attached — never a `200` whose content is an apology.
+
+**Streaming** (`stream: true`) emits one content chunk and then `[DONE]`. That is deliberate,
+not a stub: the gates are fail-closed and the leak check runs on the _complete_ Core answer,
+so streaming tokens as they were produced would release text before the verdict that decides
+whether it may be released at all. A refusal that arrives after the caller has rendered half
+an answer is not a refusal.
+
+## The MCP server
+
+`clients/mcp` exposes the fleet to any MCP client as three tools — `pgw_ask`, `pgw_evidence`
+and `pgw_verify` — so an agent can ask, read the audit document, and independently replay the
+attestation. Refusals arrive as structured results rather than thrown errors, so a model can
+explain a privacy gate instead of retrying around it. Setup for Claude Desktop, Claude Code
+and Codex is in [`clients/mcp/README.md`](clients/mcp/README.md).
 
 ## The Python client (language-agnostic consumption)
 

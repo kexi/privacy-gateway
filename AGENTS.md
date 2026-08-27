@@ -34,7 +34,7 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 - Enter the environment with `direnv allow` or `nix develop` (Nix flake; packages are managed in `flake.nix`, never Homebrew). The devShell installs lefthook pre-commit hooks automatically.
 - `just` is the **only** command surface. Docs and skills reference `just <recipe>`, never raw `gcloud`/`pnpm`/`docker` invocations (put the raw command inside a recipe). Recipes are grouped in `.just/*.just` modules imported from the root `justfile`.
 - **Every recipe must have a doc comment** (`# ...` line directly above it). `just fmt` formats justfiles; `just fmt-check` and the recipe-doc check run in lefthook and CI and fail on undocumented recipes.
-- Node.js 22 + TypeScript + **pnpm workspace** (`web`, `packages/common`, `agents/core`, `agents/gateway`, `agents/synthesis`).
+- Node.js 22 + TypeScript + **pnpm workspace** (`web`, `packages/common`, `agents/core`, `agents/gateway`, `agents/synthesis`, `clients/mcp`).
 - Python is used only for standalone scripts (e.g. `clients/python/pgw.py`). They must carry **PEP 723** inline metadata, run via `uv run path/to/script.py`, and pass **ruff** (`ruff.toml` at root). `minimumReleaseAge=1440`: packages published less than 24h ago are refused (supply-chain safety). Do not switch to bun/npm/yarn.
 - TypeScript lint/format: **oxlint** (with `oxlint-tsgolint` for type-aware rules) and **oxfmt** — not eslint/prettier. Config at repo root (`.oxlintrc.json`, `.oxfmtrc.json`); one `pnpm` devDependency version for the whole workspace.
 - **Type checking is a separate step**: `tsc --noEmit` per package (`just typecheck`). oxlint does not replace it.
@@ -66,7 +66,7 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 
 - `okf` — read before touching knowledge docs, audit records, Synthesis output schema, or anything with `sources/generated/verified/status/stale_after`. Shared body: `skills/okf/OKF.md`; wrappers in `.claude/skills/okf` and `.codex/skills/okf`.
 - `pgw-logs` — where logs/traces/audit records live and how to query them (`skills/pgw-logs/LOGS.md`). Use for any debugging by request_id / trace_id.
-- `pgw-client` — how agents and scripts consume the gateway (`skills/pgw-client/CLIENT.md`). Use when a task must route sensitive text through the fleet instead of an external LLM.
+- `pgw-client` — how the fleet is consumed from outside (`skills/pgw-client/CLIENT.md`): `POST /v1/ask`, the OpenAI-compatible endpoint, the MCP server in `clients/mcp`, and `clients/python/pgw.py`. Read before touching any client surface or describing the guarantee to a caller.
 - New skills follow the same layout: shared body under `skills/<name>/`, thin `SKILL.md` wrappers for both Claude Code and Codex.
 
 ## Git

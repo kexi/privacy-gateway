@@ -30,12 +30,18 @@ export default defineConfig({
       'agents/gateway',
       'agents/synthesis',
       'services/kill-switch',
+      'clients/mcp',
     ],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'lcov'],
       reportsDirectory: 'coverage',
-      include: ['packages/*/src/**/*.ts', 'agents/*/src/**/*.ts', 'services/*/src/**/*.ts'],
+      include: [
+        'packages/*/src/**/*.ts',
+        'agents/*/src/**/*.ts',
+        'services/*/src/**/*.ts',
+        'clients/mcp/src/**/*.ts',
+      ],
       exclude: ['**/dist/**', '**/*.d.ts', '**/*.config.ts'],
       // packages/common holds the masking, vault and OKF logic the guarantees
       // rest on, so it carries the stricter floor; the agents are thinner
