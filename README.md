@@ -60,19 +60,57 @@ for the design decisions and known limitations behind these choices.
 
 ## Required-tech checklist
 
-| Requirement                  | Where                                                                                                                                |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| **Gemini 3.5 via Vertex AI** | Core Agent (`agents/core`). Model id from `GEMINI_MODEL`.                                                                            |
-| **Google ADK**               | All three agents, ADK TypeScript (`@google/adk` 2.0.0).                                                                              |
-| **A2A**                      | Gateway → Core, via Agent Card + `message/send`. Gateway → Synthesis is plain HTTP by design — see [A2A, precisely](#a2a-precisely). |
-| **Cloud Run**                | One service per agent, plus Gemma serving on Cloud Run GPU (L4).                                                                     |
-| **Firestore**                | Token Vault (TTL) and the OKF answer store.                                                                                          |
-| **Gemma (bonus)**            | Gateway span extraction and the Synthesis judge, self-hosted via Ollama.                                                             |
+|     | Requirement                  | Where                                                                                                                                |
+| --- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| ✓   | **Gemini 3.5 via Vertex AI** | Core Agent (`agents/core`), `gemini-3.5-flash` on the **global** endpoint. Model id from `GEMINI_MODEL`.                             |
+| ✓   | **Google ADK**               | All three agents, ADK TypeScript (`@google/adk` 2.0.0).                                                                              |
+| ✓   | **A2A**                      | Gateway → Core, via Agent Card + `message/send`. Gateway → Synthesis is plain HTTP by design — see [A2A, precisely](#a2a-precisely). |
+| ✓   | **Cloud Run**                | One service per agent, plus Gemma serving on Cloud Run GPU (NVIDIA RTX PRO 6000) and the `kill-switch` service.                      |
+| ✓   | **Firestore**                | Token Vault and the OKF answer store — both with a TTL policy on `expires_at`.                                                       |
+| ✓   | **Gemma (bonus)**            | Gateway span extraction and the Synthesis judge, self-hosted via Ollama.                                                             |
 
 Gateway and Synthesis reach Gemma through **`OllamaLlm`**, a custom ADK `BaseLlm` adapter in
 `packages/common` registered in `LLMRegistry` for model names matching `ollama/*`. It speaks
 Ollama's OpenAI-compatible `/v1/chat/completions`, so the same code path serves local Ollama
 in development and Cloud Run GPU in production.
+
+## Deployed endpoints
+
+The fleet is live in project `all-thinkgs` (`us-central1`). Only the Gateway is public;
+every other service is private (IAM invoker + ID token) or internal-ingress only.
+
+| Service           | URL                                               | Access                            |
+| ----------------- | ------------------------------------------------- | --------------------------------- |
+| `gateway-agent`   | <https://gateway-agent-turszib42q-uc.a.run.app>   | **public** — the demo entry point |
+| `core-agent`      | `https://core-agent-turszib42q-uc.a.run.app`      | private (A2A, ID token)           |
+| `synthesis-agent` | `https://synthesis-agent-turszib42q-uc.a.run.app` | private (HTTP, ID token)          |
+| `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress only             |
+| `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private (Pub/Sub push + OIDC)     |
+
+```bash
+curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
+```
+
+`just urls` regenerates this list from Terraform, and `just health` probes every service
+with an ID token.
+
+## Five ways to consume it
+
+One pipeline, five entry points — whichever you use, the same fail-closed gates run and the
+same masked evidence is stored.
+
+| Surface               | Entry point                    | Best for                                                    |
+| --------------------- | ------------------------------ | ----------------------------------------------------------- |
+| **Web UI**            | `/` on the Gateway (built SPA) | the demo: masked prompt and final answer side by side       |
+| **REST**              | `POST /v1/ask`                 | the full result — trust dimensions, attestation, stats      |
+| **OpenAI-compatible** | `POST /v1/chat/completions`    | dropping the fleet into an existing OpenAI client           |
+| **MCP**               | `clients/mcp` (stdio)          | giving an agent ask / evidence / verify tools               |
+| **Python CLI**        | `clients/python/pgw.py`        | a dependency-light example, and full bundle-digest checking |
+
+Each is documented below: [API](#api), [use as a model](#use-privacy-gateway-as-a-model-in-any-openai-compatible-client),
+[MCP](#the-mcp-server), [Python client](#the-python-client-language-agnostic-consumption).
 
 ## Repository layout
 
@@ -85,6 +123,7 @@ agents/gateway/    # ADK agent + HTTP entry + serves web/dist
 agents/core/       # ADK agent (Gemini) + A2A server
 agents/synthesis/  # ADK agent + A2A server + HTTP routes
 services/kill-switch/  # cost kill switch: budget notification -> stop spending
+clients/mcp/       # MCP stdio server: pgw_ask / pgw_evidence / pgw_verify
 clients/python/    # pgw.py — single-file PEP 723 client, the language-agnostic example
 serving/gemma/     # Ollama Dockerfile for Cloud Run GPU
 web/               # demo UI (masked vs final, side by side) + Playwright specs
@@ -93,7 +132,7 @@ infra/terraform/   # Terraform: Cloud Run, IAM, Firestore TTL, Artifact Registry
 ```
 
 The workspace packages are `web`, `packages/common`, `agents/core`, `agents/gateway`,
-`agents/synthesis` and `services/kill-switch`. The kill switch sits under `services/` rather
+`agents/synthesis`, `services/kill-switch` and `clients/mcp`. The kill switch sits under `services/` rather
 than `agents/` because it is not a member of the reasoning fleet: it never sees a prompt, an
 answer or a vault entry.
 
@@ -248,6 +287,9 @@ just web-build      # produces web/dist
 just dev-gateway    # http://localhost:8081
 ```
 
+`just web-build` runs `pnpm -r build`, so it also compiles `clients/mcp` to
+`clients/mcp/dist/` — the entry point the MCP client configs point at.
+
 ### Checks
 
 ```bash
@@ -259,7 +301,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-290 vitest tests across 21 files. The root `vitest.config.ts` uses `test.projects`, so
+545 vitest tests across 31 files. The root `vitest.config.ts` uses `test.projects`, so
 `just test` runs everything from the repository root while each package keeps its own `test`
 script for `pnpm --filter X test`. `just test-coverage` uses `@vitest/coverage-v8` and
 enforces per-package floors: `packages/common` at 90% lines (it holds the masking, vault and
@@ -276,7 +318,7 @@ just web-e2e        # Playwright, chromium only
 just setup-browsers # once, outside Nix
 ```
 
-Nine Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
+36 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
 A2A) and Gemma (over the OpenAI-compatible API) mocked, so what the browser exercises is the
 production request path rather than a stubbed API. Chromium only: these assert application
 behaviour, not rendering differences, and a second engine would double the runtime for no
@@ -351,12 +393,29 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
+Codex CLI selects it the same way — the fleet is just another OpenAI-compatible provider.
+In `~/.codex/config.toml`:
+
+```toml
+[model_providers.privacy-gateway]
+name = "Privacy Gateway"
+base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+wire_api = "chat"
+
+[profiles.privacy-gateway]
+model_provider = "privacy-gateway"
+model = "privacy-gateway"
+```
+
+Then `codex --profile privacy-gateway`. `GET /v1/models` advertises exactly one id,
+`privacy-gateway`: a caller selects the _fleet_, not the model behind it.
+
 **Message mapping.** `system` and `user` contents are concatenated in order, separated by a
 blank line, into the one text the pipeline masks. `assistant` turns are dropped: they are the
 fleet's own prior output, already rehydrated in the caller's transcript, and feeding them back
 would push raw values at the boundary the egress guard exists to hold. Multi-turn context is
 therefore the caller's concatenation — each request is masked and vault-keyed independently,
-because [there are no sessions](#no-sessions).
+because [there are no sessions](#sessions-are-gone).
 
 **Extension field.** `choices[0].message.content` is the rehydrated answer and `id` is
 `chatcmpl-<request_id>`, so the evidence stays reachable from an OpenAI-shaped response. The
@@ -377,8 +436,40 @@ an answer is not a refusal.
 `clients/mcp` exposes the fleet to any MCP client as three tools — `pgw_ask`, `pgw_evidence`
 and `pgw_verify` — so an agent can ask, read the audit document, and independently replay the
 attestation. Refusals arrive as structured results rather than thrown errors, so a model can
-explain a privacy gate instead of retrying around it. Setup for Claude Desktop, Claude Code
-and Codex is in [`clients/mcp/README.md`](clients/mcp/README.md).
+explain a privacy gate instead of retrying around it.
+
+Build it once (`pnpm -r build`), then register it. Claude Desktop, in
+`claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "privacy-gateway": {
+      "command": "node",
+      "args": ["/absolute/path/to/all-things-agentic-hackathon/clients/mcp/dist/index.js"],
+      "env": { "PGW_GATEWAY_URL": "https://gateway-agent-turszib42q-uc.a.run.app" }
+    }
+  }
+}
+```
+
+Claude Code and Codex register the same binary:
+
+```bash
+claude mcp add privacy-gateway \
+  --env PGW_GATEWAY_URL=https://gateway-agent-turszib42q-uc.a.run.app \
+  -- node /absolute/path/to/clients/mcp/dist/index.js
+```
+
+```toml
+[mcp_servers.privacy-gateway]
+command = "node"
+args = ["/absolute/path/to/clients/mcp/dist/index.js"]
+env = { PGW_GATEWAY_URL = "https://gateway-agent-turszib42q-uc.a.run.app" }
+```
+
+Full notes — what `pgw_verify` can and cannot check, and why a refusal is a result rather
+than a thrown error — are in [`clients/mcp/README.md`](clients/mcp/README.md).
 
 ## The Python client (language-agnostic consumption)
 
@@ -507,13 +598,15 @@ just tf-init                      # initialise Terraform against that bucket
 just build                        # build and push the five images with Cloud Build
 just tf-plan gpu_enabled=false    # review the changes
 just tf-apply gpu_enabled=false   # apply everything except the GPU service
-just tf-apply                     # add gemma-serving once the L4 quota is granted
+just tf-apply                     # add the GPU-backed gemma-serving
 just urls && just health          # verify
 just tf-destroy                   # tear down (GPU billing stops first)
 ```
 
 `gpu_enabled=false` skips the GPU-backed `gemma-serving` service, so the rest of the fleet
-can be deployed while the Cloud Run L4 quota request is still pending.
+can be deployed without a GPU at all. The accelerator is **NVIDIA RTX PRO 6000**, not L4:
+Google declined the L4 quota request (regional exhaustion, 2026-08) and pointed at RTX PRO
+6000, which is auto-granted per region, so no quota wait applies.
 
 Core's service account deliberately has **no** Firestore role; the Gemma serving endpoint
 uses internal-only ingress; service-to-service calls authenticate with ID tokens.
@@ -545,7 +638,7 @@ invalid value stops the process rather than failing mid-request.
 | Variable                     | Default                     | Purpose                                                                                             |
 | ---------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------- |
 | `GOOGLE_CLOUD_PROJECT`       | —                           | GCP project for Vertex AI and Firestore                                                             |
-| `GOOGLE_CLOUD_LOCATION`      | `us-central1`               | Vertex AI region                                                                                    |
+| `GOOGLE_CLOUD_LOCATION`      | `us-central1`               | Vertex AI location. Core is deployed with `global` — see the note below                             |
 | `GOOGLE_GENAI_USE_VERTEXAI`  | `1`                         | route the Gemini SDK through Vertex AI                                                              |
 | `GEMINI_MODEL`               | `gemini-3.5-flash`          | Core's model id — **see the note below**                                                            |
 | `GEMMA_BASE_URL`             | `http://localhost:11434/v1` | OpenAI-compatible Gemma endpoint                                                                    |
@@ -571,13 +664,18 @@ invalid value stops the process rather than failing mid-request.
 | `OTEL_SERVICE_NAME`          | per-agent                   | overrides the service name on spans                                                                 |
 | `VITE_GCP_PROJECT`           | —                           | project id baked into the UI's console links                                                        |
 
-> **Note on `GEMINI_MODEL`.** The hackathon requires "Gemini 3.5 or newer". Model id strings
-> change as versions reach GA, and the id is therefore never hard-coded in agent code — it is
-> read from `GEMINI_MODEL`, with `gemini-3.5-flash` as the documented default. That default
-> was verified against Vertex AI with a live `generateContent` call. Note that
-> `gemini-3.5-pro` does **not** currently resolve on Vertex AI (404 "Publisher model … not
-> found"); `gemini-3.1-pro-preview` does, if a Pro-tier model is wanted. Confirm the id your
-> project serves before the demo.
+> **Note on `GEMINI_MODEL` and the global endpoint.** The hackathon requires "Gemini 3.5 or
+> newer". Model id strings change as versions reach GA, and the id is therefore never
+> hard-coded in agent code — it is read from `GEMINI_MODEL`, with `gemini-3.5-flash` as the
+> documented default, verified against Vertex AI with a live `generateContent` call.
+>
+> `gemini-3.5-flash` is published **only on the global Vertex endpoint**: the `us-central1`
+> regional endpoint 404s for it (probed 2026-08-28). Terraform therefore deploys the Core
+> service with `GOOGLE_CLOUD_LOCATION=global` while every other resource — Firestore, Cloud
+> Run, Artifact Registry — stays in `us-central1`. Only the GenAI SDK reads that variable, so
+> overriding it for Core moves nothing else. Note that `gemini-3.5-pro` does **not** currently
+> resolve on Vertex AI (404 "Publisher model … not found"); `gemini-3.1-pro-preview` does, if a
+> Pro-tier model is wanted. Confirm the id your project serves before the demo.
 
 ## Toolchain and supply-chain notes
 

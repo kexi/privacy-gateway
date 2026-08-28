@@ -39,6 +39,33 @@ Masked before it left the trust boundary:
 | `sa-core-iam.txt`       | Core's service account roles — **no Firestore role**.                                        |
 | `fleet-state.txt`       | Ingress, min/max instances, service accounts, and the attached GPU.                          |
 
+### Later runs (2026-08-27/28)
+
+| File                                     | What it shows                                                                        |
+| ---------------------------------------- | ------------------------------------------------------------------------------------ |
+| [`kill-switch.md`](./kill-switch.md)     | A **live** kill-switch fire: what stopped, what did not, and two open defects.       |
+| [`openai-compat.md`](./openai-compat.md) | `/v1/chat/completions` against production, plus the advisory-judge regression.       |
+| [`mcp.md`](./mcp.md)                     | The MCP stdio server driven against production: `pgw_ask` + `pgw_verify` transcript. |
+
+## Open defects found while capturing the above
+
+Recorded here so the evidence is not read as an all-green report. Details and log
+excerpts are in the linked documents.
+
+1. **The advisory Gemma judge vetoes its own placeholders.** Any answer containing
+   `⟦TYPE_N⟧` is refused with `judge_flagged` (`leak: true`, `categories: []`), so
+   `just smoke` currently fails and most real requests are refused. The deterministic
+   attester still passes these answers, so the fleet is failing _closed_, not leaking —
+   but it is demo-blocking. The judge code is unchanged since the first commit;
+   `serving/gemma/Dockerfile` is `FROM ollama/ollama:latest` (**unpinned**) and the
+   running Ollama 0.33.1 serves gemma3 under `--chat-template chatml --no-jinja`, which
+   is the leading hypothesis. See [`openai-compat.md`](./openai-compat.md).
+2. **The kill switch revokes public access but never caps the GPU.** `scaleToZero`
+   fails against `gemma-serving`, and because the handler returns `500` to force
+   redelivery, it re-revokes the gateway binding every ~30 s until the 600 s Pub/Sub
+   retention window drains — which blocks operator restore. See
+   [`kill-switch.md`](./kill-switch.md).
+
 ## What the evidence establishes
 
 **The masking is real.** `stats.counts_by_category` records `PERSON: 1, EMAIL: 1, PHONE: 1`,

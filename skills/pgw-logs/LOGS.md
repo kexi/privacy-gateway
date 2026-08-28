@@ -33,6 +33,7 @@ Everything is keyed by **`request_id`** (UUIDv7, header `X-Request-ID`) and **`t
 | Cloud Run                                | `core-agent`      | same                                                                                                 |                                          |
 | Cloud Run                                | `synthesis-agent` | same                                                                                                 |                                          |
 | Cloud Run (GPU)                          | `gemma-serving`   | same (Ollama stdout)                                                                                 |                                          |
+| Cloud Run                                | `kill-switch`     | same; `just logs-kill-switch` filters to its decisions                                               | see §3                                   |
 | Traces                                   | all               | Cloud Trace                                                                                          | see §4                                   |
 | Audit artifacts                          | synthesis         | Firestore collections `gateway_answers` (OKF docs), `token_vault` (masked mapping, TTL `expires_at`) | `gcloud firestore` / console             |
 
@@ -47,13 +48,16 @@ Local pipe: `just dev 2>&1 | tee /tmp/pgw-dev.log`, then `just logs-local <reque
 | gateway   | `GET /v1/requests/:id`                              | the stored **masked** OKF evidence document                                                                                        |
 | gateway   | `GET /v1/requests/:id/masked-prompt.md`             | the masked prompt Core received (an OKF `sources` target)                                                                          |
 | gateway   | `GET /v1/requests/:id/core-response.md`             | Core's still-tokenized response (an OKF `sources` target)                                                                          |
+| gateway   | `POST /v1/chat/completions`                         | OpenAI-compatible façade over the same pipeline; look for the `openai.compat.chat.*` events                                        |
+| gateway   | `GET /v1/models`                                    | OpenAI-compatible model list; one id, `privacy-gateway`                                                                            |
 | core      | `GET /.well-known/agent-card.json`                  | A2A Agent Card (registry)                                                                                                          |
 | core      | `POST /jsonrpc` (`message/send`)                    | A2A entry (IAM-protected on Cloud Run)                                                                                             |
 | synthesis | `GET /.well-known/agent-card.json`, `POST /jsonrpc` | A2A                                                                                                                                |
 | synthesis | `POST /v1/synthesize`                               | HTTP route used by gateway                                                                                                         |
 | gemma     | `GET /v1/models`, `POST /v1/chat/completions`       | Ollama OpenAI-compatible API (internal ingress only)                                                                               |
 
-Cloud Run URLs: `just urls`. Liveness across all services: `just health`.
+Deployed gateway: `https://gateway-agent-turszib42q-uc.a.run.app` (the only public service).
+Every Cloud Run URL: `just urls`. Liveness across all services: `just health`.
 Agent Card for one service: `just agent-card <service>` (both attach the ID token that
 IAM-protected services require; the audience must be the callee's URL).
 
@@ -95,6 +99,7 @@ just logs-request <request_id>        # one request across all agents
 just logs-refusals [reason]           # every refused release, or one gate
 just logs-service synthesis-agent 30  # one service, errors, last 30 min
 just logs-attest-failures             # failed leak checks
+just logs-kill-switch                 # kill-switch decisions (triggered / under-budget / failures)
 ```
 
 Each recipe wraps `gcloud logging read` with the query above and pipes it through
@@ -148,7 +153,7 @@ Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. 
 | Answer status `draft`, tier `unverified` | synthesis `attest.verdict` findings; the leak check doing its job — inspect what Core emitted (tokenized text is safe to read)             |
 | Placeholders left in the released answer | expected for `API_KEY` / `AWS_KEY` / `JWT` / `CREDIT_CARD` / `MY_NUMBER`: the disclosure policy withholds them. See `attestation.withheld` |
 | 409 `unresolved_token` / `vault_missing` | vault expiry (`stale_after` passed ⇒ TTL purged the mapping) or a generation mismatch; no answer is released either way                    |
-| Gemma timeouts                           | `gemma-serving` logs (model load on cold start ≈ 30–60 s on L4); `--no-cpu-throttling`, min instances                                      |
+| Gemma timeouts                           | `gemma-serving` logs (model load on cold start ≈ 30–60 s on the RTX PRO 6000); `--no-cpu-throttling`, min instances                        |
 | 403 between services                     | `infra/terraform/iam.tf` bindings; token audience must be the callee's URL                                                                 |
 | No trace / broken trace                  | `OTEL_ENABLED`, exporter errors in that service's logs (`event="otel.export.error"`)                                                       |
 

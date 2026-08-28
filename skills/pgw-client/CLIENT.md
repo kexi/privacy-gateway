@@ -1,14 +1,18 @@
 # Consuming the Privacy-Preserving Gateway
 
-How to call the fleet from outside it. Four surfaces, one pipeline: whichever you
+How to call the fleet from outside it. Five surfaces, one pipeline: whichever you
 use, the same fail-closed gates run and the same evidence is stored.
 
 | surface                              | use it for                                                                            |
 | ------------------------------------ | ------------------------------------------------------------------------------------- |
+| Web UI (`/` on the Gateway)          | the demo: masked prompt and final answer side by side, with the four trust dimensions |
 | `POST /v1/ask` (native JSON)         | the full result — trust dimensions, attestation, consistency, stats                   |
 | `POST /v1/chat/completions` (OpenAI) | dropping the fleet into any existing OpenAI-compatible client                         |
 | MCP server (`clients/mcp`)           | giving an agent tools that ask, fetch evidence, and verify                            |
 | `clients/python/pgw.py`              | a dependency-light CLI example, and the only client that can check the bundle digests |
+
+Deployed Gateway: `https://gateway-agent-turszib42q-uc.a.run.app`. Local: `http://localhost:8081`.
+Substitute either for the base URL in the examples below.
 
 ## 1. The native endpoint
 
@@ -50,6 +54,19 @@ completion = client.chat.completions.create(
     messages=[{"role": "user", "content": "Draft a reply about the failed charge."}],
 )
 print(completion.choices[0].message.content)
+```
+
+Codex CLI selects it through a provider profile in `~/.codex/config.toml`:
+
+```toml
+[model_providers.privacy-gateway]
+name = "Privacy Gateway"
+base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+wire_api = "chat"
+
+[profiles.privacy-gateway]
+model_provider = "privacy-gateway"
+model = "privacy-gateway"
 ```
 
 `GET /v1/models` advertises exactly one id, `privacy-gateway`: a caller selects

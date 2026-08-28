@@ -242,6 +242,47 @@ image-test:
 # Build the images and apply the Terraform configuration with that tag
 deploy *vars: build (tf-apply vars)
 
+# --- demo / filming windows --------------------------------------------------
+# gemma-serving scales to zero, and a scale-from-zero costs ~90 s while Ollama
+# loads gemma3:12b onto the GPU. That is fine for a smoke test (the gateway's
+# REQUEST_DEADLINE_SECONDS is 150) but ruinous on camera. These two recipes pin
+# an instance up for the length of a demo and then give the billing back.
+#
+# Why gcloud rather than Terraform: this is a temporary operational state, not
+# desired state. Encoding it in Terraform would mean the repository's committed
+# configuration claims a GPU should always be running, and a later `tf-apply`
+# by someone else would silently re-warm it. `just chill` — or any `tf-apply`,
+# which re-asserts min_instance_count = 0 — puts it back.
+
+# Pin one gemma-serving GPU instance up so demo requests answer without a cold start
+warm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "!! An idle Cloud Run GPU instance bills continuously while warm."
+    echo "!! Nvidia RTX PRO 6000 + 20 vCPU / 80 GiB in {{ region }} is roughly"
+    echo "!! USD 0.70-0.80 per hour, about USD 17-19 per day, whether or not a"
+    echo "!! single request arrives."
+    echo "!! Run 'just chill' the moment filming is done."
+    echo
+    echo "This waits for the pinned instance to report ready, which can take"
+    echo "several minutes on a GPU service. Ctrl-C is safe: min-instances is"
+    echo "already set, so the instance comes up regardless."
+    gcloud run services update gemma-serving \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --min-instances=1 --quiet >/dev/null
+    echo "==> gemma-serving min-instances=1; the GPU is now warm and billing."
+    echo "    Send one 'just smoke' to force the model load before you record."
+
+# Release the pinned gemma-serving instance and stop the idle GPU billing
+chill:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    gcloud run services update gemma-serving \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --min-instances=0 --quiet >/dev/null
+    echo "==> gemma-serving min-instances=0; it scales to zero and stops billing."
+    echo "    The next request pays the ~90 s cold start again."
+
 # --- GPU quota ---------------------------------------------------------------
 
 # Show the current Cloud Run GPU (Nvidia L4) quota for the project

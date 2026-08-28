@@ -942,10 +942,48 @@ visible as committed code next to the `gcloud` output that confirms it.
   the simplest possible proof that this is not a local mock
 - Show the public URL (`https://gateway-agent-257034533412.us-central1.run.app`) in the
   browser's address bar. A visible `localhost` ruins the effect
-- **Warm the GPU up before filming.** Nobody sits through a 1-2 minute cold start on video.
-  Fire one dummy request right before recording to get the instance running
+- **Warm the GPU up before filming** with `just warm` — see §9.4 below. Nobody sits through
+  a ~90 s cold start on video
 - The video is 4 minutes, so keep the Console tour to 30-40 seconds and spend the rest on
   the actual behaviour (masking -> Gemini -> leak check -> rehydration)
+
+### 9.4 Warming the GPU for a demo or judging window
+
+`gemma-serving` scales to zero, so the first request after an idle period pays a cold
+start. The GPU instance itself starts in ~5 s; what dominates is Ollama loading
+`gemma3:12b` (~8 GB) onto the card afterwards. Measured worst case is **~90 s**, and the
+request that triggers the scale-from-zero waits for all of it.
+
+Two recipes bracket a filming session:
+
+```bash
+just warm    # pin one instance up: gemma-serving min-instances=1
+# ... film, demo, let judges click ...
+just chill   # release it: min-instances=0, billing stops
+```
+
+Between them, `just smoke` and the UI answer in seconds instead of a minute and a half.
+
+**`just warm` costs real money for as long as it is on.** A pinned Nvidia RTX PRO 6000
+instance (20 vCPU / 80 GiB) in `us-central1` bills continuously whether or not a request
+arrives — roughly **USD 0.70-0.80 per hour, about USD 17-19 per day**. The recipe prints
+this warning every time. Run `just chill` the moment you stop filming; a warm instance
+left overnight is the single most likely way to trip the cost kill switch (§ _Automatic
+cost kill switch_).
+
+After `just warm`, send **one** `just smoke` before recording. `min-instances=1` starts
+the container, but Ollama only loads the model when the first request arrives, so an
+un-exercised warm instance still pays the model load on camera.
+
+Why these are `gcloud` recipes rather than Terraform: a warm GPU is a temporary
+operational state, not desired state. Encoding it in Terraform would make the committed
+configuration claim a GPU should always be running, and a later `tf-apply` by someone else
+would silently re-warm it. `just chill` puts it back, and so does any `tf-apply` — the
+Terraform config always re-asserts `min_instance_count = 0`.
+
+Do not confuse `min-instances` with the kill switch's `max-instances`. `just warm` raises
+the floor; the kill switch drops the **ceiling** to zero. If the switch has tripped,
+`just warm` will not bring Gemma back — restore with `just restore-after-kill` first.
 
 ---
 

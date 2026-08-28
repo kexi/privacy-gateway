@@ -62,19 +62,57 @@ A2A を使うのは Gateway → Core のこの 1 ホップのみ。Gateway → S
 
 ## 必須技術チェックリスト
 
-| 要件                       | 実装箇所                                                                                                                                |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **Gemini 3.5 (Vertex AI)** | Core Agent（`agents/core`）。モデル ID は `GEMINI_MODEL` から                                                                           |
-| **Google ADK**             | 3 エージェントすべて。ADK TypeScript（`@google/adk` 2.0.0）                                                                             |
-| **A2A**                    | Gateway → Core。Agent Card + `message/send`。Gateway → Synthesis は意図的に通常の HTTP——詳細は[A2A について正確に](#a2a-について正確に) |
-| **Cloud Run**              | エージェントごとに 1 サービス。加えて Gemma を Cloud Run GPU (L4) で提供                                                                |
-| **Firestore**              | Token Vault（TTL）と OKF 回答ストア                                                                                                     |
-| **Gemma（ボーナス）**      | Gateway の span 抽出と Synthesis の judge。Ollama で自ホスト                                                                            |
+|     | 要件                       | 実装箇所                                                                                                                                |
+| --- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| ✓   | **Gemini 3.5 (Vertex AI)** | Core Agent（`agents/core`）。**global** エンドポイントの `gemini-3.5-flash`。モデル ID は `GEMINI_MODEL` から                           |
+| ✓   | **Google ADK**             | 3 エージェントすべて。ADK TypeScript（`@google/adk` 2.0.0）                                                                             |
+| ✓   | **A2A**                    | Gateway → Core。Agent Card + `message/send`。Gateway → Synthesis は意図的に通常の HTTP——詳細は[A2A について正確に](#a2a-について正確に) |
+| ✓   | **Cloud Run**              | エージェントごとに 1 サービス。加えて Gemma を Cloud Run GPU (NVIDIA RTX PRO 6000) で提供し、`kill-switch` サービスも動かす             |
+| ✓   | **Firestore**              | Token Vault と OKF 回答ストア——どちらも `expires_at` に TTL ポリシーを設定                                                              |
+| ✓   | **Gemma（ボーナス）**      | Gateway の span 抽出と Synthesis の judge。Ollama で自ホスト                                                                            |
 
 Gateway と Synthesis は **`OllamaLlm`** 経由で Gemma に到達する。これは `packages/common` に
 ある独自の ADK `BaseLlm` アダプタで、`ollama/*` にマッチするモデル名として `LLMRegistry` に
 登録されている。Ollama の OpenAI 互換 `/v1/chat/completions` を話すため、開発時のローカル
 Ollama と本番の Cloud Run GPU を同一のコードパスで扱える。
+
+## デプロイ済みエンドポイント
+
+フリートはプロジェクト `all-thinkgs`（`us-central1`）で稼働中。公開されているのは Gateway
+だけで、他はすべて private（IAM invoker + ID トークン）か internal ingress のみ。
+
+| サービス          | URL                                               | アクセス                       |
+| ----------------- | ------------------------------------------------- | ------------------------------ |
+| `gateway-agent`   | <https://gateway-agent-turszib42q-uc.a.run.app>   | **公開** — デモの入口          |
+| `core-agent`      | `https://core-agent-turszib42q-uc.a.run.app`      | private（A2A、ID トークン）    |
+| `synthesis-agent` | `https://synthesis-agent-turszib42q-uc.a.run.app` | private（HTTP、ID トークン）   |
+| `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress のみ          |
+| `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private（Pub/Sub push + OIDC） |
+
+```bash
+curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
+```
+
+`just urls` はこの一覧を Terraform から再生成し、`just health` は ID トークン付きで全サービス
+の死活を確認する。
+
+## 利用方法は 5 つ
+
+パイプラインは 1 本、入口が 5 つ。どれを使っても同じ fail-closed のゲートが走り、同じマスク
+済み evidence が保存される。
+
+| サーフェス      | 入口                             | 向いている用途                                      |
+| --------------- | -------------------------------- | --------------------------------------------------- |
+| **Web UI**      | Gateway の `/`（ビルド済み SPA） | デモ: マスク済みプロンプトと最終回答を左右で対比    |
+| **REST**        | `POST /v1/ask`                   | 完全な結果——trust dimension、attestation、統計      |
+| **OpenAI 互換** | `POST /v1/chat/completions`      | 既存の OpenAI クライアントにそのまま差し込む        |
+| **MCP**         | `clients/mcp`（stdio）           | エージェントに ask / evidence / verify ツールを渡す |
+| **Python CLI**  | `clients/python/pgw.py`          | 依存の軽い利用例。バンドル digest を全部検証できる  |
+
+それぞれの詳細は下記: [API](#api)、[モデルとして使う](#openai-互換クライアントで-privacy-gateway-をモデルとして使う)、
+[MCP](#mcp-サーバ)、[Python クライアント](#python-クライアント言語非依存の利用例)。
 
 ## リポジトリ構成
 
@@ -87,6 +125,7 @@ agents/gateway/    # ADK エージェント + HTTP 入口 + web/dist の配信
 agents/core/       # ADK エージェント（Gemini）+ A2A サーバ
 agents/synthesis/  # ADK エージェント + A2A サーバ + HTTP ルート
 services/kill-switch/  # コストキルスイッチ: 予算通知 → 支出を止める
+clients/mcp/       # MCP stdio サーバ: pgw_ask / pgw_evidence / pgw_verify
 clients/python/    # pgw.py — 単一ファイルの PEP 723 クライアント（言語非依存の例）
 serving/gemma/     # Cloud Run GPU 用の Ollama Dockerfile
 web/               # デモ UI（マスク済みと最終回答の対比）+ Playwright スペック
@@ -95,7 +134,7 @@ infra/terraform/   # Terraform: Cloud Run、IAM、Firestore TTL、Artifact Regis
 ```
 
 workspace のパッケージは `web`、`packages/common`、`agents/core`、`agents/gateway`、
-`agents/synthesis`、`services/kill-switch`。キルスイッチが `agents/` ではなく `services/` に
+`agents/synthesis`、`services/kill-switch`、`clients/mcp`。キルスイッチが `agents/` ではなく `services/` に
 あるのは、推論フリートの一員ではないから — プロンプトも回答も vault エントリも一切見ない。
 
 相対 import は **`.ts` 拡張子**を付けて書く（`import { x } from './x.ts'`）。tsconfig の
@@ -252,6 +291,9 @@ just web-build      # web/dist を生成
 just dev-gateway    # http://localhost:8081
 ```
 
+`just web-build` は `pnpm -r build` を呼ぶので、`clients/mcp` も `clients/mcp/dist/` に
+コンパイルされる。MCP クライアントの設定が指すのはこのエントリポイント。
+
 ### 検査
 
 ```bash
@@ -263,7 +305,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-vitest は 21 ファイル・290 テスト。ルートの `vitest.config.ts` が `test.projects` を使うので
+vitest は 31 ファイル・545 テスト。ルートの `vitest.config.ts` が `test.projects` を使うので
 `just test` はリポジトリルートから全部を走らせられる一方、各パッケージも自前の `test` script
 を保持しており `pnpm --filter X test` も従来どおり動く。`just test-coverage` は
 `@vitest/coverage-v8` を使い、パッケージごとの下限を強制する。`packages/common` は行 90%
@@ -280,7 +322,7 @@ just web-e2e        # Playwright、chromium のみ
 just setup-browsers # Nix の外では 1 度だけ
 ```
 
-`web/e2e/` の 9 本の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
+`web/e2e/` の 36 本の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
 だけをモックした上で実物の Gateway と Synthesis を起動する。つまりブラウザが叩くのはスタブ
 API ではなく本番のリクエスト経路そのもの。chromium のみとしているのは、これらが検証するのは
 アプリケーションの挙動であってレンダリング差ではなく、2 つ目のエンジンは追加のシグナルなしに
@@ -355,6 +397,23 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
+Codex CLI も同じ要領で選べる——このフリートは単なる OpenAI 互換プロバイダにすぎない。
+`~/.codex/config.toml` に:
+
+```toml
+[model_providers.privacy-gateway]
+name = "Privacy Gateway"
+base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+wire_api = "chat"
+
+[profiles.privacy-gateway]
+model_provider = "privacy-gateway"
+model = "privacy-gateway"
+```
+
+あとは `codex --profile privacy-gateway`。`GET /v1/models` が広告する ID は
+`privacy-gateway` ただ 1 つ——呼び出し側が選ぶのは背後のモデルではなく*フリート*である。
+
 **メッセージのマッピング**: `system` と `user` の content を順序どおり空行区切りで連結し、
 パイプラインがマスクする単一のテキストにする。`assistant` ターンは破棄する——それはこの
 フリート自身の過去の出力であり、呼び出し側の履歴ではすでに復元済みであるため、送り返すと
@@ -380,8 +439,40 @@ OpenAI スキーマでは表現できないプライバシー情報は `x_privac
 `clients/mcp` は、このフリートを任意の MCP クライアントに 3 つのツール——`pgw_ask`、
 `pgw_evidence`、`pgw_verify`——として公開する。エージェントは質問し、監査ドキュメントを読み、
 attestation を独立に再実行できる。拒否は例外ではなく構造化された結果として返るため、モデルは
-プライバシーゲートを迂回してリトライするのではなく、その内容を説明できる。Claude Desktop /
-Claude Code / Codex の設定は [`clients/mcp/README.ja.md`](clients/mcp/README.ja.md) にある。
+プライバシーゲートを迂回してリトライするのではなく、その内容を説明できる。
+
+一度ビルドし（`pnpm -r build`）、あとは登録するだけ。Claude Desktop は
+`claude_desktop_config.json` に:
+
+```json
+{
+  "mcpServers": {
+    "privacy-gateway": {
+      "command": "node",
+      "args": ["/absolute/path/to/all-things-agentic-hackathon/clients/mcp/dist/index.js"],
+      "env": { "PGW_GATEWAY_URL": "https://gateway-agent-turszib42q-uc.a.run.app" }
+    }
+  }
+}
+```
+
+Claude Code と Codex も同じバイナリを登録する:
+
+```bash
+claude mcp add privacy-gateway \
+  --env PGW_GATEWAY_URL=https://gateway-agent-turszib42q-uc.a.run.app \
+  -- node /absolute/path/to/clients/mcp/dist/index.js
+```
+
+```toml
+[mcp_servers.privacy-gateway]
+command = "node"
+args = ["/absolute/path/to/clients/mcp/dist/index.js"]
+env = { PGW_GATEWAY_URL = "https://gateway-agent-turszib42q-uc.a.run.app" }
+```
+
+`pgw_verify` が何を検証でき何をできないか、拒否がなぜ例外ではなく結果なのか——詳細は
+[`clients/mcp/README.ja.md`](clients/mcp/README.ja.md) にある。
 
 ## Python クライアント（言語非依存の利用例）
 
@@ -509,13 +600,15 @@ just tf-init                      # そのバケットを backend として Terr
 just build                        # 5 つのイメージを Cloud Build でビルド・push
 just tf-plan gpu_enabled=false    # 変更内容を確認
 just tf-apply gpu_enabled=false   # GPU サービス以外をすべて適用
-just tf-apply                     # L4 クォータ承認後に gemma-serving を追加
+just tf-apply                     # GPU を積んだ gemma-serving を追加
 just urls && just health          # 確認
 just tf-destroy                   # 撤収（GPU の課金を最優先で止める）
 ```
 
-`gpu_enabled=false` は GPU を使う `gemma-serving` を作成対象から外すため、Cloud Run の L4
-クォータ申請が承認待ちの間でも残りのフリートを先にデプロイできる。
+`gpu_enabled=false` は GPU を使う `gemma-serving` を作成対象から外すため、GPU なしでも残りの
+フリートをデプロイできる。アクセラレータは L4 ではなく **NVIDIA RTX PRO 6000**。Google が
+L4 のクォータ申請を却下し（リージョン枯渇、2026-08）、リージョンごとに自動付与される
+RTX PRO 6000 を案内したため、クォータ待ちは発生しない。
 
 Core のサービスアカウントには意図的に Firestore ロールを **与えない**。Gemma のエンドポイントは
 内部 ingress のみ。サービス間呼び出しは ID トークンで認証する。
@@ -547,7 +640,7 @@ publish し、その push subscription が小さな `kill-switch` Cloud Run サ�
 | 変数                         | 既定値                      | 用途                                                                            |
 | ---------------------------- | --------------------------- | ------------------------------------------------------------------------------- |
 | `GOOGLE_CLOUD_PROJECT`       | —                           | Vertex AI と Firestore の GCP プロジェクト                                      |
-| `GOOGLE_CLOUD_LOCATION`      | `us-central1`               | Vertex AI のリージョン                                                          |
+| `GOOGLE_CLOUD_LOCATION`      | `us-central1`               | Vertex AI のロケーション。Core は `global` でデプロイされる——下の注記を参照     |
 | `GOOGLE_GENAI_USE_VERTEXAI`  | `1`                         | Gemini SDK を Vertex AI 経由にする                                              |
 | `GEMINI_MODEL`               | `gemini-3.5-flash`          | Core のモデル ID — **下の注記を参照**                                           |
 | `GEMMA_BASE_URL`             | `http://localhost:11434/v1` | OpenAI 互換の Gemma エンドポイント                                              |
@@ -573,10 +666,16 @@ publish し、その push subscription が小さな `kill-switch` Cloud Run サ�
 | `OTEL_SERVICE_NAME`          | エージェント名              | span 上のサービス名を上書きする                                                 |
 | `VITE_GCP_PROJECT`           | —                           | UI のコンソールリンクに埋め込むプロジェクト ID                                  |
 
-> **`GEMINI_MODEL` についての注記。** ハッカソンの要件は「Gemini 3.5 以降」。モデル ID の
-> 文字列は GA のタイミングで変わり得るため、エージェントのコードには埋め込まず
-> `GEMINI_MODEL` から読む。既定値は `gemini-3.5-flash` で、これは実際に Vertex AI へ
-> `generateContent` を投げて疎通を確認済み。なお `gemini-3.5-pro` は現時点の Vertex AI では
+> **`GEMINI_MODEL` と global エンドポイントについての注記。** ハッカソンの要件は
+> 「Gemini 3.5 以降」。モデル ID の文字列は GA のタイミングで変わり得るため、エージェントの
+> コードには埋め込まず `GEMINI_MODEL` から読む。既定値は `gemini-3.5-flash` で、これは実際に
+> Vertex AI へ `generateContent` を投げて疎通を確認済み。
+>
+> `gemini-3.5-flash` は **global の Vertex エンドポイントにのみ**公開されている。`us-central1`
+> のリージョナルエンドポイントは 404 を返す（2026-08-28 に実測）。そのため Terraform は Core
+> サービスだけを `GOOGLE_CLOUD_LOCATION=global` でデプロイし、Firestore・Cloud Run・Artifact
+> Registry など他のリソースは `us-central1` のまま置く。この変数を読むのは GenAI SDK だけなので、
+> Core で上書きしても他は動かない。なお `gemini-3.5-pro` は現時点の Vertex AI では
 > 解決できない（404 "Publisher model … not found"）。Pro 系が必要なら
 > `gemini-3.1-pro-preview` が利用できる。デモの前に、対象プロジェクトが提供している ID を
 > 確認すること。

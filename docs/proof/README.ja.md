@@ -39,6 +39,30 @@
 | `sa-core-iam.txt`       | Core のサービスアカウントのロール一覧 — **Firestore ロールなし**                              |
 | `fleet-state.txt`       | Ingress、最小/最大インスタンス数、サービスアカウント、接続された GPU                          |
 
+### 後日の記録（2026-08-27/28）
+
+| ファイル                                 | 内容                                                                          |
+| ---------------------------------------- | ----------------------------------------------------------------------------- |
+| [`kill-switch.md`](./kill-switch.md)     | キルスイッチの**実発火**。止まったもの・止まらなかったもの・未修正の欠陥 2 件 |
+| [`openai-compat.md`](./openai-compat.md) | 本番に対する `/v1/chat/completions`。および advisory judge の不具合           |
+| [`mcp.md`](./mcp.md)                     | MCP stdio サーバを本番に対して実行した記録（`pgw_ask` + `pgw_verify`）        |
+
+## 上記の取得中に判明した未修正の欠陥
+
+すべて green の報告と誤読されないよう記載する。詳細とログ断片は各ドキュメント参照。
+
+1. **advisory Gemma judge が自分のプレースホルダを leak と誤判定する。** `⟦TYPE_N⟧` を含む
+   回答は `judge_flagged`（`leak: true`, `categories: []`）で拒否され、`just smoke` は現在
+   失敗する。決定的 attester は pass しているため、リークではなく **fail-closed** 側の誤り
+   だが、デモは通らない。judge のコードは初回コミットから変更なし。
+   `serving/gemma/Dockerfile` が `FROM ollama/ollama:latest`（**未固定**）で、稼働中の
+   Ollama 0.33.1 が gemma3 を `--chat-template chatml --no-jinja` で配信している点が
+   有力な仮説。[`openai-compat.md`](./openai-compat.md) 参照。
+2. **キルスイッチは公開アクセスを剥奪するが GPU の上限を落とせない。** `scaleToZero` が
+   `gemma-serving` に対して失敗し、ハンドラが再配信のため `500` を返すので、Pub/Sub の
+   保持期間 600 秒が切れるまで約 30 秒ごとに gateway のバインディングを剥奪し続け、
+   運用者の復旧を妨げる。[`kill-switch.md`](./kill-switch.md) 参照。
+
 ## この証跡が示すこと
 
 **マスキングは実際に機能している。** `stats.counts_by_category` は

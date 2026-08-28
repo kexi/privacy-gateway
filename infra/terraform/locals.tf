@@ -91,6 +91,22 @@ locals {
         CORE_BASE_URL      = local.run_url["core-agent"]
         SYNTHESIS_BASE_URL = local.run_url["synthesis-agent"]
         GEMMA_BASE_URL     = local.gemma_base_url
+        # Why 150 and not the 60 s compiled-in default: on a cold fleet the
+        # first /v1/ask blew the deadline and returned 504 before Gemma had
+        # answered. The GPU instance itself starts in ~5 s; what dominates is
+        # Ollama loading gemma3:12b (~8 GB) into the RTX PRO 6000 after the
+        # container is up, and the request that triggers the scale-from-zero
+        # waits for all of it. Measured worst case was ~90 s from cold, so 150 s
+        # covers it with margin without letting a genuinely hung request hang
+        # forever.
+        #
+        # Why not raise the default in config.ts: 60 s is the right deadline
+        # once Gemma is warm, which is every request after the first. This is a
+        # deployment property of a scale-to-zero GPU, not a property of the
+        # gateway. Why not min-instances=1 instead: an idle GPU instance bills
+        # continuously; `just warm` buys that trade deliberately for a filming
+        # window, and `just chill` gives it back.
+        REQUEST_DEADLINE_SECONDS = "150"
       }
     }
   }
