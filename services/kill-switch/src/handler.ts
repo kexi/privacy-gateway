@@ -13,6 +13,16 @@
  * unparseable notification is reported (HTTP 400, logged at ERROR) and nothing
  * is touched, and only an arithmetic comparison of two numbers fires the
  * switch.
+ *
+ * The same reasoning makes delivery *terminal*. A disclosure gate retries
+ * because a missed refusal leaks data; a cost gate that retries forever becomes
+ * the outage. The live fire proved it: `scaleToZero` failed, the endpoint
+ * answered 500, and Pub/Sub redelivered every ~30 s for 11 minutes, re-revoking
+ * the gateway's public binding seconds after each operator restore until the
+ * retention window drained. So a trip is attempted at most once — recorded by a
+ * `kill-switch/tripped` annotation, cleared by `just restore-after-kill` — and
+ * the push endpoint acknowledges even a partial failure, leaving the ERROR log
+ * and the dead-letter topic as the operator's signal rather than a retry storm.
  */
 
 import type { Logger } from '@privacy-gateway/common';
@@ -47,7 +57,9 @@ export type HandlerOutcome =
       readonly gemmaAlreadyScaledToZero: boolean;
     }
   /** Over budget, but a mutation failed. The switch did not fully engage. */
-  | { readonly kind: 'failed'; readonly error: string };
+  | { readonly kind: 'failed'; readonly error: string }
+  /** Over budget, but this trip was already attempted. Nothing was touched. */
+  | { readonly kind: 'already_tripped' };
 
 export interface HandleOptions {
   readonly actions: KillActions;
@@ -108,6 +120,25 @@ export async function handleNotification(
     return { kind: 'under_budget', ratio: fields['budget_ratio'] ?? 0 };
   }
 
+  // A trip that has already been attempted must not be attempted again.
+  //
+  // Why this check exists at all: the mutations are individually idempotent,
+  // but revoke-then-restore is not idempotent *against an operator restoring in
+  // parallel*. During the live fire the handler re-revoked every ~30 s for 11
+  // minutes and took the binding away again seconds after a `tf-apply` had put
+  // it back, so recovery was impossible until the retention window drained. The
+  // marker makes the trip a one-shot: the operator's restore is what clears it.
+  const alreadyTripped = await actions
+    .isTripped(targets.gatewayService)
+    // A marker that cannot be read must not block the switch: failing to stop a
+    // real overspend is worse than acting twice. Falls through to the trip.
+    .catch(() => false);
+
+  if (alreadyTripped) {
+    logger.event('killswitch.already_tripped', fields, 'WARNING');
+    return { kind: 'already_tripped' };
+  }
+
   logger.event('killswitch.triggered', fields, 'WARNING');
 
   try {
@@ -127,6 +158,20 @@ export async function handleNotification(
       already_applied: scaled.alreadyApplied,
     });
 
+    // Written only once both mutations have been confirmed, so the marker never
+    // claims a trip that did not fully engage. A marker that cannot be written
+    // is logged and tolerated: the fleet is already stopped, and refusing here
+    // would turn a successful trip back into a redelivery loop.
+    try {
+      await actions.markTripped(targets.gatewayService);
+    } catch (error) {
+      logger.event(
+        'killswitch.mark_failed',
+        { ...fields, error_class: error instanceof Error ? error.name : 'unknown_error' },
+        'WARNING',
+      );
+    }
+
     logger.event('killswitch.completed', {
       ...fields,
       already_applied: invoker.alreadyApplied && scaled.alreadyApplied,
@@ -139,9 +184,10 @@ export async function handleNotification(
       gemmaAlreadyScaledToZero: scaled.alreadyApplied,
     };
   } catch (error) {
-    // A 500 makes Pub/Sub redeliver, which is exactly what is wanted: the
-    // operations are idempotent, so a retry re-attempts the half that failed
-    // and no-ops the half that succeeded.
+    // Reported as a failure, but the transport answers 2xx anyway — see the
+    // status mapping in `server.ts`. A 500 here is what produced the revoke
+    // loop: the failing half never started succeeding, so Pub/Sub redelivered
+    // for the whole retention window and re-ran the half that *had* worked.
     const errorClass = error instanceof Error ? error.name : 'unknown_error';
     logger.event('killswitch.failed', { ...fields, error_class: errorClass }, 'ERROR');
     return { kind: 'failed', error: errorClass };

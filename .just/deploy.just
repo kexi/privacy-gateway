@@ -366,6 +366,20 @@ logs-kill-switch:
       --project "{{ project_id }}" --freshness=24h --order=desc --limit=50 --format=json \
       | jq -c '.[] | {t:.timestamp, sev:.severity, ev:.jsonPayload.event, cost:.jsonPayload.cost_amount, budget:.jsonPayload.budget_amount, ratio:.jsonPayload.budget_ratio}'
 
+# Show budget notifications that were dead-lettered after five failed deliveries
+logs-kill-switch-dlq:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A message here means the switch could not be delivered at all — the
+    # service would not start, or the platform kept answering 5xx. The handler
+    # itself no longer asks for redelivery, so this queue should stay empty;
+    # anything in it is the retry loop having been stopped rather than run.
+    echo "== dead-lettered budget notifications =="
+    gcloud pubsub subscriptions pull billing-kill-switch-dead-letter-hold \
+      --project="{{ project_id }}" --limit=10 --format=json \
+      | jq -r '.[] | {published: .message.publishTime, data: (.message.data | @base64d)}' \
+      || echo "(none, or the dead-letter subscription is not deployed)"
+
 # Undo a kill-switch trip: restore public access and the GPU max instances
 restore-after-kill *vars:
     #!/usr/bin/env bash
@@ -382,6 +396,21 @@ restore-after-kill *vars:
     echo "Fix the underlying spend first, or the switch will trip again."
     just tf-apply {{ vars }}
 
+    # Clearing the marker is what re-arms the switch. It is done last and only
+    # after the apply succeeded: while it is set the switch will not fire, so
+    # removing it before the fleet is actually restored would leave a window in
+    # which the switch is armed against a fleet that is still down.
+    #
+    # Why gcloud rather than Terraform: the annotation is runtime state written
+    # by the switch, not desired state. Declaring it in Terraform would mean the
+    # committed configuration has an opinion about whether the fleet is tripped.
+    echo "==> clearing the kill-switch/tripped marker"
+    gcloud run services update gateway-agent \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --remove-annotations "kill-switch/tripped" --quiet >/dev/null \
+      || echo "    (no marker was set)"
+    echo "==> the kill switch is armed again"
+
 # Roll a new revision of already-deployed services from the latest images.
 # Why not tf-apply: the image tag is `latest`, so Terraform sees no diff after
 # a rebuild; Cloud Run only pulls the tag again when a new revision is forced.
@@ -394,8 +423,20 @@ roll *services:
     fi
     ar_path="{{ region }}-docker.pkg.dev/{{ project_id }}/{{ ar_repo }}"
     for svc in "${targets[@]}"; do
-      img="${svc%-agent}"
-      [ "$svc" = "kill-switch" ] && img="kill-switch"
+      # Service name -> image name, stated explicitly rather than derived.
+      # Why not `${svc%-agent}`: it silently produced `gemma-serving` for the
+      # GPU service, whose image is `gemma`, and the roll failed with an
+      # "Image not found" that reads like a missing build rather than a naming
+      # bug. An explicit case cannot be wrong by omission — an unknown service
+      # stops the loop instead of guessing.
+      case "$svc" in
+        gateway-agent) img="gateway" ;;
+        core-agent) img="core" ;;
+        synthesis-agent) img="synthesis" ;;
+        gemma-serving) img="gemma" ;;
+        kill-switch) img="kill-switch" ;;
+        *) echo "unknown service: $svc" >&2; exit 1 ;;
+      esac
       echo "==> rolling ${svc} from ${ar_path}/${img}:{{ image_tag }}"
       gcloud run services update "$svc" --region "{{ region }}" --project "{{ project_id }}" \
         --image "${ar_path}/${img}:{{ image_tag }}" --quiet >/dev/null

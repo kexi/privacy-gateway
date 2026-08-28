@@ -15,6 +15,7 @@ import {
   LeakJudgeSchema,
   ollamaModelId,
   registerOllamaLlm,
+  stripPlaceholders,
   type GemmaAuthMode,
   type Logger,
 } from '@privacy-gateway/common';
@@ -59,8 +60,11 @@ const JUDGE_PROMPT = `You are a privacy auditor. Answer with JSON only:
 {"leak": true|false, "categories": [...]}.
 
 Does the following text contain any real personal data or secret (email, phone number,
-credit card, API key, address, personal name)? Text between ⟦ and ⟧ is an already-masked
-placeholder and is NOT a leak.`;
+credit card, API key, address, personal name)?
+
+The text has already been masked: every placeholder was removed before you were shown
+it, so what you receive is the residual prose alone. Judge only what is in front of you.
+Gaps where a value used to sit are expected and are not evidence of a leak.`;
 
 export interface JudgeOptions {
   readonly baseUrl?: string | undefined;
@@ -79,6 +83,11 @@ export interface JudgeOptions {
  * Probabilistic, and applied asymmetrically by the pipeline: `leak: true` or an
  * unusable answer blocks the release, `leak: false` adds no trust whatsoever.
  * The deterministic attester remains the only thing that can pass a response.
+ *
+ * The text is stripped of every well-formed placeholder first, so the question
+ * the model actually answers is "does the residual prose contain personal
+ * data". Placeholders are not leaks by construction and the attester has
+ * already checked them; leaving them in made the judge veto its own masking.
  *
  * The endpoint is called directly rather than through a runner because a single
  * JSON classification needs no session, no tools and no event stream.
@@ -113,6 +122,12 @@ export function createLeakJudge(
   };
 
   return async (text: string, signal?: AbortSignal) => {
+    // Placeholders are removed here, at the one place that talks to the model,
+    // rather than at the call site: the guarantee is "the judge never sees a
+    // placeholder", and a guarantee enforced at the boundary cannot be lost by
+    // a future second caller that forgets to strip.
+    const residual = stripPlaceholders(text);
+
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort();
@@ -136,7 +151,7 @@ export function createLeakJudge(
           model,
           messages: [
             { role: 'system', content: JUDGE_PROMPT },
-            { role: 'user', content: text },
+            { role: 'user', content: residual },
           ],
           response_format: { type: 'json_object' },
           // Deterministic generation. The verdict can block a release, so the

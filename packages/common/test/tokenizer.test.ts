@@ -17,6 +17,7 @@ import {
   rehydrate,
   rehydrateWithPolicy,
   SessionTokenizer,
+  stripPlaceholders,
   tokenize,
   type Detection,
   withheldCategories,
@@ -173,6 +174,33 @@ describe('reserved placeholder syntax', () => {
   it('passes ordinary text, including brackets that are not the reserved pair', () => {
     expect(containsReservedSyntax('see [1] and <tag> and {json}')).toBe(false);
     expect(containsReservedSyntax('メールは taro@example.co.jp です')).toBe(false);
+  });
+});
+
+describe('stripping placeholders for the advisory judge', () => {
+  it('removes every well-formed placeholder and keeps the prose', () => {
+    expect(stripPlaceholders('Mail ⟦EMAIL_1⟧ and call ⟦PHONE_2⟧ today.')).toBe(
+      'Mail   and call   today.',
+    );
+  });
+
+  it('leaves text that merely resembles a placeholder', () => {
+    // Only the form this system mints is provably a mask. A missing index, a
+    // lowercase category or a half-open pair is not, so it stays visible to the
+    // judge rather than being silently removed from what gets checked.
+    const text = '⟦EMAIL⟧ ⟦email_1⟧ ⟦EMAIL_1';
+    expect(stripPlaceholders(text)).toBe(text);
+  });
+
+  it('separates values that were adjacent, so no spurious token is welded', () => {
+    expect(stripPlaceholders('⟦EMAIL_1⟧⟦EMAIL_2⟧')).toBe('  ');
+  });
+
+  it('is stable across calls, despite the shared global regex', () => {
+    // A module-scoped `g` regex carries lastIndex; a second identical call must
+    // not strip a different amount than the first.
+    const text = 'a ⟦EMAIL_1⟧ b';
+    expect(stripPlaceholders(text)).toBe(stripPlaceholders(text));
   });
 });
 

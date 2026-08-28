@@ -140,3 +140,175 @@ Both findings are open. Suggested fixes, not applied here:
 2. Make redelivery safe: record per-action success so a retry does not repeat an action
    that already succeeded, and/or add a dead-letter policy so a permanently failing
    message stops after N attempts instead of looping for the whole retention window.
+
+---
+
+## Addendum (2026-08-28): both findings fixed
+
+Both root causes were found and fixed. The suspicion recorded above — that the v2 API
+rejected the full-object write because of output-only or GPU-specific fields — **was
+wrong**, and is corrected here rather than left standing.
+
+### Finding 1 root cause: the long-running operation was never awaited
+
+`updateService` in Cloud Run Admin v2 returns a **long-running operation**, not a
+completed write. The old code did:
+
+```ts
+await client.updateService({ service: { ... } });   // resolves when the LRO STARTS
+```
+
+That resolves as soon as Cloud Run _accepts_ the request. The actual update was still in
+flight — and any rejection surfaced later, outside the `try` block that was supposed to
+catch it. So the handler reported success while `gemma-serving` kept
+`maxInstanceCount = 1`. This is precisely why `revokePublicInvoker` worked and
+`scaleToZero` did not: `setIamPolicy` returns the policy directly, with no operation to
+await.
+
+Evidence that the rejection hypothesis was wrong: replaying the exact full-object write
+against the real service with `validateOnly: true` was **accepted**, output-only fields
+and `nodeSelector: nvidia-rtx-pro-6000` included.
+
+A second, independent bug was found while fixing it. Cloud Run v2 has **two** scaling
+caps and the code only ever wrote one:
+
+| Field                      | `gemma-serving` | `gateway-agent` |
+| -------------------------- | --------------- | --------------- |
+| `service.scaling`          | `1`             | `20`            |
+| `service.template.scaling` | `1`             | `3`             |
+
+They are genuinely independent. Capping only the revision-level one would have left the
+service-level cap able to start the GPU, so the fix writes both.
+
+The fix therefore does three things: writes both caps, awaits `operation.promise()`, and
+**verifies the server's echo** rather than trusting the call — a completed operation that
+did not apply the cap now throws `scale_to_zero_not_applied`.
+
+### Finding 2 root cause: 500-for-redelivery, with nothing to stop it
+
+The loop was the design working as written. The push endpoint answered `500` so Pub/Sub
+would redeliver "and finish the half that failed", but the failing half could never
+succeed, so every redelivery re-ran the half that had. Delivery is now **terminal**:
+
+- The trip is recorded as a `kill-switch/tripped` annotation on `gateway-agent`, written
+  only after **both** mutations are confirmed. A redelivery reads it and returns
+  `already_tripped` without touching anything.
+- The endpoint **acknowledges** (2xx) even a failed trip. One notification now causes at
+  most one trip attempt; the ERROR log is the operator's signal, not a retry storm.
+- A **dead-letter topic** (`billing-kill-switch-dead-letter`, `max_delivery_attempts = 5`)
+  bounds any transport-level retry loop the application cannot answer its way out of.
+  Read it with `just logs-kill-switch-dlq`.
+- `just restore-after-kill` clears the marker after a successful apply, re-arming the
+  switch. Clearing it last is deliberate: while it is set the switch will not fire, so
+  removing it earlier would arm the switch against a fleet that is still down.
+
+Why the marker fails _open_ on a read error: failing to stop a real overspend is worse
+than acting twice, so an unreadable marker falls through to the trip.
+
+### Two more root causes, found only by re-firing
+
+The code fix alone was not enough. Re-firing against the real deployment exposed **two IAM
+grants the switch never had**, each hidden behind the other, and both invisible before
+because the un-awaited operation swallowed every rejection. The audit log
+(`protoPayload.methodName="google.cloud.run.v2.Services.UpdateService"`) named them; the
+service's own structured log could not, since it records `error_class` only.
+
+**1. Artifact Registry read.** A Cloud Run service _update_ re-validates the container
+image, so the caller must be able to read the repository even when the update touches
+nothing but `scaling`:
+
+```
+PERMISSION_DENIED: Permission 'artifactregistry.repositories.downloadArtifacts'
+denied on resource '.../repositories/agentic-fleet'
+```
+
+`roles/run.admin` does not imply it — run.admin governs the Cloud Run resource, not the
+registry the image lives in. Fixed by granting `roles/artifactregistry.reader`.
+
+**2. actAs on the GPU service's runtime identity.** Immediately behind it:
+
+```
+PERMISSION_DENIED: Permission 'iam.serviceaccounts.actAs' denied on service account
+sa-gemma@all-thinkgs.iam.gserviceaccount.com
+```
+
+Updating a service means assigning it a runtime service account, so the caller must be able
+to act as that account — even when the identity is unchanged. Fixed by granting
+`roles/iam.serviceAccountUser` on `sa-gemma` alone (not project-wide). `sa-gateway` is
+deliberately not granted: the gateway mutation is an IAM policy change, which needs no
+actAs.
+
+Both are now declared in `infra/terraform/killswitch.tf`.
+
+### Two corrections to the fix itself, also from re-firing
+
+**Only `template.scaling` is the real cap.** The addendum above claimed both scaling
+fields had to be written. Writing both is harmless, but only `template.scaling` can be
+asserted: it is what Cloud Run surfaces as `autoscaling.knative.dev/maxScale`, and it is
+what the original fire measured as "still 1". The top-level `service.scaling` is the
+newer _manual_ instance count, inert unless `scalingMode` selects manual scaling — and
+proto3 cannot distinguish an explicit `0` from an unset field, so the server drops that
+write and the value reads back as `1` forever. Requiring it to be zero made the action
+throw on every trip even though the GPU was genuinely capped.
+
+**The operation's rejection is not the verdict.** On this GPU service the operation
+reports a failure while the scaling change still lands — the operation is really reporting
+on the new revision coming up, and a GPU revision cannot start an instance when its own
+maximum is zero. Measured:
+
+```
+01:38:49.191  UpdateService                     status=ok
+01:38:49.535  killswitch.failed                 (the LRO rejected)
+01:38:50.538  Ready condition True for gemma-serving-00010-4f2, cap = 0
+```
+
+So the operation is awaited (that part of the fix stands), but the **service's own state
+one read later is what decides**, because it is the thing that costs money. A cost gate
+that cries failure on a successful trip re-arms the operator's alarm for a fleet that is
+already stopped. When the cap genuinely did not apply, the operation's error is reported
+in preference to a bare assertion, because it explains why.
+
+A zero reads back as an **absent** field, so "0 or unset" is the success condition.
+
+**A third actAs grant, for the marker.** The first fully-successful trip then revealed one
+more: writing the `kill-switch/tripped` annotation updates `gateway-agent`, so it needs
+`actAs` on `sa-gateway` as well. Without it the trip succeeded and then failed to record
+itself (`killswitch.mark_failed`) — which would have let a redelivery trip the fleet a
+second time, the exact loop the marker exists to prevent. The invoker revocation itself
+needs no actAs, because it is a `setIamPolicy` call rather than a service update.
+
+## The switch fully engaging (2026-08-28)
+
+The first fire in this project's history where **both** halves worked:
+
+```json
+{"t":"2026-08-28T01:51:17.917Z","ev":"killswitch.triggered"}
+{"t":"2026-08-28T01:51:18.296Z","ev":"killswitch.invoker_revoked"}
+{"t":"2026-08-28T01:51:18.898Z","ev":"killswitch.scaled_to_zero"}
+{"t":"2026-08-28T01:51:24.228Z","ev":"killswitch.completed"}
+```
+
+| Check                      | Before  | After                  | Verdict               |
+| -------------------------- | ------- | ---------------------- | --------------------- |
+| `gateway-agent` `allUsers` | present | **revoked**            | public door shut      |
+| `gemma-serving` maxScale   | `1`     | **`0`** (field absent) | **the GPU is capped** |
+| Redelivery loop            | —       | **none**               | delivery terminal     |
+
+Compare with the original fire, where `gemma-serving` kept `maxInstanceCount = 1` and the
+handler logged `killswitch.failed` every ~30 s for 11 minutes.
+
+### The loop is gone
+
+Measured on the fire before this one, which still ended in `killswitch.failed` — the worst
+case for the old design, because a permanent failure is exactly what looped:
+
+```
+01:06:15.932  killswitch.triggered
+01:06:16.417  killswitch.invoker_revoked
+01:06:21.948  killswitch.failed
+   … nothing further through 01:08:43 (2.5 minutes)
+```
+
+Exactly **one** `triggered` and **one** `invoker_revoked`. Under the old 500-for-redelivery
+design this window already showed three or four re-revocations. The endpoint now
+acknowledges, so one notification causes one trip attempt regardless of outcome.

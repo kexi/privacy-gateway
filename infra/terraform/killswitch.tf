@@ -170,6 +170,75 @@ resource "google_cloud_run_v2_service_iam_member" "kill_switch_gemma" {
   member   = "serviceAccount:${google_service_account.kill_switch[0].email}"
 }
 
+# ############################################################################
+# Read access to Artifact Registry, which a service UPDATE requires.
+#
+# Not obvious, and it cost a live fire to find. `updateService` re-validates the
+# container image the service references, so the caller must be able to read the
+# repository even when the update touches nothing but `scaling`. Without it the
+# call fails with:
+#
+#   PERMISSION_DENIED: Permission 'artifactregistry.repositories.downloadArtifacts'
+#   denied on resource '.../repositories/agentic-fleet'
+#
+# `roles/run.admin` does not imply it: run.admin governs the Cloud Run resource,
+# not the registry the image lives in. The failure was invisible for two live
+# fires because the old code never awaited the long-running operation, so the
+# rejection surfaced as a bare `{"error_class":"Error"}` with no cause.
+#
+# reader, not writer: the switch must be able to *validate* an image, never to
+# push or delete one.
+# ############################################################################
+resource "google_artifact_registry_repository_iam_member" "kill_switch_reader" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  project    = var.project_id
+  location   = var.region
+  repository = google_artifact_registry_repository.fleet.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.kill_switch[0].email}"
+}
+
+# ############################################################################
+# actAs on the GPU service's runtime identity, which a service UPDATE also
+# requires.
+#
+# The second permission the live fire uncovered, immediately behind the
+# Artifact Registry one. Deploying or updating a Cloud Run service means
+# assigning it a runtime service account, so the caller must be able to act as
+# that account — even when the update changes only `scaling` and leaves the
+# identity exactly as it was:
+#
+#   PERMISSION_DENIED: Permission 'iam.serviceaccounts.actAs' denied on service
+#   account sa-gemma@all-thinkgs.iam.gserviceaccount.com
+#
+# Granted per runtime identity, never project-wide: the switch updates exactly
+# two services, so it should be able to impersonate exactly those two identities
+# and no others.
+#
+# sa-gemma is needed for the scale-to-zero. sa-gateway is needed too — not for
+# the invoker revocation, which is a setIamPolicy call and needs no actAs, but
+# for writing the `kill-switch/tripped` annotation, which is a service update
+# like any other. Missing it made the trip succeed and then fail to record
+# itself (`killswitch.mark_failed`), which would have let a redelivery trip the
+# fleet a second time.
+# ############################################################################
+resource "google_service_account_iam_member" "kill_switch_act_as_gemma" {
+  count = var.kill_switch_enabled && var.gpu_enabled ? 1 : 0
+
+  service_account_id = google_service_account.agents["sa-gemma"].name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.kill_switch[0].email}"
+}
+
+resource "google_service_account_iam_member" "kill_switch_act_as_gateway" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  service_account_id = google_service_account.agents["sa-gateway"].name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.kill_switch[0].email}"
+}
+
 # --- the service -------------------------------------------------------------
 
 resource "google_cloud_run_v2_service" "kill_switch" {
@@ -300,6 +369,59 @@ resource "google_service_account_iam_member" "pubsub_token_creator" {
   member             = "serviceAccount:${google_project_service_identity.pubsub[0].email}"
 }
 
+# --- dead letter --------------------------------------------------------------
+
+# Where a budget notification goes when it could not be delivered five times.
+#
+# The point is not to reprocess it — by then the decision window has passed —
+# but to make the loop *stop* and leave evidence that it happened. An operator
+# reads it with `just logs-kill-switch-dlq`.
+resource "google_pubsub_topic" "kill_switch_dead_letter" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  project = var.project_id
+  name    = "billing-kill-switch-dead-letter"
+
+  depends_on = [google_project_service.required]
+}
+
+# A subscription is what makes the topic retain anything: without one, messages
+# published to it are dropped and the dead-letter policy silently discards.
+resource "google_pubsub_subscription" "kill_switch_dead_letter" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  project = var.project_id
+  name    = "billing-kill-switch-dead-letter-hold"
+  topic   = google_pubsub_topic.kill_switch_dead_letter[0].id
+
+  # Held long enough for a human to notice and read it, which a 600s window on
+  # the live subscription is not. Nothing pulls this: it is an inbox.
+  message_retention_duration = "604800s"
+
+  depends_on = [google_project_service.required]
+}
+
+# Pub/Sub moves the message itself, so its own service agent needs to publish to
+# the dead-letter topic and acknowledge on the source subscription. Without both
+# grants the policy is configured but never actually fires.
+resource "google_pubsub_topic_iam_member" "dead_letter_publisher" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  project = var.project_id
+  topic   = google_pubsub_topic.kill_switch_dead_letter[0].name
+  role    = "roles/pubsub.publisher"
+  member  = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
+resource "google_pubsub_subscription_iam_member" "dead_letter_subscriber" {
+  count = var.kill_switch_enabled ? 1 : 0
+
+  project      = var.project_id
+  subscription = google_pubsub_subscription.kill_switch[0].name
+  role         = "roles/pubsub.subscriber"
+  member       = "serviceAccount:service-${data.google_project.project.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+}
+
 resource "google_pubsub_subscription" "kill_switch" {
   count = var.kill_switch_enabled ? 1 : 0
 
@@ -312,10 +434,23 @@ resource "google_pubsub_subscription" "kill_switch" {
   message_retention_duration = "600s"
   ack_deadline_seconds       = 60
 
-  # No dead-letter topic: there is nowhere useful for a failed kill-switch
-  # message to go. A message that cannot be handled has already been logged at
-  # ERROR by the service, and the operator's next step is to look at the
-  # service, not at a queue.
+  # A message that cannot be delivered has somewhere to go after five tries.
+  #
+  # Why this exists now: the service used to answer 500 on a failed trip, and
+  # with no dead-letter policy Pub/Sub redelivered for the whole 600s retention
+  # window — a revoke every ~30s that fought the operator's restore
+  # (docs/proof/kill-switch.md). The handler no longer asks for redelivery, so
+  # this is the second line of defence: it bounds any *transport-level* retry
+  # loop (a service that will not start, a 5xx from the platform itself) that
+  # the application code cannot answer its way out of.
+  #
+  # max_delivery_attempts is 5, the minimum the API allows: this is a cost gate,
+  # and if five attempts have not tripped it, a sixth will not either.
+  dead_letter_policy {
+    dead_letter_topic     = google_pubsub_topic.kill_switch_dead_letter[0].id
+    max_delivery_attempts = 5
+  }
+
   retry_policy {
     minimum_backoff = "10s"
     maximum_backoff = "60s"

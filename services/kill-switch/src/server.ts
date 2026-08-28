@@ -83,9 +83,17 @@ export function createApp(options: CreateAppOptions): express.Application {
           res.status(400).json({ ok: false, error: outcome.error });
           return;
         case 'failed':
-          // 500 asks Pub/Sub to redeliver. The mutations are idempotent, so a
-          // retry finishes the half that failed and no-ops the half that did not.
-          res.status(500).json({ ok: false, error: outcome.error });
+          // 200, not 500, even though a mutation failed.
+          //
+          // This is the deliberate reversal of the original design. A 500 asked
+          // Pub/Sub to redeliver on the theory that a retry would finish the
+          // failed half; in the live fire the failed half never started
+          // working, so redelivery re-ran the *successful* half every ~30 s for
+          // 11 minutes and fought the operator's restore. Acknowledging makes
+          // one budget notification cause at most one trip attempt. The failure
+          // is not swallowed: it is logged at ERROR by the handler, and a
+          // message that never reaches a verdict lands in the dead-letter topic.
+          res.status(200).json({ ok: false, error: outcome.error });
           return;
         default:
           res.status(204).end();

@@ -34,10 +34,25 @@ function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
 class FakeActions implements KillActions {
   public readonly invokerCalls: string[] = [];
   public readonly scaleCalls: string[] = [];
-  public failOn: 'none' | 'invoker' | 'scale' = 'none';
+  public readonly markCalls: string[] = [];
+  public failOn: 'none' | 'invoker' | 'scale' | 'mark' | 'isTripped' = 'none';
+  /** The `kill-switch/tripped` annotation, as the real service would hold it. */
+  public tripped = false;
 
   private invokerRevoked = false;
   private scaledToZero = false;
+
+  isTripped(_service: string): Promise<boolean> {
+    if (this.failOn === 'isTripped') return Promise.reject(new TypeError('boom'));
+    return Promise.resolve(this.tripped);
+  }
+
+  markTripped(service: string): Promise<void> {
+    this.markCalls.push(service);
+    if (this.failOn === 'mark') return Promise.reject(new TypeError('boom'));
+    this.tripped = true;
+    return Promise.resolve();
+  }
 
   revokePublicInvoker(service: string): Promise<ActionOutcome> {
     this.invokerCalls.push(service);
@@ -159,8 +174,8 @@ describe('handleNotification', () => {
     });
   });
 
-  describe('idempotency under Pub/Sub redelivery', () => {
-    it('reports the second delivery as already applied and changes nothing', async () => {
+  describe('one trip per notification, under Pub/Sub redelivery', () => {
+    it('acts on the first delivery and does nothing at all on the second', async () => {
       const first = await handle(push(atRatio(1.1)));
       const second = await handle(push(atRatio(1.1)));
 
@@ -169,41 +184,71 @@ describe('handleNotification', () => {
         invokerAlreadyRevoked: false,
         gemmaAlreadyScaledToZero: false,
       });
-      expect(second).toMatchObject({
-        kind: 'triggered',
-        invokerAlreadyRevoked: true,
-        gemmaAlreadyScaledToZero: true,
-      });
+      // Not "triggered, already applied": the redelivery must not re-run the
+      // mutations at all. Re-revoking is what fought the operator's restore
+      // during the live fire, seconds after each `tf-apply` put the binding back.
+      expect(second).toEqual({ kind: 'already_tripped' });
+      expect(actions.invokerCalls).toEqual(['gateway-agent']);
+      expect(actions.scaleCalls).toEqual(['gemma-serving']);
     });
 
-    it('stays safe across many redeliveries', async () => {
+    it('never re-revokes across many redeliveries', async () => {
       for (let i = 0; i < 5; i += 1) await handle(push(atRatio(2)));
 
-      expect(actions.invokerCalls).toHaveLength(5);
-      expect(actions.scaleCalls).toHaveLength(5);
-      // Every call after the first found the desired state already in place.
-      const completions = lines.filter((line) => line['event'] === 'killswitch.completed');
-      expect(completions.map((line) => line['already_applied'])).toEqual([
-        false,
-        true,
-        true,
-        true,
-        true,
-      ]);
+      // The property that ends the loop: five deliveries, one trip.
+      expect(actions.invokerCalls).toHaveLength(1);
+      expect(actions.scaleCalls).toHaveLength(1);
+      expect(lines.filter((line) => line['event'] === 'killswitch.completed')).toHaveLength(1);
+      expect(lines.filter((line) => line['event'] === 'killswitch.already_tripped')).toHaveLength(
+        4,
+      );
+    });
+
+    it('marks the trip only after both mutations have succeeded', async () => {
+      await handle(push(atRatio(1.1)));
+
+      expect(actions.markCalls).toEqual(['gateway-agent']);
+    });
+
+    it('does not mark a trip that failed, so a later delivery can still act', async () => {
+      actions.failOn = 'scale';
+      await handle(push(atRatio(1.1)));
+
+      expect(actions.markCalls).toEqual([]);
+      expect(actions.tripped).toBe(false);
+    });
+
+    it('trips anyway when the marker cannot be read', async () => {
+      // Failing to stop a real overspend is worse than acting twice, so an
+      // unreadable marker must not become a reason to do nothing.
+      actions.failOn = 'isTripped';
+
+      expect(await handle(push(atRatio(1.1)))).toMatchObject({ kind: 'triggered' });
+    });
+
+    it('still reports success when the marker cannot be written', async () => {
+      // The fleet is already stopped at this point; refusing here would turn a
+      // successful trip back into a redelivery loop.
+      actions.failOn = 'mark';
+
+      expect(await handle(push(atRatio(1.1)))).toMatchObject({ kind: 'triggered' });
+      expect(lines.some((line) => line['event'] === 'killswitch.mark_failed')).toBe(true);
     });
   });
 
   describe('partial failure', () => {
-    it('asks for redelivery when the IAM change fails', async () => {
+    it('reports a failure and stops when the IAM change fails', async () => {
       actions.failOn = 'invoker';
 
       const outcome = await handle(push(atRatio(1.1)));
 
+      // Reported as failed, but the push endpoint answers 2xx (see server.ts):
+      // one notification causes at most one trip attempt.
       expect(outcome).toEqual({ kind: 'failed', error: 'TypeError' });
       expect(actions.scaleCalls).toEqual([]);
     });
 
-    it('asks for redelivery when scaling fails, having already closed the door', async () => {
+    it('reports a failure when scaling fails, having already closed the door', async () => {
       actions.failOn = 'scale';
 
       const outcome = await handle(push(atRatio(1.1)));

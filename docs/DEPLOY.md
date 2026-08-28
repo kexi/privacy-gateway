@@ -552,12 +552,33 @@ decide, because releasing data on a guess is unrecoverable. A cost gate is the o
 malformed notification is logged at ERROR, answered with HTTP 400 and **changes nothing**.
 Taking the demo offline because a bad message arrived would itself be the outage.
 
-**Idempotency.** Pub/Sub redelivers. Both operations are no-ops once the desired state is
-reached — removing a member that is already absent, setting a maximum that is already 0 — so
-a redelivered message costs one API read and changes nothing. There is deliberately no
-dedupe store: a cache that says "already handled" is one more thing that can be wrong at the
-moment the fleet is burning money. A mutation that _fails_ returns 500 so Pub/Sub retries,
-which finishes the half that failed and no-ops the half that succeeded.
+The same reasoning makes delivery **terminal**. A disclosure gate retries because a missed
+refusal leaks data; a cost gate that retries forever becomes the outage it was meant to
+prevent. The live fire proved it — see [proof/kill-switch.md](proof/kill-switch.md): a
+failed `scaleToZero` returned 500, and Pub/Sub redelivered every ~30 s for 11 minutes,
+re-revoking the gateway's public binding seconds after each operator restore.
+
+**One trip per notification.** Pub/Sub redelivers, so the trip is recorded as a
+`kill-switch/tripped` annotation on `gateway-agent`, written only after **both** mutations
+are confirmed. A redelivery reads the marker and returns `already_tripped` without touching
+anything. The push endpoint **acknowledges** (2xx) even a failed trip: the ERROR log is the
+operator's signal, not a retry storm.
+
+Why a marker at all, when both mutations are individually idempotent: revoke-then-restore
+is **not** idempotent against an operator restoring in parallel, which is what made recovery
+impossible during the live fire. The marker fails _open_ — an unreadable marker falls
+through to the trip, because failing to stop a real overspend is worse than acting twice.
+
+**Dead letter.** `billing-kill-switch-dead-letter` with `max_delivery_attempts = 5` bounds
+any transport-level retry loop the handler cannot answer its way out of (a service that will
+not start, a 5xx from the platform). It should stay empty; read it with
+`just logs-kill-switch-dlq`.
+
+**Both scaling caps.** Cloud Run v2 has two independent maximums — `service.scaling` and
+`service.template.scaling` (observed as 20 and 3 on `gateway-agent`). The switch writes
+both; capping only one would leave the GPU able to start. It then **awaits the update
+operation and verifies the server's echo**, because `updateService` returns a long-running
+operation and awaiting only its start is what made the first live fire silently half-work.
 
 **Required role — on the billing account, not the project.**
 
@@ -599,7 +620,8 @@ maintainer approval, and prompts for confirmation. Use it only to prove the wiri
 **Restoring after a trip.**
 
 ```bash
-just restore-after-kill          # terraform apply: re-adds allUsers, restores max instances
+just restore-after-kill          # terraform apply, then clear the tripped marker
+just logs-kill-switch-dlq        # anything dead-lettered? (should be empty)
 ```
 
 Terraform is the restore path rather than a pair of `gcloud` commands because it already
@@ -607,6 +629,15 @@ holds the desired state the switch deviated from — the `allUsers` invoker bind
 and `max_instance_count = 1` (`cloudrun.tf`). An apply re-asserts both and, unlike a
 hand-written command, cannot restore one and forget the other. **Fix the underlying spend
 first**, or the next notification trips the switch again. This recipe is never run by agents.
+
+The recipe then clears the `kill-switch/tripped` annotation, which re-arms the switch. It is
+cleared **last**, only after the apply succeeded: while the marker is set the switch will not
+fire, so removing it earlier would arm the switch against a fleet that is still down. The
+annotation is runtime state written by the switch, not desired state, which is why it is
+cleared with `gcloud` rather than declared in Terraform.
+
+IAM propagation takes ~40 s: `/v1/models` may answer `403` for a few probes after the apply
+reports success. Wait before concluding the restore failed.
 
 ---
 

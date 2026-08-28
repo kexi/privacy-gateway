@@ -160,3 +160,93 @@ is how to confirm the mechanism above.
 
 Until then the fail-closed behaviour is correct — no PII is released — but the fleet
 refuses most real requests, which is a demo-blocking bug.
+
+---
+
+## Addendum (2026-08-28): fixed deterministically
+
+The judge no longer sees placeholders at all.
+
+The hypothesis above — that serving Gemma 3 under `--chat-template chatml --no-jinja`
+made it ignore the "`⟦…⟧` is NOT a leak" instruction — is plausible and remains
+unconfirmed, because confirming it needs a direct call to the internal-ingress
+`gemma-serving`. It was not worth confirming: the instruction was a _request_ to the
+model, and the fix replaces it with a _guarantee_.
+
+**Every well-formed placeholder (`⟦[A-Z_]+_\d+⟧`) is stripped from the text before the
+judge is called** (`stripPlaceholders`, `packages/common/src/tokenizer.ts`, applied in
+`createLeakJudge`). The question the model now answers is only ever "does this residual
+prose contain personal data". Placeholders are not leaks by construction, and the
+deterministic attester has already validated the ones present — so removing them takes
+away nothing the judge was capable of usefully deciding.
+
+Three properties keep the fix from weakening the gate:
+
+- **Real PII still flags.** Stripping removes only the masked spans, so an unmasked value
+  is still in front of the model and its veto still blocks the release.
+- **A malformed near-placeholder is left in view.** `⟦EMAIL⟧` has no index, so it is not
+  something this system minted and is still judged.
+- **The asymmetric veto is unchanged.** `leak: true` or an unusable answer blocks;
+  `leak: false` adds no trust. The attester remains the only thing that can _pass_ an
+  answer. `judge_unavailable` still refuses.
+
+Covered by `agents/synthesis/test/judge.test.ts` (which asserts the bytes that reach the
+wire, not just the verdict) and `packages/common/test/tokenizer.test.ts`.
+
+The prompt was updated to match, since a prompt that describes a world the model is not
+in is its own hazard: it now says the text has already been masked and that gaps are
+expected.
+
+## healthz: `/healthz` 404s on `*.run.app`, and the app is not at fault
+
+A separate reported defect: the deployed gateway answered `GET /healthz` with `404` while
+`GET /v1/models` answered `200` on the same revision. The route exists at
+`agents/gateway/src/server.ts:197` and is registered before every other mount.
+
+**The request never reaches the container.** The 404 is a Google Front End HTML error page
+(`Error 404 (Not Found)!!1`, `robot.png`), and it carries none of the headers the app
+stamps on every response:
+
+| Path                      | Status | `x-powered-by: Express` | Body                                |
+| ------------------------- | ------ | ----------------------- | ----------------------------------- |
+| `/healthz`                | `404`  | **absent**              | Google HTML error page              |
+| `/healthz/`               | `200`  | present                 | `{"status":"ok","agent":"gateway"}` |
+| `/HEALTHZ`                | `200`  | present                 | `{"status":"ok","agent":"gateway"}` |
+| `/definitely-not-a-route` | `404`  | present                 | the app's own 404                   |
+
+A trailing slash or a change of case reaches the app and answers correctly, which rules
+out the route, the routing order, the JSON middleware and the compat router.
+
+The decisive check is the IAM-closed `kill-switch` service, where **every** path returns
+`403` because IAM rejects before the app runs — except bare `/healthz`, which returns
+`404`. The interception therefore sits upstream of even the IAM check:
+
+```
+kill-switch:  /healthz  -> 404      <- intercepted before IAM
+              /healthz/ -> 403
+              /readyz   -> 403
+              /anything -> 403
+```
+
+Confirmed against the built image locally: `docker build -f agents/gateway/Dockerfile` then
+`curl /healthz` answers `200` with the correct JSON body. Same image, same code — the
+difference is only whether `*.run.app` is in front of it.
+
+So there is **no application bug to fix**, and no code change was made for it. The exact
+path `/healthz` is reserved by the platform on `*.run.app` domains. What was added is a
+regression test that boots the compiled `dist/server.js` and asserts the route is bound
+(`agents/gateway/test/dist_healthz.test.ts`), following the `dist_attestation` precedent —
+so that a genuine packaging regression, which the deployment could not have distinguished
+from this interception, cannot pass unnoticed.
+
+For an external liveness probe against the deployed service, use `/healthz/` (trailing
+slash) or `/v1/models`. Cloud Run's own startup/liveness probes are unaffected: they
+address the container directly and never traverse the front end.
+
+### The Ollama base image is pinned
+
+Independently certain, and fixed: `serving/gemma/Dockerfile` was `FROM ollama/ollama:latest`.
+It is now pinned to `ollama/ollama:0.33.1@sha256:317a9773…` — by **digest**, because tags
+are mutable and a tag alone would not have prevented what happened. `0.33.1` is the
+current stable release and the version the fleet was observed running, so this pins the
+deployment to a known state rather than combining a bug fix with an untested version bump.
