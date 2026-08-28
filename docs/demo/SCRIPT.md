@@ -13,7 +13,7 @@ captions; narration can be Japanese or English.
    - T2: Cloud Run services list (Console, project **all-thinkgs** visible in header)
    - T3: Cloud Trace list (Console)
    - T4: IAM page filtered to `sa-core@all-thinkgs.iam.gserviceaccount.com`
-   - T5: Billing budget `agentic-fleet-kill-switch` (¥8,000)
+   - T5: Billing budget `agentic-fleet-kill-switch` (¥15,000)
 4. Terminal with big font, repo cwd, `direnv` active.
 5. After recording: `just chill`.
 
@@ -115,7 +115,7 @@ Switch to IAM (T4):
 
 ### 3:25–4:00 — Fleet economics and close (T5)
 
-Show the ¥8,000 budget.
+Show the ¥15,000 budget.
 
 > Caption: "The fleet scales to zero — idle cost is zero — and a billing budget
 > feeds a kill switch that unpublishes the gateway if spend ever crosses the

@@ -178,7 +178,10 @@ variable "budget_jpy" {
   # from the account's is rejected with 400 INVALID_ARGUMENT (observed live).
   description = "Monthly budget in JPY. Reaching 100% of it trips the kill switch."
   type        = number
-  default     = 8000
+  # Raised from 8000 on 2026-08-28: testing (a leaked polling loop plus repeated
+  # kill-switch fires) consumed ~4,300 JPY, and a trip mid-judging would take
+  # the demo down; 15000 covers filming and the judging window with margin.
+  default = 15000
 
   validation {
     # A zero or negative budget would be tripped by the first cent of spend, and

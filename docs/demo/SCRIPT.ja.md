@@ -6,7 +6,7 @@
 
 1. `just warm`（Gemma を1台ウォーム、撮影中のみ ≈$3.5/h）
 2. `just smoke` を2回（10秒以内で返ることを確認）
-3. タブ準備: ①Web UI ②Cloud Run 一覧（プロジェクト ID `all-thinkgs` をヘッダーに映す）③Cloud Trace ④IAM（sa-core でフィルタ）⑤予算 `agentic-fleet-kill-switch`（¥8,000）
+3. タブ準備: ①Web UI ②Cloud Run 一覧（プロジェクト ID `all-thinkgs` をヘッダーに映す）③Cloud Trace ④IAM（sa-core でフィルタ）⑤予算 `agentic-fleet-kill-switch`（¥15,000）
 4. 撮影後は必ず `just chill`
 
 ## 構成（4分）
@@ -17,7 +17,7 @@
 - **1:45–2:15** fail-closed（⟦⟧ 混入は 400、漏洩検知時は draft で本文 withheld）
 - **2:15–2:50** 消費面: `/v1/models` で「モデルとして選べる」、Python CLI、（時間があれば）Claude Desktop の MCP
 - **2:50–3:25** 実在証明: Cloud Trace の1本のトレース、IAM で sa-core に Firestore 権限が無いこと
-- **3:25–4:00** スケールゼロ経済性と ¥8,000 キルスイッチ、締め
+- **3:25–4:00** スケールゼロ経済性と ¥15,000 キルスイッチ、締め
 
 ## 撮影時の注意
 
