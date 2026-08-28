@@ -31,7 +31,7 @@ resource "google_cloud_run_v2_job" "verify_auth" {
       service_account = google_service_account.agents["sa-gateway"].email
 
       max_retries = 0
-      timeout     = "120s"
+      timeout     = "600s"
 
       # Same egress path as every caller of an internal-ingress service:
       # ALL_TRAFFIC plus Private Google Access on the subnet is what makes a
@@ -64,8 +64,20 @@ resource "google_cloud_run_v2_job" "verify_auth" {
         # the image because the SDK itself runs on it.
         # -u so each print reaches Cloud Logging as it happens: a buffered
         # failing run flushes nothing and reports only a bare exit code.
-        command = ["/usr/bin/python3", "-u", "-c"]
-        args = [<<-EOT
+        # Why this absurd path: the amd64 variant of this image has NO python3
+        # on PATH (arm64 does — local testing lies). The SDK runs on a bundled
+        # interpreter at platform/bundledpythonunix, so the probe borrows it.
+        # The bash -c wrapper keeps a stderr line if the layout changes again.
+        command = ["/bin/bash", "-c", "exec /usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3 -u -c \"$PROBE_SOURCE\""]
+        # The image ships no /etc/ssl certs; the bundled interpreter needs an
+        # explicit CA bundle or every https request dies in the TLS handshake.
+        env {
+          name  = "SSL_CERT_FILE"
+          value = "/usr/lib/google-cloud-sdk/lib/third_party/certifi/cacert.pem"
+        }
+        env {
+          name  = "PROBE_SOURCE"
+          value = <<-EOT
           import urllib.request, urllib.error, sys
 
           URLS = [
@@ -78,11 +90,16 @@ resource "google_cloud_run_v2_job" "verify_auth" {
 
 
           def status(url, token=None):
-              req = urllib.request.Request(url + "/healthz")
+              # Trailing slash: Google's front end intercepts bare /healthz with
+              # its own 404 before the app (or even IAM) sees the request.
+              # Gemma is Ollama, which has no health route; its root answers 200.
+              # 120s timeout because an authed hit may be the GPU cold start.
+              path = "/" if "gemma" in url else "/healthz/"
+              req = urllib.request.Request(url + path)
               if token:
                   req.add_header("Authorization", "Bearer " + token)
               try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
+                  with urllib.request.urlopen(req, timeout=120) as r:
                       return r.status
               except urllib.error.HTTPError as e:
                   return e.code
@@ -119,7 +136,7 @@ resource "google_cloud_run_v2_job" "verify_auth" {
                 if not fail else "FAIL: see above")
           sys.exit(fail)
         EOT
-        ]
+        }
       }
     }
   }

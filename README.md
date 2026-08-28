@@ -318,7 +318,7 @@ just web-e2e        # Playwright, chromium only
 just setup-browsers # once, outside Nix
 ```
 
-36 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
+23 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
 A2A) and Gemma (over the OpenAI-compatible API) mocked, so what the browser exercises is the
 production request path rather than a stubbed API. Chromium only: these assert application
 behaviour, not rendering differences, and a second engine would double the runtime for no
