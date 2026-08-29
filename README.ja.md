@@ -98,18 +98,25 @@ curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
 `just urls` はこの一覧を Terraform から再生成し、`just health` は ID トークン付きで全サービス
 の死活を確認する。
 
-## 利用方法は 5 つ
+## 利用方法は 6 つ
 
-パイプラインは 1 本、入口が 5 つ。どれを使っても同じ fail-closed のゲートが走り、同じマスク
+パイプラインは 1 本、入口が 6 つ。どれを使っても同じ fail-closed のゲートが走り、同じマスク
 済み evidence が保存される。
 
-| サーフェス      | 入口                             | 向いている用途                                      |
-| --------------- | -------------------------------- | --------------------------------------------------- |
-| **Web UI**      | Gateway の `/`（ビルド済み SPA） | デモ: マスク済みプロンプトと最終回答を左右で対比    |
-| **REST**        | `POST /v1/ask`                   | 完全な結果——trust dimension、attestation、統計      |
-| **OpenAI 互換** | `POST /v1/chat/completions`      | 既存の OpenAI クライアントにそのまま差し込む        |
-| **MCP**         | `clients/mcp`（stdio）           | エージェントに ask / evidence / verify ツールを渡す |
-| **Python CLI**  | `clients/python/pgw.py`          | 依存の軽い利用例。バンドル digest を全部検証できる  |
+| サーフェス      | 入口                               | 向いている用途                                      |
+| --------------- | ---------------------------------- | --------------------------------------------------- |
+| **Web UI**      | Gateway の `/`（ビルド済み SPA）   | デモ: マスク済みプロンプトと最終回答を左右で対比    |
+| **REST**        | `POST /v1/ask`                     | 完全な結果——trust dimension、attestation、統計      |
+| **OpenAI 互換** | `POST /v1/chat/completions`        | 既存の OpenAI クライアントにそのまま差し込む        |
+| **MCP**         | `clients/mcp`（stdio）             | エージェントに ask / evidence / verify ツールを渡す |
+| **モデル選択**  | `clients/ollama-shim`（localhost） | Claude Desktop で「モデル」として選ぶ               |
+| **Python CLI**  | `clients/python/pgw.py`            | 依存の軽い利用例。バンドル digest を全部検証できる  |
+
+モデル選択用のシムが提供するのは **Anthropic Messages API**（`GET /v1/models`、
+`POST /v1/messages`）である。Claude Desktop の third-party gateway が実際に話すのは
+Ollama プロトコルではなくこちらだから。`ollama` クライアント向けにネイティブ Ollama API も
+併せて提供する。調査内容・出典・設定手順は
+[`clients/ollama-shim/README.ja.md`](clients/ollama-shim/README.ja.md) を参照。
 
 それぞれの詳細は下記: [API](#api)、[モデルとして使う](#openai-互換クライアントで-privacy-gateway-をモデルとして使う)、
 [MCP](#mcp-サーバ)、[Python クライアント](#python-クライアント言語非依存の利用例)。

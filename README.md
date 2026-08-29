@@ -96,21 +96,28 @@ curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
 `just urls` regenerates this list from Terraform, and `just health` probes every service
 with an ID token.
 
-## Five ways to consume it
+## Six ways to consume it
 
-One pipeline, five entry points — whichever you use, the same fail-closed gates run and the
+One pipeline, six entry points — whichever you use, the same fail-closed gates run and the
 same masked evidence is stored.
 
-| Surface               | Entry point                    | Best for                                                    |
-| --------------------- | ------------------------------ | ----------------------------------------------------------- |
-| **Web UI**            | `/` on the Gateway (built SPA) | the demo: masked prompt and final answer side by side       |
-| **REST**              | `POST /v1/ask`                 | the full result — trust dimensions, attestation, stats      |
-| **OpenAI-compatible** | `POST /v1/chat/completions`    | dropping the fleet into an existing OpenAI client           |
-| **MCP**               | `clients/mcp` (stdio)          | giving an agent ask / evidence / verify tools               |
-| **Python CLI**        | `clients/python/pgw.py`        | a dependency-light example, and full bundle-digest checking |
+| Surface               | Entry point                       | Best for                                                    |
+| --------------------- | --------------------------------- | ----------------------------------------------------------- |
+| **Web UI**            | `/` on the Gateway (built SPA)    | the demo: masked prompt and final answer side by side       |
+| **REST**              | `POST /v1/ask`                    | the full result — trust dimensions, attestation, stats      |
+| **OpenAI-compatible** | `POST /v1/chat/completions`       | dropping the fleet into an existing OpenAI client           |
+| **MCP**               | `clients/mcp` (stdio)             | giving an agent ask / evidence / verify tools               |
+| **Model picker**      | `clients/ollama-shim` (localhost) | selecting the fleet as a _model_ in Claude Desktop          |
+| **Python CLI**        | `clients/python/pgw.py`           | a dependency-light example, and full bundle-digest checking |
 
 Each is documented below: [API](#api), [use as a model](#use-privacy-gateway-as-a-model-in-any-openai-compatible-client),
 [MCP](#the-mcp-server), [Python client](#the-python-client-language-agnostic-consumption).
+
+The model-picker shim serves the **Anthropic Messages API** (`GET /v1/models`,
+`POST /v1/messages`), because that — not the Ollama protocol — is what Claude Desktop's
+third-party gateway actually speaks; it also serves the native Ollama API for `ollama`
+clients. See [`clients/ollama-shim/README.md`](clients/ollama-shim/README.md) for the
+research, the sources, and the setup steps.
 
 ## Repository layout
 

@@ -6,6 +6,7 @@ packages:
   - 'agents/synthesis'
   - 'services/kill-switch'
   - 'clients/mcp'
+  - 'clients/ollama-shim'
 
 # Postinstall scripts are blocked by default (pnpm 10+). Allow only the packages that
 # genuinely need one, and deny the rest: a build script is arbitrary code execution at

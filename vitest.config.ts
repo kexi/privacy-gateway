@@ -31,6 +31,7 @@ export default defineConfig({
       'agents/synthesis',
       'services/kill-switch',
       'clients/mcp',
+      'clients/ollama-shim',
     ],
     coverage: {
       provider: 'v8',
@@ -41,6 +42,7 @@ export default defineConfig({
         'agents/*/src/**/*.ts',
         'services/*/src/**/*.ts',
         'clients/mcp/src/**/*.ts',
+        'clients/ollama-shim/src/**/*.ts',
       ],
       exclude: ['**/dist/**', '**/*.d.ts', '**/*.config.ts'],
       // packages/common holds the masking, vault and OKF logic the guarantees

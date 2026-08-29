@@ -1,0 +1,43 @@
+{
+  "name": "@privacy-gateway/ollama-shim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Localhost shim that advertises the Privacy-Preserving Gateway as a selectable model to Claude Desktop (Anthropic Messages) and to Ollama clients (native API).",
+  "bin": {
+    "pgw-ollama-shim": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "development": "./src/server.ts",
+      "types": "./src/server.ts",
+      "default": "./dist/server.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "lint": "oxlint",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check"
+  },
+  "dependencies": {
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.5.3"
+}

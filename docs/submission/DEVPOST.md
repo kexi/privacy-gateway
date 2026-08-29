@@ -83,9 +83,11 @@ audit trail into a standard, portable artifact instead of bespoke JSON.
 
 ## What's next
 
-An Ollama-façade shim so Claude Desktop's new gateway-provider model picker can
-select privacy-gateway directly; authenticated human review (IAP) to unlock the
-human-reviewed trust tier; per-tenant disclosure policies.
+Shipped since: the model-picker shim (`clients/ollama-shim`), so Claude Desktop's
+gateway-provider picker can select privacy-gateway directly — it turned out to
+require the Anthropic Messages API, not the Ollama protocol, so the shim serves
+both. Still ahead: authenticated human review (IAP) to unlock the human-reviewed
+trust tier; per-tenant disclosure policies.
 
 ## Built with
 

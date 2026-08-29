@@ -1,15 +1,16 @@
 # Consuming the Privacy-Preserving Gateway
 
-How to call the fleet from outside it. Five surfaces, one pipeline: whichever you
+How to call the fleet from outside it. Six surfaces, one pipeline: whichever you
 use, the same fail-closed gates run and the same evidence is stored.
 
-| surface                              | use it for                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------- |
-| Web UI (`/` on the Gateway)          | the demo: masked prompt and final answer side by side, with the four trust dimensions |
-| `POST /v1/ask` (native JSON)         | the full result — trust dimensions, attestation, consistency, stats                   |
-| `POST /v1/chat/completions` (OpenAI) | dropping the fleet into any existing OpenAI-compatible client                         |
-| MCP server (`clients/mcp`)           | giving an agent tools that ask, fetch evidence, and verify                            |
-| `clients/python/pgw.py`              | a dependency-light CLI example, and the only client that can check the bundle digests |
+| surface                                       | use it for                                                                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Web UI (`/` on the Gateway)                   | the demo: masked prompt and final answer side by side, with the four trust dimensions |
+| `POST /v1/ask` (native JSON)                  | the full result — trust dimensions, attestation, consistency, stats                   |
+| `POST /v1/chat/completions` (OpenAI)          | dropping the fleet into any existing OpenAI-compatible client                         |
+| MCP server (`clients/mcp`)                    | giving an agent tools that ask, fetch evidence, and verify                            |
+| Ollama/Anthropic shim (`clients/ollama-shim`) | selecting the fleet as a _model_ in Claude Desktop's picker                           |
+| `clients/python/pgw.py`                       | a dependency-light CLI example, and the only client that can check the bundle digests |
 
 Deployed Gateway: `https://gateway-agent-turszib42q-uc.a.run.app`. Local: `http://localhost:8081`.
 Substitute either for the base URL in the examples below.
@@ -125,7 +126,30 @@ Two properties matter when writing against it:
   and are reported as **not checked**, never as passing — use `pgw.py verify`
   from a checkout to compare those.
 
-## 4. The Python CLI
+## 4. The model-picker shim
+
+`clients/ollama-shim` makes the fleet selectable as a _model_ in Claude Desktop.
+
+The important correction, because the obvious guess is wrong: Ollama v0.33 did
+not teach Claude Desktop the Ollama protocol — it registered Ollama as a
+**third-party gateway provider**, and a Claude gateway serves the **Anthropic
+Messages API**. Desktop calls `GET /v1/models` for discovery and
+`POST /v1/messages` for inference. A shim serving only `/api/tags` and
+`/api/chat` is reachable from the `ollama` CLI and invisible to Desktop.
+
+Discovery also filters: an entry is kept only when its `id` contains `claude` or
+`anthropic`, so the shim advertises `claude-privacy-gateway` with the display
+name `Privacy Gateway (masked → Gemini)`. The id is a routing key for the picker,
+not a claim about the model — the fleet is Gemma and Gemini throughout.
+
+The shim serves the native Ollama API too, so `ollama`-shaped clients work
+unchanged. It binds `127.0.0.1` (it authenticates nobody), depends only on `zod`,
+and never imports `@privacy-gateway/common` — a laptop-side process must not be
+able to reach the vault. Refusals map to HTTP errors on both surfaces, carrying
+the categories and the do-not-retry sentence; both streaming framings emit one
+content chunk, for the same reason the OpenAI SSE does.
+
+## 5. The Python CLI
 
 ```bash
 uv run clients/python/pgw.py ask "text"
@@ -136,7 +160,7 @@ uv run clients/python/pgw.py verify <request_id>
 The only client that can check all four digests, because it can hash the bundle
 files in the checkout it lives in.
 
-## 5. What to say about the guarantee
+## 6. What to say about the guarantee
 
 The masking is **pseudonymization, not anonymization**. Placeholders disclose
 category and equality (`⟦EMAIL_1⟧` twice means the same address twice), and
