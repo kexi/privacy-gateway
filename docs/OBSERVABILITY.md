@@ -16,8 +16,9 @@ Japanese version: [OBSERVABILITY.ja.md](OBSERVABILITY.ja.md).
 `request_id` is a **UUIDv7**: its leading 48 bits are a millisecond timestamp, so
 sorting a result set by it also sorts by time. It is always minted server-side by
 the Gateway and used as-is as the Token Vault key. An inbound `X-Request-ID`
-header is echoed back on the response for correlation, but it is **never
-adopted** as the request's own id: the id is the vault key, and a caller who
+header is **ignored entirely** — nothing echoes the inbound value, and the
+`X-Request-ID` response header always carries the id the Gateway minted. It is
+**never adopted** as the request's own id: the id is the vault key, and a caller who
 could choose it could name another request's mapping and read its
 placeholders back. There is no `session_id` anywhere in this system — see
 `ARCHITECTURE.md` §2 for why sessions were removed entirely.

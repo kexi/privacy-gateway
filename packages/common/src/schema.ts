@@ -403,9 +403,11 @@ export const AskRequestSchema = z
      * Extra phrases to mask verbatim, on top of what the detectors find.
      *
      * The terms themselves are request data of the same trust class as the vault
-     * mapping: they are held for the length of the request, stored in the vault
-     * like any other masked value, and never logged or persisted in the evidence
-     * — the audit record carries only `custom_terms: {count}`.
+     * mapping. The list as submitted is never logged and never persisted in the
+     * evidence — the audit record carries only `custom_terms: {count}`. A term
+     * that matches the text becomes a masked value like any other, so that value
+     * lands in the request-scoped TTL vault; a term that matches nothing is never
+     * written anywhere and lives only in memory for the length of the request.
      */
     mask_terms: MaskTermsSchema.optional(),
   })

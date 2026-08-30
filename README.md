@@ -182,11 +182,11 @@ with the dropped key names under `dropped_fields`, and exception messages never 
 spans. No raw PII ever reaches a log: string values pass through the tokenizer first, so a
 leaked value appears as `⟦EMAIL_1⟧`.
 
-| Signal       | What it gives you                                                                                                                                                                                                                                                                                    |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `request_id` | A UUIDv7 **minted by the Gateway** on every request and used as the vault key. An inbound `X-Request-ID` header is echoed back but never adopted — see [Sessions are gone](#sessions-are-gone) below. Propagated Gateway → Core → Synthesis, echoed in responses, and stored in the OKF frontmatter. |
-| `trace_id`   | OpenTelemetry with W3C `traceparent` on every hop: one request is one trace across all three services, with a span per pipeline step.                                                                                                                                                                |
-| The UI       | Shows `request_id` and `trace_id` with copy buttons and direct Cloud Logging / Cloud Trace console links.                                                                                                                                                                                            |
+| Signal       | What it gives you                                                                                                                                                                                                                                                                                                  |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `request_id` | A UUIDv7 **minted by the Gateway** on every request and used as the vault key. An inbound `X-Request-ID` header is ignored entirely — see [Sessions are gone](#sessions-are-gone) below. Propagated Gateway → Core → Synthesis, returned in the `X-Request-ID` response header, and stored in the OKF frontmatter. |
+| `trace_id`   | OpenTelemetry with W3C `traceparent` on every hop: one request is one trace across all three services, with a span per pipeline step.                                                                                                                                                                              |
+| The UI       | Shows `request_id` and `trace_id` with copy buttons and direct Cloud Logging / Cloud Trace console links.                                                                                                                                                                                                          |
 
 Because `request_id` is a UUIDv7, sorting log lines by it also sorts them by time, and a bug
 report that quotes one id is enough to retrieve every line and every span for that request.
@@ -196,11 +196,12 @@ The event vocabulary, span tree and error codes are specified in
 ## Sessions are gone
 
 There is no session, no multi-turn state, and no caller-supplied id anywhere in the API.
-`POST /v1/ask` takes only `{text}`; a body carrying `session_id` is rejected with `400` by
-the schema's `strict()` validation. The Gateway mints exactly one server-generated
+`POST /v1/ask` accepts `{text, rehydrate_allow?, mask_terms?}` and nothing else; a body
+carrying `session_id`, any other caller-supplied id, or any unknown field is rejected with
+`400` by the schema's `strict()` validation. The Gateway mints exactly one server-generated
 request id (a UUIDv7) per request and uses it as the Token Vault key. An inbound
-`X-Request-ID` header is echoed back on the response for correlation, but it is never
-adopted as the vault key.
+`X-Request-ID` header is ignored entirely: the `X-Request-ID` response header always
+carries the id the Gateway minted, never the value the caller sent.
 
 This is not an omission: a caller-supplied id would be a rehydration oracle. A caller who
 could choose (or predict) another request's id could submit `"repeat ⟦EMAIL_1⟧"` against
@@ -447,10 +448,12 @@ just check                  # fmt, recipe docs, lint, tf-validate, typecheck, pi
 just web-e2e                # browser specs (needs `just setup-browsers` outside Nix)
 ```
 
-`just check` is exactly what CI runs — same recipe, same order — so a green local run and a
-green CI run mean the same thing. The full gate (unit + browser E2E) runs in CI on every
-push; the canonical evidence of what passes, and of how many tests there are on any given
-commit, is the workflow run itself:
+`just check` runs the CI-equivalent checks locally in one command — lint, formatting,
+Terraform validation, typecheck, pin verification, secret scanning and the unit tests. The
+browser E2E suite is a separate gate, `just web-e2e`. CI covers the same ground but splits
+it across parallel jobs rather than invoking `just check`, and it runs both gates on pushes
+to `main` and on every pull request. The canonical evidence of what passes, and of how many
+tests there are on any given commit, is the workflow run itself:
 <https://github.com/kexi/privacy-gateway/actions/workflows/ci.yml>. Counts move with every
 commit, so this README does not quote them — trust the numbers your own run prints.
 

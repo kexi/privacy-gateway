@@ -668,7 +668,9 @@ function renderAttestation(response: AskResponse): void {
     rows.push(
       `<p class="custom-terms">Requester-named terms scanned for:
         <code>${attestation.custom_terms.count}</code>
-        <small>(the terms themselves are never logged, stored, or shown — only this count)</small></p>`,
+        <small>(the term list is never in the evidence or the logs — only this count; terms
+        that matched are held as masked values in the request-scoped TTL vault, and terms
+        that matched nothing stay in memory for the length of the request)</small></p>`,
     );
   }
   if (attestation.judge && typeof attestation.judge.leak === 'boolean') {
