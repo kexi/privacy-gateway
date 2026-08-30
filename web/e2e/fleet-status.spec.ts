@@ -26,13 +26,34 @@ const LEAK_MARKER = 'SCENARIO-LEAK';
 /** Serve a fixed status document so the badge's state is the spec's to choose. */
 async function mockStatus(
   page: Page,
-  body: { gemma: string; last_active_at?: string; cold_start_estimate_seconds?: number },
+  body: {
+    gemma: string;
+    last_active_at?: string;
+    warmup_requested_at?: string;
+    cold_start_estimate_seconds?: number;
+  },
 ): Promise<void> {
   await page.route('**/v1/status', (route) =>
     route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ cold_start_estimate_seconds: 120, ...body }),
+    }),
+  );
+}
+
+/**
+ * Serve a status document that changes after the warmup is posted.
+ *
+ * The badge's whole job is to move, so a fixed mock cannot show the behaviour
+ * under test: the route reads a mutable cell that the `/v1/warmup` mock flips.
+ */
+async function mockStatusSequence(page: Page, state: { gemma: string }): Promise<void> {
+  await page.route('**/v1/status', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ cold_start_estimate_seconds: 120, gemma: state.gemma }),
     }),
   );
 }
@@ -72,6 +93,82 @@ test.describe('the GPU badge', () => {
     await page.goto('/');
 
     await expect(page.locator('#gpu-badge')).toHaveAttribute('data-state', 'unknown');
+  });
+
+  test('renders warming distinctly from both warm and cold', async ({ page }) => {
+    await mockStatus(page, {
+      gemma: 'warming',
+      warmup_requested_at: new Date().toISOString(),
+    });
+    await page.goto('/');
+
+    const badge = page.locator('#gpu-badge');
+    await expect(badge).toHaveAttribute('data-state', 'warming');
+    // The label carries the state on its own, so the badge does not rely on
+    // colour or on the pulse animation to say what is happening.
+    await expect(badge).toHaveText(/warming/i);
+
+    // The note has to name the wait, which is the reason the state exists.
+    const note = page.locator('#gpu-note');
+    await expect(note).toBeVisible();
+    await expect(note).toContainText(/2 minutes/i);
+    await expect(note).toContainText(/starting up/i);
+  });
+
+  test('holds the warm-up button disabled while the fleet is warming', async ({ page }) => {
+    await mockStatus(page, { gemma: 'warming', warmup_requested_at: new Date().toISOString() });
+    await page.goto('/');
+
+    const button = page.locator('#warmup');
+    // Pressing again while a boot is already under way would spend nothing and
+    // teach the user the button does not work.
+    await expect(button).toBeDisabled();
+    await expect(button).toHaveAttribute('aria-busy', 'true');
+    await expect(button).toHaveText(/starting/i);
+  });
+
+  test('flips from cold to warming when the warm-up is pressed', async ({ page }) => {
+    const state = { gemma: 'cold' };
+    await mockStatusSequence(page, state);
+    await page.route('**/v1/warmup', (route) => {
+      // What the server does on a wake: the next status poll reports warming.
+      state.gemma = 'warming';
+      return route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ started: true }),
+      });
+    });
+
+    await page.goto('/');
+    await expect(page.locator('#gpu-badge')).toHaveAttribute('data-state', 'cold');
+    await expect(page.locator('#warmup')).toBeEnabled();
+
+    await page.click('#warmup');
+
+    // The press is acknowledged immediately, and the badge follows on the poll
+    // that the click triggers — this is the feedback the button previously
+    // lacked entirely.
+    await expect(page.locator('#warmup')).toBeDisabled();
+    await expect(page.locator('#gpu-badge')).toHaveAttribute('data-state', 'warming');
+  });
+
+  test('releases the button and stops warning once the fleet turns warm', async ({ page }) => {
+    const state = { gemma: 'warming' };
+    await mockStatusSequence(page, state);
+    await page.goto('/');
+
+    await expect(page.locator('#warmup')).toBeDisabled();
+
+    // The boot lands; the 5s warming poll is what notices, without a reload.
+    state.gemma = 'warm';
+
+    await expect(page.locator('#gpu-badge')).toHaveAttribute('data-state', 'warm', {
+      timeout: 15_000,
+    });
+    await expect(page.locator('#warmup')).toBeEnabled();
+    await expect(page.locator('#warmup')).toHaveText(/warm up/i);
+    await expect(page.locator('#gpu-note')).toBeHidden();
   });
 
   test('the warm-up button posts to /v1/warmup and re-polls', async ({ page }) => {

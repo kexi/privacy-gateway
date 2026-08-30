@@ -14,7 +14,13 @@
             The GPU state is read from a recorded timestamp, never by probing
             Gemma: a probe would wake the instance the badge is reporting on.
           -->
-          <div class="gpu-status" id="gpu-status">
+          <!--
+            The badge announces itself: its state changes on a poll rather than
+            in response to anything the user did, so a screen reader would
+            otherwise never hear cold turn into warming. `polite` because a
+            warmth change is never urgent enough to interrupt.
+          -->
+          <div class="gpu-status" id="gpu-status" aria-live="polite">
             <span class="gpu-badge" id="gpu-badge" data-state="unknown">GPU: unknown</span>
             <button
               id="warmup"

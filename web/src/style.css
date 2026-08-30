@@ -453,9 +453,10 @@ summary {
 }
 
 /*
- * Three states, three colours, and none of them green-by-default: `unknown` is a
- * real answer here rather than a failure to load, so it gets the neutral border
- * the dimensions grid uses for an unasserted claim rather than a warning colour.
+ * Four states, four treatments, and none of them green-by-default: `unknown` is
+ * a real answer here rather than a failure to load, so it gets the neutral
+ * border the dimensions grid uses for an unasserted claim rather than a warning
+ * colour.
  */
 .gpu-badge {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -476,6 +477,34 @@ summary {
 .gpu-badge[data-state='cold'] {
   color: var(--token);
   border-color: color-mix(in srgb, var(--token) 45%, transparent);
+}
+
+/*
+ * `warming` is a transitional state, so it is the only badge that moves: the
+ * pulse says "still going" between polls, which a static label cannot. The
+ * colour is deliberately not `warm`'s — nothing has answered yet — and the
+ * label carries the same information for anyone the animation does not reach.
+ */
+.gpu-badge[data-state='warming'] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  animation: gpu-warming-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes gpu-warming-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/*
+ * Motion is decoration here, never the message: the label already says
+ * "warming…", so removing the animation costs nothing.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .gpu-badge[data-state='warming'] {
+    animation: none;
+  }
 }
 
 .warmup {

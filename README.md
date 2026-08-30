@@ -342,7 +342,7 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 | `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                             |
 | `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                 |
 | `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                     |
-| `GET`  | `/v1/status`                         | is Gemma warm or cold, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU                              |
+| `GET`  | `/v1/status`                         | is Gemma `warm`/`warming`/`cold`/`unknown`, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU         |
 | `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                |
 | `GET`  | `/healthz`                           | liveness                                                                                                                    |
 
@@ -357,10 +357,14 @@ the headers are flushed long before the pipeline knows whether it will refuse; a
 client reads the refusal frame's `status` field instead. The OpenAI-compatible
 `stream: true` is unchanged (one content chunk, then `[DONE]`).
 
-`/v1/status` reports `warm` when a Gemma call was recorded in the last 10 minutes, `cold`
-when none was, and `unknown` when the record could not be read — it is derived from a
-timestamp written after each successful Gemma call, never by probing Gemma, because a probe
-would wake the instance it is reporting on.
+`/v1/status` reports `warm` when a Gemma call was recorded in the last 10 minutes,
+`warming` when a `/v1/warmup` was dispatched in the last 3 minutes and no Gemma call has
+landed since, `cold` when neither holds, and `unknown` when the record could not be read.
+It is derived from timestamps written after each successful Gemma call and each dispatched
+wake, never by probing Gemma, because a probe would wake the instance it is reporting on.
+`warm` always wins over `warming`: activity proves residency, while a wake only predicts
+it. A wake that produces no Gemma call inside its window expires back to `cold`, so the
+button can be pressed again.
 
 There is no session-based API any more: `GET /v1/sessions/{id}/answer`,
 `POST /v1/sessions/{id}/approve` and `GET /v1/sessions/{id}/tier` are all removed. The evidence

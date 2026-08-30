@@ -338,17 +338,17 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 
 ### API
 
-| メソッド | パス                                 | 用途                                                                                                                      |
-| -------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計 |
-| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                            |
-| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                       |
-| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                 |
-| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                    |
-| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                              |
-| `GET`    | `/v1/status`                         | Gemma が warm か cold か、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない                     |
-| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける     |
-| `GET`    | `/healthz`                           | 死活監視                                                                                                                  |
+| メソッド | パス                                 | 用途                                                                                                                               |
+| -------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計          |
+| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                     |
+| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                |
+| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                          |
+| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                             |
+| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                                       |
+| `GET`    | `/v1/status`                         | Gemma が `warm`/`warming`/`cold`/`unknown` のいずれか、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない |
+| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける              |
+| `GET`    | `/healthz`                           | 死活監視                                                                                                                           |
 
 `POST /v1/ask` は `Accept: text/event-stream` に対して進捗ストリームでも応答する。パイプ
 ラインの各段階（`masking`、`egress_guard`、`core_reasoning`、`leak_check`、`rehydrate`）
@@ -361,10 +361,14 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 `status` フィールドを読む。OpenAI 互換の `stream: true` は従来どおり（コンテンツ 1
 チャンクのあと `[DONE]`）で変更していない。
 
-`/v1/status` は直近 10 分以内に Gemma 呼び出しが記録されていれば `warm`、なければ `cold`、
-記録を読めなければ `unknown` を返す。判定は Gemma 呼び出しの成功後に書き込まれるタイム
-スタンプから導出しており、Gemma を叩いて確かめることはしない——叩けば、報告対象である
-インスタンスをその場で起こしてしまうからである。
+`/v1/status` は直近 10 分以内に Gemma 呼び出しが記録されていれば `warm`、直近 3 分以内に
+`/v1/warmup` が送られておりその後 Gemma 呼び出しが記録されていなければ `warming`、どちら
+でもなければ `cold`、記録を読めなければ `unknown` を返す。判定は Gemma 呼び出しの成功後と
+wake の送出後に書き込まれるタイムスタンプから導出しており、Gemma を叩いて確かめることは
+しない——叩けば、報告対象であるインスタンスをその場で起こしてしまうからである。`warm` は
+つねに `warming` に優先する: 呼び出しの記録は稼働の証拠だが、wake は予測にすぎないからで
+ある。ウィンドウ内に Gemma 呼び出しを生まなかった wake は `cold` に戻り、ボタンを再度押せる
+ようになる。
 
 セッションベースの API はもう存在しない: `GET /v1/sessions/{id}/answer`、
 `POST /v1/sessions/{id}/approve`、`GET /v1/sessions/{id}/tier` はすべて削除された。

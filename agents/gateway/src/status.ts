@@ -16,6 +16,8 @@
 import {
   COLD_START_ESTIMATE_SECONDS,
   WARM_WINDOW_MS,
+  WARMING_WINDOW_MS,
+  type ActivityReading,
   type ActivityStore,
   type GemmaWarmth,
   type StatusResponse,
@@ -28,29 +30,51 @@ import {
  * inside the retention window, which is exactly what cold means. `undefined`
  * means the store could not be asked at all, which is `unknown` — see the
  * schema's note on why that is not collapsed into `cold`.
+ *
+ * `warmupRequestedAt` upgrades a `cold` verdict to `warming` while a wake is
+ * plausibly still booting. It never downgrades a `warm` one: a Gemma call that
+ * landed after the wake proves the instance is up, so the recorded activity
+ * always wins over the request that asked for it. That ordering is the whole
+ * reason both instants are compared rather than each being tested alone.
  */
 export function warmthOf(
   lastActiveAt: Date | null | undefined,
   now: number = Date.now(),
+  warmupRequestedAt: Date | null | undefined = null,
 ): GemmaWarmth {
   if (lastActiveAt === undefined) return 'unknown';
-  if (lastActiveAt === null) return 'cold';
 
-  const isWithinWindow = now - lastActiveAt.getTime() < WARM_WINDOW_MS;
-  return isWithinWindow ? 'warm' : 'cold';
+  const isWarm = lastActiveAt !== null && now - lastActiveAt.getTime() < WARM_WINDOW_MS;
+  if (isWarm) return 'warm';
+
+  if (warmupRequestedAt === null || warmupRequestedAt === undefined) return 'cold';
+
+  // A wake only explains the current silence while it could still be booting,
+  // and only while nothing newer has been served. Activity that post-dates the
+  // request means the wake already resolved — into a fleet that has since gone
+  // cold again — so replaying `warming` would restart a wait that is over.
+  const isBooting = now - warmupRequestedAt.getTime() < WARMING_WINDOW_MS;
+  const isSupersededByActivity =
+    lastActiveAt !== null && lastActiveAt.getTime() >= warmupRequestedAt.getTime();
+  return isBooting && !isSupersededByActivity ? 'warming' : 'cold';
 }
 
 /** Build the status document from a (possibly absent) activity reading. */
 export function statusOf(
-  lastActiveAt: Date | null | undefined,
+  reading: ActivityReading | undefined,
   now: number = Date.now(),
 ): StatusResponse {
-  const gemma = warmthOf(lastActiveAt, now);
+  const lastActiveAt = reading === undefined ? undefined : reading.lastActiveAt;
+  const warmupRequestedAt = reading?.warmupRequestedAt ?? null;
+  const gemma = warmthOf(lastActiveAt, now, warmupRequestedAt);
   return {
     gemma,
     // Reported whenever it is known, including when the fleet has since gone
     // cold: "last seen 40 minutes ago" is more useful than a bare `cold`.
     ...(lastActiveAt instanceof Date ? { last_active_at: lastActiveAt.toISOString() } : {}),
+    ...(warmupRequestedAt instanceof Date
+      ? { warmup_requested_at: warmupRequestedAt.toISOString() }
+      : {}),
     cold_start_estimate_seconds: COLD_START_ESTIMATE_SECONDS,
   };
 }
@@ -84,14 +108,14 @@ export class StatusCache {
     // The catch is unconditional on purpose: this endpoint must never 500, since
     // a status page that fails when the fleet is unhealthy is a status page that
     // is absent exactly when it is wanted.
-    let lastActiveAt: Date | null | undefined;
+    let reading: ActivityReading | undefined;
     try {
-      lastActiveAt = await this.store.read();
+      reading = await this.store.readActivity();
     } catch {
-      lastActiveAt = undefined;
+      reading = undefined;
     }
 
-    const value = statusOf(lastActiveAt, at);
+    const value = statusOf(reading, at);
     this.cached = { value, at };
     return value;
   }

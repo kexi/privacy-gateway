@@ -25,6 +25,7 @@ import {
   IdTokenError,
   loadConfig,
   recordGemmaActivity,
+  recordWarmupRequest,
   UnknownAudienceError,
   PiiLeakError,
   ReleaseRefusalSchema,
@@ -540,14 +541,23 @@ export function createApp(options: CreateAppOptions): express.Application {
 
     context.logger.event('warmup.requested', {});
 
+    const injected = options.wakeGemmaImpl;
     const wake =
-      options.wakeGemmaImpl ??
-      (() =>
-        wakeGemma({
-          baseUrl: config.GEMMA_BASE_URL,
-          apiKey: config.GEMMA_API_KEY,
-          ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
-        }));
+      injected !== undefined
+        ? // An injected wake never reaches Gemma, so it cannot stamp the clock
+          // itself; stamping here keeps `/v1/status` describing the same fleet a
+          // test is driving.
+          async (): Promise<boolean> => {
+            recordWarmupRequest(activityStore);
+            return await injected();
+          }
+        : () =>
+            wakeGemma({
+              baseUrl: config.GEMMA_BASE_URL,
+              apiKey: config.GEMMA_API_KEY,
+              activityStore,
+              ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+            });
 
     // Deliberately not awaited. The instance keeps booting after this promise
     // settles either way, and holding the response open for two minutes would

@@ -62,8 +62,18 @@ input.value = SAMPLE;
 
 // --- GPU warmth --------------------------------------------------------------
 
-/** How often the badge is refreshed while the tab is visible. */
+/** How often the badge is refreshed while the tab is visible and settled. */
 const STATUS_POLL_MS = 30_000;
+
+/**
+ * How often it is refreshed while a boot is expected to be in progress.
+ *
+ * A cold start resolves in around two minutes, so a 30s poll would leave the
+ * badge stale for a sixth of the wait it is describing. The faster rate is
+ * deliberately temporary: it applies only while the fleet is `warming` or
+ * `cold`, which is the only time the answer is expected to change on its own.
+ */
+const WARMING_POLL_MS = 5_000;
 
 /** The last state the badge showed, used to decide whether to warn before a submit. */
 let gemmaWarmth: GemmaWarmth = 'unknown';
@@ -71,9 +81,21 @@ let coldStartSeconds = 120;
 
 const WARMTH_LABEL: Record<GemmaWarmth, string> = {
   warm: 'GPU: warm',
+  warming: 'GPU: warming…',
   cold: 'GPU: cold',
   unknown: 'GPU: unknown',
 };
+
+/**
+ * Whether the fleet's state is expected to change without anyone asking.
+ *
+ * `warming` is obviously in flight. `cold` is included because a wake may have
+ * been started from another tab, and because it is the state a user is most
+ * likely to be watching while waiting for something to happen.
+ */
+function isSettling(warmth: GemmaWarmth): boolean {
+  return warmth === 'warming' || warmth === 'cold';
+}
 
 /**
  * Refresh the badge.
@@ -89,8 +111,18 @@ async function refreshStatus(): Promise<void> {
   gpuBadge.dataset['state'] = status.gemma;
   gpuBadge.textContent = WARMTH_LABEL[status.gemma];
 
+  // The button stays pressed for as long as the server agrees a boot is under
+  // way, rather than for a fixed interval: the server's `warming` window is the
+  // authority, so the two cannot disagree about whether pressing again is
+  // useful. It is released as soon as the fleet is warm, or once the wake has
+  // expired back to cold and pressing again is the right move.
+  setWarmupPending(status.gemma === 'warming');
+
   const minutes = Math.round(coldStartSeconds / 60);
-  if (status.gemma === 'cold') {
+  if (status.gemma === 'warming') {
+    gpuNote.textContent = `Starting up — up to about ${minutes} minutes until the first response. It is billed for as long as it stays running.`;
+    gpuNote.hidden = false;
+  } else if (status.gemma === 'cold') {
     gpuNote.textContent = `The GPU is asleep — the first request may take about ${minutes} minutes while it starts.`;
     gpuNote.hidden = false;
   } else if (status.gemma === 'unknown') {
@@ -100,59 +132,110 @@ async function refreshStatus(): Promise<void> {
   } else {
     gpuNote.hidden = true;
   }
+
+  // A state that settles on its own is worth watching closely; one that does not
+  // is worth leaving alone. Re-applied on every refresh so the rate follows the
+  // fleet without anything having to remember to switch it back.
+  applyPollRate(isSettling(status.gemma) ? WARMING_POLL_MS : STATUS_POLL_MS);
+}
+
+/**
+ * Reflect "a wake is in flight" on the button.
+ *
+ * `aria-busy` alongside `disabled` because the two say different things: the
+ * button cannot be pressed, *and* the thing it started is still running.
+ */
+function setWarmupPending(pending: boolean): void {
+  warmupButton.disabled = pending;
+  warmupButton.setAttribute('aria-busy', pending ? 'true' : 'false');
+  warmupButton.textContent = pending ? 'Starting…' : 'Warm up';
+}
+
+/**
+ * The poll's timer and its current rate.
+ *
+ * Held at module scope rather than closed over inside `startStatusPolling`
+ * because the rate now changes from `refreshStatus`, which runs outside it.
+ */
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+let pollRateMs = STATUS_POLL_MS;
+
+function stopPolling(): void {
+  if (pollTimer !== undefined) clearInterval(pollTimer);
+  pollTimer = undefined;
+}
+
+function startPolling(): void {
+  if (pollTimer !== undefined) return;
+  pollTimer = setInterval(() => {
+    void refreshStatus();
+  }, pollRateMs);
+}
+
+/**
+ * Switch the polling rate, restarting the timer only when it actually changed.
+ *
+ * Guarded because `refreshStatus` calls this on every poll: recreating the
+ * interval each time would reset the countdown and, at the 5s rate, could keep
+ * pushing the next poll further away than the rate it is asking for.
+ */
+function applyPollRate(rateMs: number): void {
+  if (rateMs === pollRateMs) return;
+  pollRateMs = rateMs;
+  // A hidden tab has no timer to re-rate; it will pick the current rate up when
+  // it comes back and restarts.
+  if (pollTimer === undefined) return;
+  stopPolling();
+  startPolling();
 }
 
 /**
  * Poll only while the tab is visible.
  *
- * A background tab polling a public endpoint every 30s costs the fleet reads for
- * a badge nobody is looking at; the state is refreshed on the way back instead.
+ * A background tab polling a public endpoint costs the fleet reads for a badge
+ * nobody is looking at — more so at the 5s warming rate — so the timer is
+ * dropped entirely while hidden.
  */
 function startStatusPolling(): void {
-  let timer: ReturnType<typeof setInterval> | undefined;
-
-  const stop = (): void => {
-    if (timer !== undefined) clearInterval(timer);
-    timer = undefined;
-  };
-
-  const start = (): void => {
-    if (timer !== undefined) return;
-    timer = setInterval(() => {
-      void refreshStatus();
-    }, STATUS_POLL_MS);
-  };
-
+  // Refreshed once on the way back before the interval resumes, so a tab that
+  // was hidden through an entire cold start does not show a stale `warming`
+  // until the first tick lands.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
-      stop();
+      stopPolling();
       return;
     }
     void refreshStatus();
-    start();
+    startPolling();
   });
 
   void refreshStatus();
-  start();
+  startPolling();
 }
 
 warmupButton.addEventListener('click', () => {
-  warmupButton.disabled = true;
+  // Applied before the request rather than after it: the press must be visibly
+  // acknowledged even though the answer is a round trip away, which is the whole
+  // complaint this state exists to fix.
+  setWarmupPending(true);
   gpuNote.textContent = 'Starting the GPU… it is billed for as long as it stays running.';
   gpuNote.hidden = false;
 
   warmup()
     .then(async () => {
-      // The wake was dispatched, not completed: the badge only flips once a real
-      // Gemma call has been recorded, so it is re-polled rather than assumed.
+      // The wake was dispatched, not completed. The server has recorded the
+      // request, so the next poll reports `warming` — the badge is re-read
+      // rather than assumed, and `refreshStatus` owns the button state from
+      // here, holding it pressed until the fleet is warm or the wake expires.
       await refreshStatus();
       return true;
     })
     .catch(() => {
+      // Nothing was started, so the button must become pressable again; only
+      // this path releases it, because a dispatched wake is still in flight.
+      setWarmupPending(false);
       gpuNote.textContent = 'The warm-up request was refused. Try again in a moment.';
-    })
-    .finally(() => {
-      warmupButton.disabled = false;
+      gpuNote.hidden = false;
     });
 });
 

@@ -51,8 +51,10 @@ knows its verdict, so a streaming client reads the refusal frame's `status`
 rather than the response code. The OpenAI `stream: true` framing is separate and
 unchanged — see §2.
 
-**Warm/cold.** `GET /v1/status` reports `{gemma: warm|cold|unknown,
-last_active_at?, cold_start_estimate_seconds}`. The GPU-backed Gemma service
+**Warm/cold.** `GET /v1/status` reports `{gemma: warm|warming|cold|unknown,
+last_active_at?, warmup_requested_at?, cold_start_estimate_seconds}`. `warming` means a
+wake was dispatched within the last 3 minutes and no Gemma call has landed since; it
+expires back to `cold`, and a recorded Gemma call always outranks it as `warm`. The GPU-backed Gemma service
 scales to zero, so a cold fleet's first request waits roughly two minutes. The
 verdict comes from a timestamp recorded after each successful Gemma call, never
 from probing Gemma — a probe would wake the instance being reported on. It is

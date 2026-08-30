@@ -282,8 +282,13 @@ export type HealthResponse = z.infer<typeof HealthResponseSchema>;
  * recorded timestamp, and when that record cannot be read the honest report is
  * that nobody knows. Guessing `cold` would be a claim the gateway has not
  * earned, and guessing `warm` would promise a fast response it cannot deliver.
+ *
+ * `warming` is the same kind of honesty about the in-between: a wake has been
+ * asked for and no Gemma call has landed since, so the instance is presumed to
+ * be booting. It is not `warm` — nothing has answered yet — and reporting it as
+ * `cold` would tell a user who just pressed the button that nothing happened.
  */
-export const GemmaWarmthSchema = z.enum(['warm', 'cold', 'unknown']);
+export const GemmaWarmthSchema = z.enum(['warm', 'warming', 'cold', 'unknown']);
 export type GemmaWarmth = z.infer<typeof GemmaWarmthSchema>;
 
 /**
@@ -298,6 +303,8 @@ export const StatusResponseSchema = z.object({
   gemma: GemmaWarmthSchema,
   /** Absent when nothing was ever recorded, or when the store was unreachable. */
   last_active_at: z.string().optional(),
+  /** When a wake was last asked for. Absent under the same conditions. */
+  warmup_requested_at: z.string().optional(),
   cold_start_estimate_seconds: z.number(),
 });
 export type StatusResponse = z.infer<typeof StatusResponseSchema>;

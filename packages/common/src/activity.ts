@@ -33,6 +33,17 @@ export const FLEET_STATUS_COLLECTION = 'fleet_status';
 export const GEMMA_STATUS_DOC = 'gemma';
 
 /**
+ * How long a warmup request is presumed to still be booting an instance.
+ *
+ * A cold start is on the order of two minutes; three leaves margin for a queued
+ * container start without letting a failed wake claim `warming` forever. Past
+ * this the fleet reverts to whatever `last_active_at` says, which for a wake
+ * that never landed is `cold` — the honest answer, and the one that lets the
+ * user press the button again.
+ */
+export const WARMING_WINDOW_MS = 3 * 60 * 1000;
+
+/**
  * How long after the last recorded call Gemma is still presumed warm.
  *
  * Cloud Run keeps an idle instance for roughly 15 minutes before reclaiming it;
@@ -51,38 +62,79 @@ export const WARM_WINDOW_MS = 10 * 60 * 1000;
  */
 export const COLD_START_ESTIMATE_SECONDS = 120;
 
-/** Reads and writes the "Gemma was last active at" instant. */
+/**
+ * Both instants the fleet-status document holds.
+ *
+ * They are read together because the verdict needs both and they live in one
+ * document: a wake that was requested but has not yet produced a Gemma call is
+ * `warming`, which is only distinguishable from `cold` by comparing the two.
+ * Each is `null` when never recorded.
+ */
+export interface ActivityReading {
+  readonly lastActiveAt: Date | null;
+  readonly warmupRequestedAt: Date | null;
+}
+
+/** Reads and writes the fleet's activity clock. */
 export interface ActivityStore {
-  /** Stamp the current instant. Never throws — see the module docstring. */
+  /** Stamp the current instant as Gemma activity. Never throws — see the module docstring. */
   record(at?: Date): Promise<void>;
   /**
-   * The last recorded instant, `null` if nothing was ever recorded.
+   * Stamp the current instant as a warmup request.
+   *
+   * Written to the same document and with the same fire-and-forget contract:
+   * this only decorates a badge, so a failure here must never fail the wake it
+   * describes.
+   */
+  recordWarmupRequest(at?: Date): Promise<void>;
+  /**
+   * The last recorded Gemma activity, `null` if nothing was ever recorded.
    *
    * Throws when the store itself is unreachable. The distinction matters: "never
    * recorded" is a cold fleet, while "cannot tell" is `unknown`, and collapsing
    * them would show a confident `cold` whenever Firestore was down.
    */
   read(): Promise<Date | null>;
+  /**
+   * Both instants in one round trip.
+   *
+   * Why not two `read`-shaped calls: the badge needs both on every poll, and two
+   * gets would double a Firestore bill that scales with the number of open tabs.
+   */
+  readActivity(): Promise<ActivityReading>;
 }
 
 /** In-process implementation, for local development and tests. */
 export class InMemoryActivityStore implements ActivityStore {
   private lastActiveAt: Date | null = null;
+  private warmupRequestedAt: Date | null = null;
 
   record(at: Date = new Date()): Promise<void> {
     this.lastActiveAt = at;
     return Promise.resolve();
   }
 
+  recordWarmupRequest(at: Date = new Date()): Promise<void> {
+    this.warmupRequestedAt = at;
+    return Promise.resolve();
+  }
+
   read(): Promise<Date | null> {
     return Promise.resolve(this.lastActiveAt);
+  }
+
+  readActivity(): Promise<ActivityReading> {
+    return Promise.resolve({
+      lastActiveAt: this.lastActiveAt,
+      warmupRequestedAt: this.warmupRequestedAt,
+    });
   }
 }
 
 /** The Firestore document surface this module uses; narrowed so tests can double it. */
 export interface ActivityDocLike {
   get(): Promise<{ exists: boolean; data(): Record<string, unknown> | undefined }>;
-  set(data: Record<string, unknown>): Promise<unknown>;
+  set(data: Record<string, unknown>, options?: { merge?: boolean }): Promise<unknown>;
 }
 
 /** The Firestore surface this module uses. */
@@ -140,16 +192,34 @@ export class FirestoreActivityStore implements ActivityStore {
     // Stored as an ISO string rather than a Firestore Timestamp so the document
     // reads the same whether it was written by the emulator, a test double or
     // the real client, and so `read` needs no type dispatch.
-    await doc.set({ last_active_at: at.toISOString() });
+    //
+    // Merged rather than replaced: the two stamps share one document, and a
+    // plain `set` would delete whichever field this call is not writing —
+    // turning every Gemma call into an erasure of the warmup request that woke
+    // it, which is precisely the comparison the `warming` verdict needs.
+    await doc.set({ last_active_at: at.toISOString() }, { merge: true });
+  }
+
+  async recordWarmupRequest(at: Date = new Date()): Promise<void> {
+    const doc = await this.doc();
+    await doc.set({ warmup_requested_at: at.toISOString() }, { merge: true });
   }
 
   async read(): Promise<Date | null> {
+    const { lastActiveAt } = await this.readActivity();
+    return lastActiveAt;
+  }
+
+  async readActivity(): Promise<ActivityReading> {
     const doc = await this.doc();
     const snapshot = await doc.get();
-    if (!snapshot.exists) return null;
+    if (!snapshot.exists) return { lastActiveAt: null, warmupRequestedAt: null };
 
-    const raw = snapshot.data()?.['last_active_at'];
-    return toDate(raw);
+    const data = snapshot.data();
+    return {
+      lastActiveAt: toDate(data?.['last_active_at']),
+      warmupRequestedAt: toDate(data?.['warmup_requested_at']),
+    };
   }
 }
 
@@ -192,9 +262,32 @@ export function buildActivityStore(backend?: string): ActivityStore {
  * made and it cannot be forgotten by a future caller.
  */
 export function recordGemmaActivity(store: ActivityStore | undefined, at?: Date): void {
+  stampSilently(store, (s) => s.record(at));
+}
+
+/**
+ * Stamp the warmup clock under the same contract as `recordGemmaActivity`.
+ *
+ * The wake request has already been dispatched by the time this runs, so a
+ * failure here costs a `warming` badge and nothing else. It must never turn a
+ * successful wake into a reported failure.
+ */
+export function recordWarmupRequest(store: ActivityStore | undefined, at?: Date): void {
+  stampSilently(store, (s) => s.recordWarmupRequest(at));
+}
+
+/**
+ * The one place the "a badge is never worth failing a request" decision is made.
+ *
+ * Shared by both stamps so a future third one cannot forget it.
+ */
+function stampSilently(
+  store: ActivityStore | undefined,
+  write: (store: ActivityStore) => Promise<void>,
+): void {
   if (store === undefined) return;
   try {
-    void store.record(at).catch(() => {
+    void write(store).catch(() => {
       // Deliberately silent. A failure to record activity is invisible to the
       // user by design: the badge falls back to `unknown`, which is honest.
     });

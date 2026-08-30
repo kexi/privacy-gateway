@@ -24,6 +24,7 @@ import { createApp as createSynthesisApp } from '@privacy-gateway/synthesis/serv
 import { InMemoryAnswerStore } from '@privacy-gateway/synthesis/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/server.ts';
+import { wakeGemma } from '../src/warmup.ts';
 
 const CORE_BASE_URL = 'http://core.test';
 
@@ -201,7 +202,9 @@ describe('GET /v1/status', () => {
   it('reports unknown rather than 500 when the store is unreachable', async () => {
     const store: ActivityStore = {
       read: () => Promise.reject(new Error('permission denied')),
+      readActivity: () => Promise.reject(new Error('permission denied')),
       record: () => Promise.resolve(),
+      recordWarmupRequest: () => Promise.resolve(),
     };
     await startFleet({ activityStore: store });
 
@@ -258,6 +261,37 @@ describe('POST /v1/warmup', () => {
     expect(response.status).toBe(202);
   });
 
+  it('makes the very next status poll report warming', async () => {
+    const store = new InMemoryActivityStore();
+    await startFleet({ activityStore: store, wakeGemmaImpl: () => Promise.resolve(true) });
+
+    // The feature this exists for: pressing the button must change what the
+    // badge says immediately, rather than staying `cold` for the two minutes it
+    // takes a real Gemma call to land.
+    await fetch(`${gatewayUrl}/v1/warmup`, { method: 'POST' });
+
+    await vi.waitFor(async () => {
+      const body = StatusResponseSchema.parse(
+        await (await fetch(`${gatewayUrl}/v1/status`)).json(),
+      );
+      expect(body.gemma).toBe('warming');
+      expect(body.warmup_requested_at).toBeDefined();
+    });
+  });
+
+  it('leaves the badge warm when the fleet was already up', async () => {
+    const store = new InMemoryActivityStore();
+    await store.record(new Date());
+    await startFleet({ activityStore: store, wakeGemmaImpl: () => Promise.resolve(true) });
+
+    await fetch(`${gatewayUrl}/v1/warmup`, { method: 'POST' });
+
+    // Warming up an already-warm fleet must not downgrade the badge into a wait
+    // that is not happening.
+    const body = StatusResponseSchema.parse(await (await fetch(`${gatewayUrl}/v1/status`)).json());
+    expect(body.gemma).toBe('warm');
+  });
+
   it('is refused when the caller is over the rate limit', async () => {
     // The one endpoint that spends GPU money without producing an answer, so it
     // shares the limiter rather than being exempt from it.
@@ -273,11 +307,79 @@ describe('POST /v1/warmup', () => {
   });
 });
 
+/** Fire-and-forget writes land a tick later than the call that made them. */
+async function settled(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+/** A fetch that behaves like an aborted request: delivered, then given up on. */
+function abortingFetch(): Promise<Response> {
+  const error = new Error('aborted');
+  error.name = 'AbortError';
+  return Promise.reject(error);
+}
+
+/** A fetch that never reached the far end at all. */
+function refusingFetch(): Promise<Response> {
+  return Promise.reject(new Error('ECONNREFUSED'));
+}
+
+/** A fetch that answers, as an already-running instance would. */
+function answeringFetch(): Promise<Response> {
+  return Promise.resolve(new Response('{}'));
+}
+
+describe('wakeGemma, stamping the warmup clock', () => {
+  // `none` keeps the static-key path: minting a real ID token would need
+  // credentials, and the auth mode is not what these tests are about.
+  const base = { baseUrl: 'http://gemma.test/v1', apiKey: 'k', auth: 'none' as const };
+
+  it('stamps when the wake is answered', async () => {
+    const store = new InMemoryActivityStore();
+
+    await wakeGemma({ ...base, activityStore: store, fetchImpl: answeringFetch });
+    await settled();
+
+    expect((await store.readActivity()).warmupRequestedAt).not.toBeNull();
+  });
+
+  it('stamps when the wake times out, because the container is still booting', async () => {
+    const store = new InMemoryActivityStore();
+
+    await wakeGemma({ ...base, activityStore: store, fetchImpl: abortingFetch });
+    await settled();
+
+    // The case that matters most: against a genuinely cold instance the probe
+    // usually times out while Cloud Run keeps starting the container. Refusing
+    // to stamp here would show `warming` only when the fleet was already up.
+    expect((await store.readActivity()).warmupRequestedAt).not.toBeNull();
+  });
+
+  it('does not stamp when nothing was ever reached', async () => {
+    const store = new InMemoryActivityStore();
+
+    await wakeGemma({ ...base, activityStore: store, fetchImpl: refusingFetch });
+    await settled();
+
+    // A transport failure woke nothing, so claiming `warming` would promise a
+    // boot that is not happening and hide a broken configuration.
+    expect((await store.readActivity()).warmupRequestedAt).toBeNull();
+  });
+
+  it('wakes without a store rather than refusing to', async () => {
+    // The wake does not depend on the badge: a fleet with no activity store must
+    // still boot, it simply cannot describe the boot.
+    await expect(wakeGemma({ ...base, fetchImpl: answeringFetch })).resolves.toBe(true);
+  });
+});
+
 describe('the activity write', () => {
   it('does not fail the request when the store is broken', async () => {
     const store: ActivityStore = {
       record: () => Promise.reject(new Error('firestore is unreachable')),
+      recordWarmupRequest: () => Promise.reject(new Error('firestore is unreachable')),
       read: () => Promise.resolve(null),
+      readActivity: () => Promise.resolve({ lastActiveAt: null, warmupRequestedAt: null }),
     };
     await startFleet({ activityStore: store });
 
