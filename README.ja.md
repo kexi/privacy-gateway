@@ -351,7 +351,7 @@ Gemma 用の [Ollama](https://ollama.com/)。Python クライアントを動か�
 ```bash
 cp .env.example .env       # 編集する
 just setup                 # pnpm install
-just pull-gemma            # ollama pull gemma3:12b
+just pull-gemma            # ollama pull gemma4:12b
 ```
 
 `just dev` は 4 プロセス——Gateway (8081)、Core (8082)、Synthesis (8083)、Vite 開発サーバ
@@ -833,7 +833,7 @@ Cloud Run の manual scaling で `gemma-serving` をインスタンス数 0 に�
 | `GOOGLE_GENAI_USE_VERTEXAI`  | `1`                         | Gemini SDK を Vertex AI 経由にする                                              |
 | `GEMINI_MODEL`               | `gemini-3.5-flash`          | Core のモデル ID — **下の注記を参照**                                           |
 | `GEMMA_BASE_URL`             | `http://localhost:11434/v1` | OpenAI 互換の Gemma エンドポイント                                              |
-| `GEMMA_MODEL`                | `gemma3:12b`                | Gemma のモデルタグ                                                              |
+| `GEMMA_MODEL`                | `gemma4:12b`                | Gemma のモデルタグ                                                              |
 | `GEMMA_API_KEY`              | `ollama`                    | OpenAI 互換 API 用のダミーキー                                                  |
 | `CORE_BASE_URL`              | `http://localhost:8082`     | Core のベース URL（配下から Agent Card を解決）                                 |
 | `SYNTHESIS_BASE_URL`         | `http://localhost:8083`     | Synthesis のベース URL                                                          |

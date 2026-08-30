@@ -349,7 +349,7 @@ you want to run the Python client.
 ```bash
 cp .env.example .env       # then edit
 just setup                 # pnpm install
-just pull-gemma            # ollama pull gemma3:12b
+just pull-gemma            # ollama pull gemma4:12b
 ```
 
 `just dev` starts all four processes — Gateway (8081), Core (8082), Synthesis (8083) and the
@@ -837,7 +837,7 @@ invalid value stops the process rather than failing mid-request.
 | `GOOGLE_GENAI_USE_VERTEXAI`  | `1`                         | route the Gemini SDK through Vertex AI                                                              |
 | `GEMINI_MODEL`               | `gemini-3.5-flash`          | Core's model id — **see the note below**                                                            |
 | `GEMMA_BASE_URL`             | `http://localhost:11434/v1` | OpenAI-compatible Gemma endpoint                                                                    |
-| `GEMMA_MODEL`                | `gemma3:12b`                | Gemma model tag                                                                                     |
+| `GEMMA_MODEL`                | `gemma4:12b`                | Gemma model tag                                                                                     |
 | `GEMMA_API_KEY`              | `ollama`                    | placeholder key for the OpenAI-compatible API                                                       |
 | `CORE_BASE_URL`              | `http://localhost:8082`     | Core service base URL (Agent Card resolved under it)                                                |
 | `SYNTHESIS_BASE_URL`         | `http://localhost:8083`     | Synthesis service base URL                                                                          |

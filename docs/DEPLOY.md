@@ -103,7 +103,7 @@ Defaults live in `infra/terraform/variables.tf`; `infra/terraform/example.tfvars
 values worth overriding. Overrides are passed per invocation as `var=value`:
 
 ```bash
-just tf-plan gemma_model=gemma3:4b
+just tf-plan gemma_model=gemma4:e4b
 just tf-apply gpu_enabled=false
 ```
 
@@ -111,7 +111,7 @@ The environment variables `PROJECT_ID` / `REGION` / `IMAGE_TAG` / `GEMMA_MODEL` 
 `TF_STATE_BUCKET` still work and are read by the recipes themselves:
 
 ```bash
-GEMMA_MODEL=gemma3:4b just build gemma
+GEMMA_MODEL=gemma4:e4b just build gemma
 ```
 
 ### 3.1 Bootstrap the Terraform state bucket
@@ -157,7 +157,7 @@ an artifact rather than infrastructure. Terraform consumes the tag through the `
 variable (default `latest`).
 
 The Gemma image **bakes the model in at build time**, so it is slow (15-25 minutes for
-`gemma3:12b`). It runs on `e2-highcpu-32` with a 100GB disk and a 3600s timeout. To avoid
+`gemma4:12b`). It runs on `e2-highcpu-32` with a 100GB disk and a 3600s timeout. To avoid
 redoing this, pin the tag once a Gemma build succeeds.
 
 > The Artifact Registry repository itself is a Terraform resource, so the very first
@@ -763,7 +763,7 @@ preference is history rather than a gate.
    a larger number draws out the review, so request the minimum you need)
 3. Write the justification in English, for example:
    > Hackathon project (All Things Agentic Hackathon, submission due 2026-08-31).
-   > Serving Gemma 3 with Ollama on Cloud Run GPU for a privacy-preserving
+   > Serving Gemma 4 with Ollama on Cloud Run GPU for a privacy-preserving
    > multi-agent gateway. Need 1x L4 in us-central1 for demo and video recording.
 4. Approval takes **minutes to a few business days**. Given the deadline, **file this first,
    before anything else**
@@ -773,7 +773,7 @@ preference is history rather than a gate.
 | Step | Action                                                                                       |
 | ---- | -------------------------------------------------------------------------------------------- |
 | 0    | **Deploy the other 33 resources now**: `just tf-apply gpu_enabled=false` (see 3.5)           |
-| 1    | Drop to `just tf-apply gemma_model=gemma3:4b` (3.3GB, but still needs an L4)                 |
+| 1    | Drop to `just tf-apply gemma_model=gemma4:e4b` (3.3GB, but still needs an L4)                 |
 | 2    | Request in another region: `just tf-apply region=us-east4` / `europe-west1` / `europe-west4` |
 | 3    | Give up on GPU and go through Vertex AI (below)                                              |
 
@@ -1040,7 +1040,7 @@ visible as committed code next to the `gcloud` output that confirms it.
 
 `gemma-serving` scales to zero, so the first request after an idle period pays a cold
 start. The GPU instance itself starts in ~5 s; what dominates is Ollama loading
-`gemma3:12b` (~8 GB) onto the card afterwards. Measured worst case is **~90 s**, and the
+`gemma4:12b` (~8 GB) onto the card afterwards. Measured worst case is **~90 s**, and the
 request that triggers the scale-from-zero waits for all of it.
 
 Two recipes bracket a filming session:

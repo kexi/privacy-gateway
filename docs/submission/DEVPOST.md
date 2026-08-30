@@ -58,7 +58,7 @@ reasons never sees a secret at all.
 ## How we built it
 
 ADK TypeScript (`@google/adk` 2.x) for all three agents; A2A for discovery and
-the Gateway→Core hop; Ollama serving Gemma 3 12B on Cloud Run's NVIDIA RTX PRO
+the Gateway→Core hop; Ollama serving Gemma 4 12B on Cloud Run's NVIDIA RTX PRO
 6000; Vertex AI `gemini-3.5-flash` via the global endpoint; Firestore with TTL
 for the vault and masked evidence; the whole platform declared in Terraform
 (50+ resources, least-privilege service accounts, Direct VPC egress with
@@ -105,7 +105,7 @@ policies.
 ## Built with
 
 `google-adk` (TypeScript) · A2A · Gemini 3.5 Flash (Vertex AI, global) ·
-Gemma 3 12B (Ollama, Cloud Run GPU RTX PRO 6000) · Firestore · Terraform ·
+Gemma 4 12B (Ollama, Cloud Run GPU RTX PRO 6000) · Firestore · Terraform ·
 Cloud Trace/Logging (OpenTelemetry) · Pub/Sub + Cloud Billing budgets ·
 zod · vitest · Playwright · MCP · OKF v0.2
 
@@ -118,7 +118,7 @@ zod · vitest · Playwright · MCP · OKF v0.2
 
 ## Gemma integration (bonus)
 
-Gemma 3 12B performs both privacy-critical functions — PII span extraction and
+Gemma 4 12B performs both privacy-critical functions — PII span extraction and
 the leak-check judge — self-hosted on a Cloud Run GPU inside the trust
 boundary. This is not a garnish: the product's core guarantee depends on an
 open model that never leaves our infrastructure.

@@ -96,7 +96,7 @@ just tf-destroy                   # 終わったら（§10）
 `infra/terraform/example.tfvars` に例がある。上書きは `var=value` 形式で呼び出しごとに渡す:
 
 ```bash
-just tf-plan gemma_model=gemma3:4b
+just tf-plan gemma_model=gemma4:e4b
 just tf-apply gpu_enabled=false
 ```
 
@@ -104,7 +104,7 @@ just tf-apply gpu_enabled=false
 有効で、レシピ側が読む:
 
 ```bash
-GEMMA_MODEL=gemma3:4b just build gemma
+GEMMA_MODEL=gemma4:e4b just build gemma
 ```
 
 ### 3.1 Terraform state バケットの bootstrap
@@ -149,7 +149,7 @@ Terraform の外に置いているのは意図的で、plan のたびに再ビ�
 タグはインフラではなく成果物だから。Terraform は `image_tag` 変数（既定 `latest`）
 としてタグを受け取る。
 
-Gemma イメージは**モデルをビルド時に焼き込む**ため時間がかかる（`gemma3:12b` で 15〜25 分）。
+Gemma イメージは**モデルをビルド時に焼き込む**ため時間がかかる（`gemma4:12b` で 15〜25 分）。
 `e2-highcpu-32` / disk 100GB / timeout 3600s で回す。ここを毎回やり直さないよう、
 Gemma のビルドは一度成功したらタグを固定しておくとよい。
 
@@ -749,7 +749,7 @@ L4 preference `34528bab-4b5b-47f1-82da-cec57b21a95d` の最終状態: **却下**
    大きい数字を出すと審査が長引くので、必要最小限で出すこと）
 3. 申請理由を英語で書く。例:
    > Hackathon project (All Things Agentic Hackathon, submission due 2026-08-31).
-   > Serving Gemma 3 with Ollama on Cloud Run GPU for a privacy-preserving
+   > Serving Gemma 4 with Ollama on Cloud Run GPU for a privacy-preserving
    > multi-agent gateway. Need 1x L4 in us-central1 for demo and video recording.
 4. 承認まで**数分〜数営業日**。締切があるので**最優先で最初に出しておくこと**
 
@@ -758,7 +758,7 @@ L4 preference `34528bab-4b5b-47f1-82da-cec57b21a95d` の最終状態: **却下**
 | 段階 | 対応                                                                                  |
 | ---- | ------------------------------------------------------------------------------------- |
 | 0    | **残り 33 リソースを今すぐ入れる**: `just tf-apply gpu_enabled=false`（§3.5）         |
-| 1    | `just tf-apply gemma_model=gemma3:4b` に落とす（3.3GB。それでも L4 は必要）           |
+| 1    | `just tf-apply gemma_model=gemma4:e4b` に落とす（3.3GB。それでも L4 は必要）           |
 | 2    | 別リージョンで申請: `just tf-apply region=us-east4` / `europe-west1` / `europe-west4` |
 | 3    | GPU を諦めて Vertex AI 経由にする（下記）                                             |
 
@@ -1027,7 +1027,7 @@ just smoke
 ### 9.4 デモ・審査ウィンドウ用に GPU を暖める
 
 `gemma-serving` はゼロスケールするため、アイドル後の最初のリクエストはコールドスタートを
-負担する。GPU インスタンス自体の起動は約 5 秒だが、その後 Ollama が `gemma3:12b`（約 8 GB）
+負担する。GPU インスタンス自体の起動は約 5 秒だが、その後 Ollama が `gemma4:12b`（約 8 GB）
 をカードに読み込む時間が支配的で、**実測の最悪値は約 90 秒**。スケールアップの引き金になった
 リクエストがその全部を待つことになる。
 

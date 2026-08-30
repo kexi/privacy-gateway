@@ -1,4 +1,4 @@
-# Image for running Gemma 3 with Ollama on Cloud Run GPU (NVIDIA L4).
+# Image for running Gemma 4 with Ollama on Cloud Run GPU (NVIDIA RTX PRO 6000).
 # Based on Google's "Run Gemma on Cloud Run with Ollama" tutorial.
 #
 # Approach: bake the model into the image at build time.
@@ -21,10 +21,10 @@
 # combining a bug fix with an untested version bump.
 FROM ollama/ollama:0.33.1@sha256:317a9773ab450c6aa5c51797d12548ff39129abbaea64debc16f8f1b564027b7
 
-# Model baked in at build time. gemma3:12b (~8.1GB) is the default and fits the
-# L4's 24GB of VRAM. Fall back with --build-arg GEMMA_MODEL=gemma3:4b if quota
+# Model baked in at build time. gemma4:12b is the default and fits the GPU's
+# 96GB of VRAM with room to spare. Fall back with --build-arg GEMMA_MODEL=gemma4:e4b
 # is unavailable.
-ARG GEMMA_MODEL=gemma3:12b
+ARG GEMMA_MODEL=gemma4:12b
 
 # Make Ollama listen on every interface in the container, on Cloud Run's PORT.
 ENV OLLAMA_HOST=0.0.0.0:8080
