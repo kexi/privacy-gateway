@@ -86,8 +86,14 @@ audit trail into a standard, portable artifact instead of bespoke JSON.
 Shipped since: the model-picker shim (`clients/ollama-shim`), so Claude Desktop's
 gateway-provider picker can select privacy-gateway directly — it turned out to
 require the Anthropic Messages API, not the Ollama protocol, so the shim serves
-both. Still ahead: authenticated human review (IAP) to unlock the human-reviewed
-trust tier; per-tenant disclosure policies.
+both, and a per-request disclosure opt-in, so a caller can ask for the high-risk
+values _they_ submitted back in _their_ answer without loosening the deployment's
+policy. Still ahead: **multimodal input** — every surface is text-only today and
+refuses an image part outright rather than dropping it, because regex plus a text
+model cannot find, mask or verify PII inside a picture; in-boundary Gemma vision
+extraction is the way to support it honestly. Also ahead: authenticated human
+review (IAP) to unlock the human-reviewed trust tier; per-tenant disclosure
+policies.
 
 ## Built with
 
@@ -99,7 +105,7 @@ zod · vitest · Playwright · MCP · OKF v0.2
 ## Links
 
 - Hosted demo: https://privacy-gateway.kexi.dev
-- Repository: https://github.com/kexi/all-things-agentic-hackathon ⟨confirm access for judges⟩
+- Repository: https://github.com/kexi/privacy-gateway ⟨confirm access for judges⟩
 - Video: ⟨YouTube URL, ≤4 min, English subtitles⟩
 - Architecture diagram: docs/diagram/architecture.png (also embedded in README)
 

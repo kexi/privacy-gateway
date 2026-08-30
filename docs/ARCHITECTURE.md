@@ -73,6 +73,8 @@ User ──HTTP──▶ Gateway (Gemma)
                  │ 5. leak check                           (422 leak_check_failed)
                  │ 6. Gemma judge (advisory, asymmetric)    (422 judge_flagged / judge_unavailable)
                  │ 7. rehydrate with disclosure policy      (409 unresolved_token)
+                 │    (default-withheld − env allow − request rehydrate_allow)
+                 │ 8. post-rehydration completeness check   (500 rehydration_incomplete)
                  ▼
                User  (final answer + OKF evidence document: what was masked, what was verified)
 ```
@@ -100,6 +102,9 @@ only masked artifacts are persisted (`status: draft`, `verified` omitted).
 | Gemma judge returns `leak: true`                                  | `422 judge_flagged`                                                                    |
 | Gemma judge unavailable / no usable verdict                       | `422 judge_unavailable`                                                                |
 | Unresolved placeholder survives rehydration                       | `409 unresolved_token`                                                                 |
+| A non-text content part on the OpenAI-compatible endpoint         | `400 multimodal_unsupported` (see §9a); nothing is sent                                |
+| `rehydrate_allow` names a category outside the withheld set       | `400 invalid_request`; nothing is sent                                                 |
+| The rehydration did not match the disclosure policy               | `500 rehydration_incomplete` (see §9b) — our bug, so 5xx; the body is still withheld   |
 | Per-IP demo rate limit exceeded                                   | `429`                                                                                  |
 | Body over `MAX_BODY_BYTES`                                        | `413`                                                                                  |
 | End-to-end deadline exceeded                                      | `504`                                                                                  |
@@ -199,15 +204,15 @@ has no Firestore role. Gateway and Synthesis import the package entry point.
 
 ## 7. API surface
 
-| Route                               | Method | Purpose                                                                                                                                                                                                                                                  |
-| ----------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/v1/ask`                           | POST   | `{text}` only. Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
-| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                       |
-| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                           |
-| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                   |
-| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.    |
-| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                    |
-| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                |
+| Route                               | Method | Purpose                                                                                                                                                                                                                                                                                      |
+| ----------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/v1/ask`                           | POST   | `{text}` plus the optional `rehydrate_allow` (§9). Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
+| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                                                           |
+| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                                                               |
+| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                                                       |
+| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.                                        |
+| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                                                        |
+| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                                                    |
 
 There is no approval route, no tier-lookup route and no session-scoped answer route:
 `POST /v1/sessions/:id/approve`, `GET /v1/sessions/:id/tier` and
@@ -269,6 +274,85 @@ it, and echoing it back through a frontier-model round trip only widens the blas
 radius of a logged or screenshotted response. `REHYDRATE_ALLOW_CATEGORIES`
 (comma-separated, e.g. `CREDIT_CARD,MY_NUMBER`) re-enables specific categories for a
 deployment that needs them released.
+
+### Per-request opt-in
+
+A caller may also ask, for one request only, that specific high-risk categories be
+restored: `POST /v1/ask` accepts an optional `rehydrate_allow: string[]`, and the
+OpenAI-compatible endpoint accepts the same list under
+`x_privacy_gateway: {rehydrate_allow}`. The list is validated against the
+default-withheld set and **anything else is a 400** — naming `EMAIL` would allow a
+category nothing withholds, so accepting it silently would report success for an
+opt-in that did nothing.
+
+The two allowances are a **union**: the effective policy is the default-withheld set
+minus the operator's `REHYDRATE_ALLOW_CATEGORIES` minus this request's own list.
+Neither can widen past the default-withheld set, because that fixed list is what is
+being filtered.
+
+The scope is deliberately narrow. The opt-in covers only the values the requester
+submitted **in this same request**, because one request is all the vault key names;
+there is no session for it to persist into, and an opt-in that outlived the request
+would apply to data the person granting it has not seen yet. The risk being accepted
+is that _this_ answer gets logged or screenshotted, which is a risk only the sender is
+positioned to accept.
+
+The audit record keeps the request and the outcome apart: `attestation.disclosure_requested`
+lists what was asked for and `attestation.withheld` lists what was still not given, in
+both the API response and the OKF document. A deliberate disclosure and an accidental
+one produce the same released text; only the record distinguishes them. The stored
+evidence document's body stays masked either way — the disclosure is for the one
+response, never for the audit trail.
+
+## 9a. Text only, by design
+
+Every surface is text-only, and a non-text content part is **refused by name**, never
+dropped. `POST /v1/chat/completions` returns `400 multimodal_unsupported` naming the
+part kinds it saw (`image_url`, `input_audio`, …) when any message content part is not
+text; the Anthropic/Ollama shim refuses an `image` block the same way; MCP `pgw_ask`
+takes a `string` and has no shape an attachment could arrive in.
+
+The reason is the masking itself. Redaction here is deterministic regex plus a text
+model, so PII inside an image or an audio clip — a face, a whiteboard, a screenshot of
+a card, a name read aloud — cannot be found, masked, or verified by any gate in this
+fleet. Accepting the part and dropping it would send a prompt the caller did not write;
+forwarding it would put unmaskable data across the boundary. Refusing is the only
+fail-closed reading, and it has to be loud enough that a caller knows their image never
+went. In-boundary Gemma vision extraction is the planned way to support it.
+
+## 9b. Post-rehydration completeness check
+
+Rehydration is the one step that turns placeholders back into real values, so after the
+single rehydration Synthesis verifies deterministically — no model, no second vault
+read — that it did exactly what the policy said:
+
+1. **The leftover set equals the withheld set.** A `⟦…⟧` surviving that the policy did
+   not withhold is a substitution that silently failed; a withheld placeholder that
+   _vanished_ means something replaced it, which is the disclosure the policy forbade.
+2. **Every restored placeholder carries the vault's own value.** A rehydrator that
+   wrote some other value would still produce a placeholder-free string that passes (1).
+3. **Nothing else that looks like PII appeared.** The deterministic attester is re-run
+   over the released text with the intentionally restored values subtracted out; the
+   residue must be empty. Scanning it raw would flag every successful release, since the
+   point of one is that real identifiers are now present.
+
+Any violation is `500 rehydration_incomplete` — alone among the refusals in being 5xx,
+because it is a fault in our code rather than something the caller could fix — and the
+body is withheld exactly as every other refusal withholds it. The verdict is recorded as
+`attestation.rehydration: {substituted, withheld_remaining, verdict: "pass"}`, present
+only on a release.
+
+Why post-hoc and deterministic rather than trusting `rehydrateWithPolicy`: that function
+is the thing being checked, and a verification sharing its implementation would only
+prove the implementation agrees with itself.
+
+**Replay coverage.** `just verify-answer <request_id>` replays what the stored artifacts
+support: the recorded digests, the leak-check verdict over the masked prompt and core
+response, and the presence of `disclosure_requested` / `rehydration` in the attestation
+block. It cannot replay the rehydration itself — the check runs over the rehydrated text,
+which by design exists only inside the one API response and is never persisted, and over
+the vault mapping, which is TTL'd and unreachable after expiry. Those parts are
+**runtime-only**: what survives is the fleet's attestation that they passed.
 
 ## 10. UI trust dimensions
 

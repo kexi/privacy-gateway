@@ -9,7 +9,7 @@ JSON over HTTP, so consuming the fleet needs no SDK and no shared runtime with
 the agents. This file exists to demonstrate exactly that.
 
 Usage:
-    uv run clients/python/pgw.py ask "text" [--gateway URL]
+    uv run clients/python/pgw.py ask "text" [--allow CREDIT_CARD] [--gateway URL]
     uv run clients/python/pgw.py evidence <request_id> [--gateway URL] [--json]
     uv run clients/python/pgw.py verify <request_id> [--base URL]
 
@@ -115,6 +115,11 @@ def describe_http_error(exc: httpx.HTTPStatusError) -> str:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"text": args.text}
+    # Sent only when something was asked for: an empty list is semantically
+    # identical to omitting the field, but sending it makes every request look
+    # like a disclosure request in a log or a proxy trace.
+    if args.allow:
+        payload["rehydrate_allow"] = args.allow
 
     with client(args.gateway) as http:
         try:
@@ -157,6 +162,21 @@ def cmd_ask(args: argparse.Namespace) -> int:
     withheld = attestation.get("withheld") or []
     if withheld:
         print(f"withheld   : {', '.join(withheld)} (left masked by the disclosure policy)")
+
+    # What was asked for and what was still not given are different facts, so
+    # they are printed as different lines rather than merged into one.
+    requested = attestation.get("disclosure_requested") or []
+    if requested:
+        print(f"disclosed  : {', '.join(requested)} (restored for this request only)")
+
+    rehydration = attestation.get("rehydration")
+    if isinstance(rehydration, dict):
+        print(
+            "rehydrate  : "
+            f"{rehydration.get('substituted')} substituted, "
+            f"{len(rehydration.get('withheld_remaining') or [])} left masked, "
+            f"verdict {rehydration.get('verdict')}"
+        )
 
     dimensions = body.get("dimensions") or {}
     if dimensions:
@@ -407,6 +427,30 @@ def cmd_verify(args: argparse.Namespace) -> int:
         )
     )
 
+    # 5. The disclosure and rehydration record.
+    #
+    #    Reported, not re-derived. The rehydration check runs over the rehydrated
+    #    text and the vault mapping: the first exists only inside the one API
+    #    response that produced it and is never persisted, and the second is
+    #    TTL'd and unreachable after expiry. Neither is available to a replay, so
+    #    what a third party can check here is that the fleet recorded a verdict
+    #    and what it claimed — printed as an explicit runtime-only note rather
+    #    than counted as a passing check it did not actually verify.
+    requested = recorded.get("disclosure_requested") or []
+    if requested:
+        print(f"     disclosure requested (this request only): {', '.join(requested)}")
+
+    rehydration = recorded.get("rehydration")
+    if isinstance(rehydration, dict):
+        remaining = rehydration.get("withheld_remaining") or []
+        print(
+            "     rehydration (runtime-only, not replayable): "
+            f"{rehydration.get('substituted', '?')} substituted, "
+            f"{len(remaining)} left masked, verdict {rehydration.get('verdict', '(absent)')}"
+        )
+    else:
+        print("     rehydration: (not recorded — a refused release records no verdict)")
+
     for name, ok, value in checks:
         print(f"{'OK  ' if ok else 'FAIL'} {name}: {value}")
     print(f"     independently derived findings: {', '.join(findings) or '(none)'}")
@@ -429,6 +473,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     ask = sub.add_parser("ask", help="send a request across the trust boundary")
     ask.add_argument("text", help="the request, in the clear; it is masked before it leaves")
+    ask.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="CATEGORY",
+        help=(
+            "allow one high-risk category to be restored in THIS response only "
+            "(API_KEY, AWS_KEY, JWT, CREDIT_CARD, MY_NUMBER); repeatable. "
+            "Anything else is refused with 400"
+        ),
+    )
     ask.set_defaults(func=cmd_ask)
 
     evidence = sub.add_parser("evidence", help="fetch the stored masked OKF document")

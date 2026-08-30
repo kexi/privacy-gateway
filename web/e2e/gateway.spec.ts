@@ -319,3 +319,106 @@ test.describe('the stored evidence', () => {
     }
   });
 });
+
+test.describe('the disclosure opt-in', () => {
+  test('offers every high-risk category, all unchecked', async ({ page }) => {
+    await page.goto('/');
+
+    // The safe policy has to be what happens when nobody chooses, so every box
+    // starts off. A pre-checked disclosure would be a disclosure by default.
+    for (const category of ['CREDIT_CARD', 'API_KEY', 'JWT', 'AWS_KEY', 'MY_NUMBER']) {
+      const box = page.locator(`input[name="rehydrate_allow"][value="${category}"]`);
+      await expect(box).toBeVisible();
+      await expect(box).not.toBeChecked();
+    }
+  });
+
+  test('groups the boxes under a legend and warns what allowing means', async ({ page }) => {
+    await page.goto('/');
+
+    await expect(page.locator('fieldset.disclosure legend')).toHaveText(/高リスク情報の復元/);
+    await expect(page.locator('#disclosure-warning')).toContainText(
+      /このリクエストで送信した値だけ/,
+    );
+    // The warning is announced with the control, not merely printed near it.
+    await expect(
+      page.locator('input[name="rehydrate_allow"][value="CREDIT_CARD"]'),
+    ).toHaveAttribute('aria-describedby', 'disclosure-warning');
+  });
+
+  test('labels every box so the control is reachable by its text', async ({ page }) => {
+    await page.goto('/');
+
+    // Clicking the label must toggle the box, which is only true when `for` and
+    // `id` actually pair up.
+    const card = page.locator('input[name="rehydrate_allow"][value="CREDIT_CARD"]');
+    await page.click('label[for="allow-credit-card"]');
+    await expect(card).toBeChecked();
+  });
+
+  test('withholds the card as a chip when nothing is allowed', async ({ page }) => {
+    await submit(page, CUSTOMER_EMAIL);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const answer = await page.locator('#answer').innerText();
+    expect(answer).toContain('⟦CREDIT_CARD_1⟧');
+    expect(answer).not.toContain('4242 4242 4242 4242');
+    await expect(page.locator('#answer .pii-chip.withheld')).not.toHaveCount(0);
+  });
+
+  test('restores the card into the answer when the box is checked', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.check('input[name="rehydrate_allow"][value="CREDIT_CARD"]');
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const answer = await page.locator('#answer').innerText();
+    expect(answer).toContain('4242 4242 4242 4242');
+    expect(answer).not.toContain('⟦CREDIT_CARD_1⟧');
+  });
+
+  test('highlights the restored card rather than showing a withheld chip', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.check('input[name="rehydrate_allow"][value="CREDIT_CARD"]');
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // The card is now a restored value like any other, so it is painted by the
+    // same highlight machinery — and the withheld chip for it is gone.
+    await expect(
+      page.locator('#answer .pii-chip.withheld[data-category="CREDIT_CARD"]'),
+    ).toHaveCount(0);
+    await expect(page.locator('#attestation .withheld')).not.toContainText('CREDIT_CARD');
+  });
+
+  test('still withholds a category the user did not check', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.check('input[name="rehydrate_allow"][value="CREDIT_CARD"]');
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const answer = await page.locator('#answer').innerText();
+    expect(answer).toContain('⟦API_KEY_1⟧');
+    expect(answer).not.toContain('sk-abcdefghijklmnopqrstuvwxyz012345');
+  });
+
+  test('records the opt-in in the OKF document', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.check('input[name="rehydrate_allow"][value="CREDIT_CARD"]');
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // `textContent`, not `innerText`: the document lives inside a collapsed
+    // `<details>`, so nothing here is rendered until someone opens it.
+    const okf = (await page.locator('#okf').textContent()) ?? '';
+    expect(okf).toContain('disclosure_requested');
+    expect(okf).toContain('CREDIT_CARD');
+    // The audit record still holds only the masked body: the disclosure was for
+    // the one response, never for the stored evidence.
+    expect(okf).not.toContain('4242 4242 4242 4242');
+  });
+});

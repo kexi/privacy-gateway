@@ -1,0 +1,51 @@
+/*
+ * The palette, defined once for every page.
+ *
+ * Both `style.css` (the demo UI) and `audit.css` (the audit view) previously
+ * carried their own copy of these ten values. That is one edit away from two
+ * pages of the same product disagreeing about what `--surface` means, and the
+ * duplication is invisible until someone changes a colour and only half the
+ * product follows.
+ *
+ * Why a plain `@import` of a CSS file rather than a preprocessor: these are
+ * already CSS custom properties, so they cascade, respond to a theme switch at
+ * runtime, and are readable in devtools under the name the source uses. A build
+ * step could only turn them back into the literals they came from.
+ */
+
+:root {
+  --bg: #0f1115;
+  --surface: #171a21;
+  --surface-2: #1e222b;
+  --border: #2b313d;
+  --text: #e6e9ef;
+  --muted: #99a1b3;
+  --accent: #7aa2f7;
+  --pass: #7ee787;
+  --fail: #ff7b72;
+  --token: #f2cc60;
+}
+
+/*
+ * The light theme lives here for the same reason the dark one does.
+ *
+ * It used to sit in `style.css` alone, so the demo page followed the reader's
+ * OS theme and the audit view stayed dark whatever they had chosen — the audit
+ * view simply had no light palette to switch to. Defining both here means a
+ * page gets the theme by importing the tokens, rather than by remembering to
+ * copy a second block.
+ */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --surface-2: #eef1f6;
+    --border: #d3d9e3;
+    --text: #14171d;
+    --muted: #5a6473;
+    --accent: #2a5bd7;
+    --pass: #1a7f37;
+    --fail: #c0392b;
+    --token: #8a6100;
+  }
+}

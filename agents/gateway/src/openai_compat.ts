@@ -29,8 +29,10 @@
 import {
   OPENAI_MODEL_ID,
   OpenAiChatCompletionRequestSchema,
+  type HighRiskCategory,
   type Logger,
   type OpenAiChatCompletionResponse,
+  type OpenAiChatMessage,
   type OpenAiModelList,
   type PiiCategory,
 } from '@privacy-gateway/common';
@@ -41,19 +43,51 @@ import type { AskResult } from './pipeline.ts';
 const TURN_SEPARATOR = '\n\n';
 
 /**
+ * The distinct non-text part kinds anywhere in the message list, sorted.
+ *
+ * Collected across *every* message including `assistant` turns: the flattener
+ * drops those, and "we dropped the turn your image was in" is not a defence
+ * against having accepted an image. The caller learns which kinds tripped the
+ * refusal — `image_url`, `input_audio` — because "multimodal is unsupported" is
+ * not actionable when the client library added the part on the caller's behalf.
+ *
+ * Empty means every part was text, which is the only shape this fleet forwards.
+ */
+export function nonTextPartTypes(messages: readonly OpenAiChatMessage[]): string[] {
+  const kinds = new Set<string>();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== 'text') kinds.add(part.type);
+    }
+  }
+  return [...kinds].sort();
+}
+
+/**
  * Flatten an OpenAI message list into the one text the pipeline masks.
+ *
+ * Only reached once `nonTextPartTypes` has come back empty, so the array form
+ * here is an array of text parts and joining them loses nothing.
  *
  * Exported for the tests: the mapping is the contract this endpoint documents,
  * so it is asserted directly rather than inferred from a masked prompt.
  */
-export function flattenMessages(
-  messages: readonly { readonly role: string; readonly content: string }[],
-): string {
+export function flattenMessages(messages: readonly OpenAiChatMessage[]): string {
   return messages
     .filter((message) => message.role === 'system' || message.role === 'user')
-    .map((message) => message.content.trim())
+    .map((message) => contentToText(message.content).trim())
     .filter((content) => content.length > 0)
     .join(TURN_SEPARATOR);
+}
+
+/** One message's content as text. `null` is an empty turn, which the caller drops. */
+function contentToText(content: OpenAiChatMessage['content']): string {
+  if (content === null) return '';
+  if (typeof content === 'string') return content;
+  return content
+    .map((part) => (part.type === 'text' ? ((part as { text?: string }).text ?? '') : ''))
+    .join('');
 }
 
 /** `GET /v1/models`: one id, because a caller selects the fleet, not a model. */
@@ -75,6 +109,8 @@ export function modelList(now: () => number): OpenAiModelList {
 export function toChatCompletion(
   result: AskResult,
   createdMs: number,
+  /** Echoed back so an aware client can confirm the opt-in was understood. */
+  rehydrateAllow: readonly HighRiskCategory[] = [],
 ): OpenAiChatCompletionResponse {
   return {
     // `chatcmpl-<request_id>` rather than a fresh id: the request id is the vault
@@ -98,6 +134,7 @@ export function toChatCompletion(
       status: result.status,
       masked_prompt: result.maskedPrompt,
       withheld: [...(result.attestation.withheld ?? [])] as PiiCategory[],
+      ...(rehydrateAllow.length > 0 ? { disclosure_requested: [...rehydrateAllow] } : {}),
     },
   };
 }
@@ -198,7 +235,12 @@ export function parseChatRequest(
   body: unknown,
   requestId: string,
 ):
-  | { readonly ok: true; readonly text: string; readonly stream: boolean }
+  | {
+      readonly ok: true;
+      readonly text: string;
+      readonly stream: boolean;
+      readonly rehydrateAllow: readonly HighRiskCategory[];
+    }
   | { readonly ok: false; readonly status: number; readonly body: OpenAiErrorBody } {
   const parsed = OpenAiChatCompletionRequestSchema.safeParse(body);
   if (!parsed.success) {
@@ -211,6 +253,27 @@ export function parseChatRequest(
         parsed.error.issues
           .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
           .join('; '),
+        requestId,
+      ),
+    };
+  }
+
+  // Checked before flattening, so an image is refused rather than dropped on the
+  // floor by a flattener that only knows how to read text.
+  const nonText = nonTextPartTypes(parsed.data.messages);
+  if (nonText.length > 0) {
+    return {
+      ok: false,
+      status: 400,
+      body: toOpenAiError(
+        400,
+        'multimodal_unsupported',
+        `this gateway is text-only; the request carried non-text content part(s) ` +
+          `(${nonText.join(', ')}) and nothing was sent. Redaction here is deterministic regex ` +
+          `plus a text model, so PII inside an image or an audio clip — a face, a screenshot of ` +
+          `a card, a name read aloud — cannot be found, masked or verified. Accepting the part ` +
+          `and dropping it would send a prompt you did not write; forwarding it would put ` +
+          `unmaskable data across the boundary. Send the content as text.`,
         requestId,
       ),
     };
@@ -232,7 +295,12 @@ export function parseChatRequest(
     };
   }
 
-  return { ok: true, text, stream: parsed.data.stream ?? false };
+  return {
+    ok: true,
+    text,
+    stream: parsed.data.stream ?? false,
+    rehydrateAllow: parsed.data.x_privacy_gateway?.rehydrate_allow ?? [],
+  };
 }
 
 /** Logs the shape of a compat request without any of its text. */

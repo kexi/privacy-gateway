@@ -185,6 +185,9 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
             coreAnswer: input.core_answer,
             knownTokens: input.known_tokens,
             vaultGeneration: input.vault_generation,
+            ...(input.rehydrate_allow !== undefined
+              ? { rehydrateAllow: input.rehydrate_allow }
+              : {}),
             vault,
             generatedBy: input.generated_by,
             logger: scoped,

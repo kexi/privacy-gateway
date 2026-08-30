@@ -23,7 +23,7 @@ import { InMemoryAnswerStore } from '@privacy-gateway/synthesis/store';
 import type express from 'express';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createApp } from '../src/server.ts';
-import { flattenMessages } from '../src/openai_compat.ts';
+import { flattenMessages, nonTextPartTypes } from '../src/openai_compat.ts';
 
 const CORE_BASE_URL = 'http://core.test';
 
@@ -45,6 +45,11 @@ function echoingCore(prompt: string): string {
 /** A Core that emits a raw address of its own, as if from training data. */
 function leakingCore(): string {
   return 'Contact them directly at leaked.person@example.com.';
+}
+
+/** A Core that echoes every placeholder it was given, card included. */
+function echoAllTokens(prompt: string): string {
+  return `Details: ${findTokens(prompt).join(' ')}`;
 }
 
 function testConfig(overrides: Record<string, string> = {}): Config {
@@ -422,5 +427,167 @@ describe('flattenMessages', () => {
         { role: 'user', content: 'Only this.' },
       ]),
     ).toBe('Only this.');
+  });
+
+  it('reads an all-text content array as the text it holds', () => {
+    expect(
+      flattenMessages([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Part one. ' },
+            { type: 'text', text: 'Part two.' },
+          ],
+        },
+      ]),
+    ).toBe('Part one. Part two.');
+  });
+});
+
+describe('nonTextPartTypes', () => {
+  it('finds nothing in a plain string body', () => {
+    expect(nonTextPartTypes([{ role: 'user', content: 'plain' }])).toEqual([]);
+  });
+
+  it('finds nothing in an all-text content array', () => {
+    expect(nonTextPartTypes([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])).toEqual(
+      [],
+    );
+  });
+
+  it('names each distinct non-text kind, sorted', () => {
+    expect(
+      nonTextPartTypes([
+        { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image_url' }] },
+        { role: 'user', content: [{ type: 'input_audio' }, { type: 'image_url' }] },
+      ]),
+    ).toEqual(['image_url', 'input_audio']);
+  });
+
+  it('inspects assistant turns too, which the flattener would have dropped', () => {
+    // "We ignore assistant turns" is not a defence against having accepted an
+    // image: the caller still believes it was sent.
+    expect(nonTextPartTypes([{ role: 'assistant', content: [{ type: 'image_url' }] }])).toEqual([
+      'image_url',
+    ]);
+  });
+});
+
+describe('multimodal content parts', () => {
+  it('refuses an image part with multimodal_unsupported and sends nothing', async () => {
+    await startFleet();
+
+    const response = await chat({
+      model: OPENAI_MODEL_ID,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is on this card?' },
+            { type: 'image_url', image_url: { url: 'https://example.test/card.png' } },
+          ],
+        },
+      ],
+    });
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('multimodal_unsupported');
+    // The refusal has to say *why*, or a caller reads it as a bug to work around.
+    expect(body.error.message).toContain('text-only');
+    expect(body.error.message).toContain('image_url');
+    // Nothing crossed the boundary, and no vault entry was spent on it.
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('refuses an audio part the same way', async () => {
+    await startFleet();
+
+    const response = await chat({
+      model: OPENAI_MODEL_ID,
+      messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: {} }] }],
+    });
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('multimodal_unsupported');
+    expect(body.error.message).toContain('input_audio');
+  });
+
+  it('never silently drops the image and answers about the text alone', async () => {
+    // The failure this guards against: accepting the request, masking only the
+    // text and returning a confident answer to a prompt the caller did not send.
+    await startFleet();
+
+    const response = await chat({
+      model: OPENAI_MODEL_ID,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe it.' },
+            { type: 'image_url', image_url: { url: 'https://example.test/x.png' } },
+          ],
+        },
+      ],
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).not.toContain('choices');
+  });
+
+  it('accepts an all-text content array unchanged', async () => {
+    await startFleet();
+
+    const response = await chat({
+      model: OPENAI_MODEL_ID,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Say hello.' }] }],
+    });
+
+    expect(response.status).toBe(200);
+    expect(promptsSeenByCore).toHaveLength(1);
+  });
+});
+
+describe('the disclosure opt-in over the compat surface', () => {
+  const WITH_CARD = 'The charge on card 4242 4242 4242 4242 failed. Repeat the card number.';
+
+  it('withholds the card when the request asks for nothing', async () => {
+    await startFleet(echoAllTokens);
+
+    const response = await chat(standardBody(WITH_CARD));
+    const body = OpenAiChatCompletionResponseSchema.parse(await response.json());
+
+    expect(body.choices[0]?.message.content).toContain('⟦CREDIT_CARD_1⟧');
+    expect(body.choices[0]?.message.content).not.toContain('4242 4242 4242 4242');
+    expect(body.x_privacy_gateway.withheld).toContain('CREDIT_CARD');
+    expect(body.x_privacy_gateway.disclosure_requested).toBeUndefined();
+  });
+
+  it('restores the card when x_privacy_gateway allows it', async () => {
+    await startFleet(echoAllTokens);
+
+    const response = await chat(
+      standardBody(WITH_CARD, { x_privacy_gateway: { rehydrate_allow: ['CREDIT_CARD'] } }),
+    );
+    expect(response.status).toBe(200);
+
+    const body = OpenAiChatCompletionResponseSchema.parse(await response.json());
+    expect(body.choices[0]?.message.content).toContain('4242 4242 4242 4242');
+    expect(body.x_privacy_gateway.disclosure_requested).toEqual(['CREDIT_CARD']);
+    expect(body.x_privacy_gateway.withheld).not.toContain('CREDIT_CARD');
+  });
+
+  it('rejects a category that is never withheld', async () => {
+    await startFleet();
+
+    const response = await chat(
+      standardBody('Hello.', { x_privacy_gateway: { rehydrate_allow: ['EMAIL'] } }),
+    );
+
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe('invalid_request');
+    expect(promptsSeenByCore).toHaveLength(0);
   });
 });

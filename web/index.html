@@ -39,14 +39,100 @@
         <p class="gpu-note" id="gpu-note" hidden></p>
       </header>
 
-      <section class="composer">
-        <label for="input">Request (in the clear)</label>
-        <textarea id="input" rows="7" spellcheck="false"></textarea>
+      <!--
+        A real <form>: the controls collect data and one button submits them, so
+        the semantics are the browser's rather than a click handler's. It never
+        navigates — the handler calls preventDefault and streams the request —
+        but keeping the element means Enter submits, the fieldset groups, and
+        assistive technology reads the composer as one thing.
+      -->
+      <form class="composer" id="composer" method="POST" action="/v1/ask">
+        <div class="field">
+          <label for="input">Request (in the clear)</label>
+          <textarea
+            id="input"
+            name="text"
+            rows="7"
+            spellcheck="false"
+            required
+            aria-describedby="input-help"
+          ></textarea>
+          <p id="input-help" class="hint">
+            Everything here is masked inside the boundary before any frontier model sees it.
+          </p>
+        </div>
+
+        <!--
+          The disclosure opt-in. These five categories are never restored into an
+          answer by default; a checkbox here allows restoration of the values
+          *this request* submits, for this response only. Default off, always:
+          the safe policy must be what happens when nobody chooses.
+        -->
+        <fieldset class="disclosure">
+          <legend>高リスク情報の復元をこのリクエストに限り許可</legend>
+          <p id="disclosure-warning" class="warning">
+            <strong>注意:</strong>
+            許可すると、そのカテゴリの値が回答本文にそのまま復元されます。ログやスクリーンショットに残ると被害範囲が広がります。許可は<strong>このリクエストで送信した値だけ</strong>が対象で、次のリクエストには引き継がれません。
+          </p>
+          <div class="disclosure-options">
+            <div class="disclosure-check">
+              <input
+                type="checkbox"
+                id="allow-credit-card"
+                name="rehydrate_allow"
+                value="CREDIT_CARD"
+                aria-describedby="disclosure-warning"
+              />
+              <label for="allow-credit-card">カード番号 <code>CREDIT_CARD</code></label>
+            </div>
+            <div class="disclosure-check">
+              <input
+                type="checkbox"
+                id="allow-api-key"
+                name="rehydrate_allow"
+                value="API_KEY"
+                aria-describedby="disclosure-warning"
+              />
+              <label for="allow-api-key">API キー <code>API_KEY</code></label>
+            </div>
+            <div class="disclosure-check">
+              <input
+                type="checkbox"
+                id="allow-jwt"
+                name="rehydrate_allow"
+                value="JWT"
+                aria-describedby="disclosure-warning"
+              />
+              <label for="allow-jwt">JWT <code>JWT</code></label>
+            </div>
+            <div class="disclosure-check">
+              <input
+                type="checkbox"
+                id="allow-aws-key"
+                name="rehydrate_allow"
+                value="AWS_KEY"
+                aria-describedby="disclosure-warning"
+              />
+              <label for="allow-aws-key">AWS キー <code>AWS_KEY</code></label>
+            </div>
+            <div class="disclosure-check">
+              <input
+                type="checkbox"
+                id="allow-my-number"
+                name="rehydrate_allow"
+                value="MY_NUMBER"
+                aria-describedby="disclosure-warning"
+              />
+              <label for="allow-my-number">マイナンバー <code>MY_NUMBER</code></label>
+            </div>
+          </div>
+        </fieldset>
+
         <div class="actions">
-          <button id="submit" type="button">Send through the gateway</button>
+          <button id="submit" type="submit">Send through the gateway</button>
           <p id="status" class="status"></p>
         </div>
-      </section>
+      </form>
 
       <!--
         Filled from the /v1/ask progress stream. It says which stage the request

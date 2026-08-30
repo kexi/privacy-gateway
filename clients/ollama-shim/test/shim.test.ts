@@ -409,3 +409,53 @@ describe('logging cannot carry prompt text', () => {
     expect(entry['severity']).toBe('ERROR');
   });
 });
+
+describe('the shim is text-only', () => {
+  it('refuses an image block instead of dropping it', async () => {
+    const captured: { request?: unknown } = {};
+    await withServer(stubFetch({ status: 200, body: SUCCESS_BODY }, captured), async (base) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL_ID,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'What is on this card?' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } },
+              ],
+            },
+          ],
+          max_tokens: 100,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: { type: string; message: string } };
+      expect(body.error.type).toBe('invalid_request_error');
+      expect(body.error.message).toContain('text-only');
+      expect(body.error.message).toContain('image');
+      // Nothing reached the gateway, so no vault entry was spent and no partial
+      // prompt crossed the boundary.
+      expect(captured.request).toBeUndefined();
+    });
+  });
+
+  it('still accepts an all-text block array', async () => {
+    await withServer(stubFetch({ status: 200, body: SUCCESS_BODY }), async (base) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: ANTHROPIC_MODEL_ID,
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'Just words.' }] }],
+          max_tokens: 100,
+        }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+  });
+});

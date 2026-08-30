@@ -1,25 +1,21 @@
 /*
  * Styling for the read-only audit view.
  *
- * The palette and the chip/badge vocabulary are copied from `style.css` rather
- * than imported from it: the two pages are separate Vite entry points, and
- * pulling the whole main-app stylesheet in would ship the composer, the
- * pipeline checklist and the mask legend to a page that has none of them. The
- * shared vocabulary is the token set below, which is small enough to keep in
- * step by eye and is what makes a status chip mean the same thing on both pages.
+ * The chip/badge vocabulary is duplicated from `style.css` rather than imported
+ * from it: the two pages are separate Vite entry points, and pulling the whole
+ * main-app stylesheet in would ship the composer, the pipeline checklist and
+ * the mask legend to a page that has none of them.
+ *
+ * The palette is *not* duplicated. It used to be, with a comment claiming the
+ * copy was "small enough to keep in step by eye" — and it was not: the light
+ * theme was added to `style.css` only, so this page stayed dark for every
+ * reader whose OS asked for light. It now comes from `tokens.css`, which both
+ * entry points import.
  */
 
+@import './tokens.css';
+
 :root {
-  --bg: #0f1115;
-  --surface: #171a21;
-  --surface-2: #1e222b;
-  --border: #2b313d;
-  --text: #e6e9ef;
-  --muted: #99a1b3;
-  --accent: #7aa2f7;
-  --pass: #7ee787;
-  --fail: #ff7b72;
-  --token: #f2cc60;
   font-family:
     ui-sans-serif,
     system-ui,
@@ -202,6 +198,18 @@ button.secondary {
  */
 .table-scroll {
   overflow-x: auto;
+  /*
+   * Capped so the listing scrolls instead of stretching the page. The endpoint
+   * returns up to 50 rows, and an uncapped table put the detail panel below
+   * thousands of pixels of scroll — the reader had to travel past the whole
+   * list to see what clicking a row did.
+   *
+   * `dvh` rather than `vh`: on mobile the browser chrome collapses on scroll,
+   * and `vh` is the *largest* viewport, so a `vh` cap is taller than the screen
+   * for the first swipe. `dvh` tracks the visible area.
+   */
+  max-height: min(60dvh, 34rem);
+  overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
@@ -223,12 +231,35 @@ button.secondary {
   padding: 0.7rem 0.85rem;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
+  /*
+   * Pinned inside the scroll container: once the body scrolls, eight unlabelled
+   * columns of ids, chips and counts are unreadable. `background` is required —
+   * a sticky cell is transparent by default and the rows would show through it.
+   */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
 }
 
 .audit-table td {
   padding: 0.6rem 0.85rem;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
+}
+
+/*
+ * The `Judge retries` header is three times wider than any value it ever shows.
+ *
+ * Measured on the live page: the column reserves 125px to display a single `0`,
+ * purely because the two-word header cannot wrap. That, plus the 298px full
+ * UUID beside it, pushed the table ~40px past its container and clipped the
+ * last column mid-word ("CREDIT_CAR"). Letting the header wrap to two lines
+ * costs nothing — the header row is already the tallest thing in the thead —
+ * and it buys back more width than the overflow needed.
+ */
+.audit-table th:nth-child(7) {
+  white-space: normal;
 }
 
 .audit-table tbody tr:last-child td {
@@ -401,4 +432,12 @@ button.secondary {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-x: auto;
+  /*
+   * The single tallest element on the page: an OKF document is ~87 lines, and
+   * rendered whole it pushed everything after it off the bottom. Capped and
+   * scrolled in place so the document stays readable without the page becoming
+   * a column of one thing.
+   */
+  max-height: min(55dvh, 30rem);
+  overflow-y: auto;
 }

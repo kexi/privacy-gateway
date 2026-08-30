@@ -384,9 +384,40 @@ export const DEFAULT_WITHHELD_CATEGORIES: readonly string[] = [
   'MY_NUMBER',
 ];
 
-/** Parse `REHYDRATE_ALLOW_CATEGORIES` into the set of categories to release anyway. */
+/**
+ * True when `category` is one this fleet withholds unless someone allows it.
+ *
+ * The same list `DEFAULT_WITHHELD_CATEGORIES` names, exposed as a predicate so
+ * the request schema can reject an opt-in naming anything else: a caller who
+ * asks to "restore" `EMAIL` is describing a category that was never withheld,
+ * and honouring the request silently would teach them the opt-in did something.
+ */
+export function isHighRiskCategory(category: string): boolean {
+  return DEFAULT_WITHHELD_CATEGORIES.includes(category);
+}
+
+/**
+ * Which categories stay masked, given the operator policy and this request's
+ * own opt-in.
+ *
+ * The two allowances are a **union**, not an override in either direction. The
+ * operator's `REHYDRATE_ALLOW_CATEGORIES` is a deployment-wide statement that a
+ * category may be released at all; `requestAllow` is one caller saying they want
+ * back the values *they themselves submitted in this request*. Neither can widen
+ * beyond the default-withheld set, because `DEFAULT_WITHHELD_CATEGORIES` is what
+ * is being filtered — an allowance naming a category nobody withholds subtracts
+ * nothing.
+ *
+ * Why a request may allow anything at all: there is exactly one request's worth
+ * of data behind the vault key, and the caller supplied every byte of it. The
+ * blast radius the default policy protects against is *this* answer being logged
+ * or screenshotted, which is a risk only the sender is in a position to accept.
+ * Why not a header or a cookie: an opt-in that outlives the request would apply
+ * to data the person granting it has not seen yet.
+ */
 export function withheldCategories(
   allowList: string | undefined = process.env['REHYDRATE_ALLOW_CATEGORIES'],
+  requestAllow: readonly string[] = [],
 ): string[] {
   const allowed = new Set(
     (allowList ?? '')
@@ -394,6 +425,7 @@ export function withheldCategories(
       .map((entry) => entry.trim().toUpperCase())
       .filter((entry) => entry !== ''),
   );
+  for (const category of requestAllow) allowed.add(category.trim().toUpperCase());
   return DEFAULT_WITHHELD_CATEGORIES.filter((category) => !allowed.has(category));
 }
 

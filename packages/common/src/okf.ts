@@ -208,6 +208,22 @@ export interface AttestationEvidence {
   readonly checkedAt: Date;
   /** Categories the disclosure policy kept masked in the released answer. */
   readonly withheld?: readonly string[] | undefined;
+  /**
+   * Categories the requester asked to have restored for this request alone.
+   *
+   * Recorded beside `withheld` because a disclosure that happened on purpose and
+   * one that happened by accident produce the same released text; only the
+   * record distinguishes them, and the record is the product.
+   */
+  readonly disclosureRequested?: readonly string[] | undefined;
+  /** The post-rehydration completeness verdict; present only on a release. */
+  readonly rehydration?:
+    | {
+        readonly substituted: number;
+        readonly withheld_remaining: readonly string[];
+        readonly verdict: 'pass';
+      }
+    | undefined;
 }
 
 export interface BuildGatewayAnswerOptions {
@@ -312,6 +328,18 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
       ...(evidence.withheld !== undefined && evidence.withheld.length > 0
         ? { withheld: [...evidence.withheld] }
         : {}),
+      ...(evidence.disclosureRequested !== undefined && evidence.disclosureRequested.length > 0
+        ? { disclosure_requested: [...evidence.disclosureRequested] }
+        : {}),
+      ...(evidence.rehydration !== undefined
+        ? {
+            rehydration: {
+              substituted: evidence.rehydration.substituted,
+              withheld_remaining: [...evidence.rehydration.withheld_remaining],
+              verdict: evidence.rehydration.verdict,
+            },
+          }
+        : {}),
     },
   };
 
@@ -338,6 +366,23 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
       ? `\nThe disclosure policy kept these categories masked in the released answer: ` +
         `${evidence.withheld.map((category) => `\`${category}\``).join(', ')}.\n`
       : '';
+  // Stated in prose as well as in the frontmatter: a reader scanning the
+  // document for "was anything high-risk deliberately given back" should not
+  // have to know which YAML key to look under.
+  const disclosureBlock =
+    evidence.disclosureRequested !== undefined && evidence.disclosureRequested.length > 0
+      ? `\nThe requester asked, for this request only, that these high-risk categories be ` +
+        `restored: ${evidence.disclosureRequested.map((c) => `\`${c}\``).join(', ')}. The ` +
+        `opt-in covers only values submitted in this same request.\n`
+      : '';
+  const rehydrationBlock =
+    evidence.rehydration !== undefined
+      ? `\nRehydration check: ${evidence.rehydration.substituted} placeholder(s) restored, ` +
+        `${evidence.rehydration.withheld_remaining.length} left masked, verdict ` +
+        `\`${evidence.rehydration.verdict}\`. The released text was verified to contain exactly ` +
+        `the withheld placeholders, the exact vault value for every restored one, and no other ` +
+        `identifier.\n`
+      : '';
 
   const content = `# Answer (masked)
 
@@ -346,7 +391,7 @@ ${options.maskedAnswerBody.trim()}
 The rehydrated form of this answer was returned to the caller in the API response and is
 deliberately not stored. Only the masked text above, the hashes below, and the category
 counts are retained.
-${withheldBlock}
+${withheldBlock}${disclosureBlock}${rehydrationBlock}
 # Attestation
 
 Leak-policy check ${verdictLine}. It confirms only that the core agent's tokenized

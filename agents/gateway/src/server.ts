@@ -150,6 +150,7 @@ interface SynthesisInput {
   readonly knownTokens: readonly string[];
   readonly vaultGeneration: number;
   readonly requestId: string;
+  readonly rehydrateAllow: readonly string[];
 }
 
 /**
@@ -352,6 +353,7 @@ export function createApp(options: CreateAppOptions): express.Application {
         generated_by: input.generatedBy,
         known_tokens: [...input.knownTokens],
         vault_generation: input.vaultGeneration,
+        rehydrate_allow: [...input.rehydrateAllow],
       }),
     });
 
@@ -396,6 +398,8 @@ export function createApp(options: CreateAppOptions): express.Application {
     req: Request,
     context: RequestContext,
     text: string,
+    /** The request's disclosure opt-in, already validated by the caller's schema. */
+    rehydrateAllow: readonly string[],
     onProgress?: (event: ProgressEvent) => void,
   ): Promise<AskResult> {
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
@@ -438,6 +442,7 @@ export function createApp(options: CreateAppOptions): express.Application {
               const outcome = await ask({
                 text,
                 requestId: context.requestId,
+                rehydrateAllow,
                 vault,
                 signal: controller.signal,
                 callCore: (maskedPrompt, signal) =>
@@ -515,8 +520,8 @@ export function createApp(options: CreateAppOptions): express.Application {
     logChatStart(context.logger, parsed.stream);
 
     try {
-      const result = await runAsk(req, context, parsed.text);
-      const completion = toChatCompletion(result, now());
+      const result = await runAsk(req, context, parsed.text, parsed.rehydrateAllow);
+      const completion = toChatCompletion(result, now(), parsed.rehydrateAllow);
 
       context.logger.event('openai.compat.chat.end', {
         document_status: result.status,
@@ -656,13 +661,14 @@ export function createApp(options: CreateAppOptions): express.Application {
     // body means `AskRequestSchema` stays strict and a client that cannot stream
     // is unaffected.
     const wantsStream = /text\/event-stream/u.test(req.headers.accept ?? '');
+    const rehydrateAllow = parsed.data.rehydrate_allow ?? [];
     if (wantsStream) {
-      await handleAskStream(req, res, context, parsed.data.text);
+      await handleAskStream(req, res, context, parsed.data.text, rehydrateAllow);
       return;
     }
 
     try {
-      res.json(toPayload(await runAsk(req, context, parsed.data.text)));
+      res.json(toPayload(await runAsk(req, context, parsed.data.text, rehydrateAllow)));
     } catch (error) {
       handleAskError(error, res, context);
     }
@@ -689,6 +695,7 @@ export function createApp(options: CreateAppOptions): express.Application {
     res: Response,
     context: RequestContext,
     text: string,
+    rehydrateAllow: readonly string[],
   ): Promise<void> {
     res.status(200);
     res.setHeader('content-type', 'text/event-stream; charset=utf-8');
@@ -705,7 +712,7 @@ export function createApp(options: CreateAppOptions): express.Application {
     };
 
     try {
-      const result = await runAsk(req, context, text, (progress) => {
+      const result = await runAsk(req, context, text, rehydrateAllow, (progress) => {
         send('progress', progress);
       });
       send('result', toPayload(result));
@@ -1049,7 +1056,16 @@ export class SynthesisRefusedError extends Error {
  * cannot be replayed to the caller as if Synthesis had reasoned about it.
  */
 async function readRefusal(response: globalThis.Response): Promise<SynthesisRefusedError | null> {
-  const isRefusalStatus = [409, 410, 422].includes(response.status);
+  // 500 is in this list for exactly one refusal: `rehydration_incomplete`, which
+  // is Synthesis catching a fault in its *own* rehydration rather than declining
+  // something about the request. It is still a refusal — nothing was released —
+  // so it must reach the caller as the reason Synthesis chose, not as a generic
+  // 502 that reads like Synthesis was unreachable. The body still has to parse
+  // as a `ReleaseRefusal` below, so an ordinary 500 from an unhandled exception
+  // (whose body is `{error: 'internal_error', message: ...}`, with no
+  // `status_code` or `categories`) fails the schema and falls through to
+  // `DownstreamError` as before.
+  const isRefusalStatus = [409, 410, 422, 500].includes(response.status);
   if (!isRefusalStatus) return null;
 
   try {

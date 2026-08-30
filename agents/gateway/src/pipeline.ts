@@ -42,6 +42,7 @@ export type SynthesisCaller = (
     generatedBy: string;
     knownTokens: readonly string[];
     vaultGeneration: number;
+    rehydrateAllow: readonly string[];
   },
   signal?: AbortSignal,
 ) => Promise<SynthesizeResponse>;
@@ -108,6 +109,14 @@ export interface AskOptions {
   readonly text: string;
   /** The vault key: one server-generated request id, never caller-supplied. */
   readonly requestId: string;
+  /**
+   * High-risk categories this request asked to have restored.
+   *
+   * Carried through untouched: the Gateway neither applies nor second-guesses
+   * the disclosure policy — Synthesis owns it, and it validates the list again
+   * on arrival. Empty by default, which is the existing behaviour exactly.
+   */
+  readonly rehydrateAllow?: readonly string[] | undefined;
   readonly vault: TokenVault;
   readonly callCore: CoreCaller;
   readonly callSynthesis: SynthesisCaller;
@@ -304,6 +313,7 @@ export async function ask(options: AskOptions): Promise<AskResult> {
           generatedBy: options.coreActor,
           knownTokens,
           vaultGeneration: entry.generation,
+          rehydrateAllow: options.rehydrateAllow ?? [],
         },
         signal,
       );

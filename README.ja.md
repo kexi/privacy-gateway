@@ -212,6 +212,38 @@ Firestore が保存するのは**マスク済み**のアーティファクトの
 できる（例: `REHYDRATE_ALLOW_CATEGORIES=CREDIT_CARD,MY_NUMBER`）。未設定なら 5 カテゴリ
 すべてが伏せられたままになる。
 
+**リクエスト単位のオプトイン。** 呼び出し元は 1 回のリクエストに限って特定カテゴリの復元を
+許可できる。`POST /v1/ask` は任意の `rehydrate_allow: ["CREDIT_CARD"]` を受け付け、OpenAI
+互換エンドポイントは同じリストを `x_privacy_gateway: {rehydrate_allow}` で受け付ける。デモ
+UI ではチェックボックス群として提供し、既定はすべてオフ。リストはこの 5 カテゴリの部分集合
+でなければならず、そもそも抑制されていないカテゴリ（`EMAIL` など）を指定すれば `400` になる
+——「黙って何もしなかったオプトイン」こそが、この機能に許されない唯一の失敗形だからだ。
+`REHYDRATE_ALLOW_CATEGORIES` とは和集合で扱われ、対象は**同一リクエストで送信した値**だけ
+である（1 リクエスト = 1 金庫キーであり、許可が持ち越されるセッションは存在しない）。記録は
+両者を分けて残す——`attestation.disclosure_requested` が要求した内容、
+`attestation.withheld` がそれでも渡されなかった内容——であり、保存される OKF の本文はどちらの
+場合もマスクされたままだ。
+
+**リハイドレートは検証される。** 単一のリハイドレートの後、Synthesis は決定的に、残存する
+プレースホルダが抑制集合とちょうど一致すること、復元された各プレースホルダが金庫の値その
+ものを持つこと、それ以外の識別子が出現していないこと（意図的に復元した値を差し引いた
+リリーステキストに対するアテスタ再実行）を検証する。違反は `500 rehydration_incomplete` —
+呼び出し元ではなく我々のバグなので唯一の 5xx 拒否である — となり、本文は他の拒否と同様に
+withheld される。リリース時には `attestation.rehydration: {substituted, withheld_remaining,
+verdict}` が付く。
+
+## 設計としてのテキスト専用
+
+すべてのサーフェスはテキスト専用である。テキスト以外のコンテンツパートは黙って捨てず名指し
+で拒否する: `/v1/chat/completions` は検出した種別（`image_url`、`input_audio` など）を挙げて
+`400 multimodal_unsupported` を返し、Anthropic/Ollama シムも `image` ブロックを同様に拒否し、
+MCP の `pgw_ask` は `string` のみで添付が届く形を持たない。ここでの秘匿化は決定的な正規表現と
+テキストモデルであり、画像や音声の中の PII — 顔、ホワイトボード、カードのスクリーンショット、
+読み上げられた氏名 — はこのフリートのどのゲートでも検出・マスク・検証できない。パートを受理
+して捨てれば呼び出し元が書いていないプロンプトを送ることになり、転送すればマスク不能なデータ
+を境界の外に出すことになる。境界内 Gemma によるビジョン抽出が、これをサポートする予定の方式
+である。
+
 ## Open Knowledge Format (OKF v0.2)
 
 このエージェント群が出す回答はすべて「エージェントが書いたコンテンツ」なので、来歴と信頼性を
@@ -312,7 +344,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-vitest は 31 ファイル・545 テスト。ルートの `vitest.config.ts` が `test.projects` を使うので
+vitest は 43 ファイル・801 テスト。ルートの `vitest.config.ts` が `test.projects` を使うので
 `just test` はリポジトリルートから全部を走らせられる一方、各パッケージも自前の `test` script
 を保持しており `pnpm --filter X test` も従来どおり動く。`just test-coverage` は
 `@vitest/coverage-v8` を使い、パッケージごとの下限を強制する。`packages/common` は行 90%
@@ -329,12 +361,89 @@ just web-e2e        # Playwright、chromium のみ
 just setup-browsers # Nix の外では 1 度だけ
 ```
 
-`web/e2e/` の 36 本の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
+`web/e2e/` の 50 本の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
 だけをモックした上で実物の Gateway と Synthesis を起動する。つまりブラウザが叩くのはスタブ
 API ではなく本番のリクエスト経路そのもの。chromium のみとしているのは、これらが検証するのは
 アプリケーションの挙動であってレンダリング差ではなく、2 つ目のエンジンは追加のシグナルなしに
 実行時間だけを倍にするため。Nix ではブラウザを `PLAYWRIGHT_BROWSERS_PATH` から取る。Nix の
 外では `just setup-browsers`（`pnpm -C web exec playwright install chromium`）を 1 度実行する。
+
+### 再現可能なテスト
+
+この README の主張はすべて、書いた本人以外が検証し直せることを意図している。この節は、
+クリーンなチェックアウトから自分で検証し終えるまでの最短経路である。
+
+**1. まず全部をオフラインで。** クラウドアカウントも API キーも不要:
+
+```bash
+direnv allow                # または: nix develop
+just setup                  # pnpm install
+just check                  # fmt・recipe doc・lint・tf-validate・typecheck・pinact・gitleaks・テスト
+just web-e2e                # Playwright 50 本（Nix の外では先に `just setup-browsers`）
+```
+
+`just check` は CI が実行するものと同一のレシピ・同一の順序なので、ローカルが green である
+ことと CI が green であることは同じ意味を持つ。**vitest 43 ファイル・801 テスト**と
+**Playwright 50 本**が期待値である。実行結果がこの数と食い違う場合は、自分の実行結果のほうを
+信じてこの記述を古いものとして扱ってほしい。
+
+壊れていると判断する前に知っておくとよい注意が 2 点ある。
+
+- `agents/synthesis/test/dist_attestation.test.ts` はパッケージをビルドし、ビルド成果物を
+  実際に起動して、本番イメージでも attestation の digest が実物であること（かつて
+  パッケージングの不具合で出た `unavailable` プレースホルダではないこと）を確認する。
+  最も遅く、唯一タイミングに敏感なテストであり、並列負荷が高いとまれにタイムアウトする。
+  調査の前に再実行すること。
+- テストが固定しているのは**文言ではなく振る舞い**である。拒否種別とステータスコードを
+  assert しているので、散文の変更では壊れず、意味の変更で壊れる。
+
+**2. プライバシー保証そのもの。** マスキング・vault 境界・fail-closed ゲートが退行したら
+落ちるテスト群はここにある:
+
+```bash
+pnpm --filter @privacy-gateway/common test      # マスキング・vault・OKF・ログ allowlist
+pnpm --filter @privacy-gateway/synthesis test   # 5 つのリリースゲート、ジャッジの非対称性
+pnpm --filter @privacy-gateway/core test        # 境界: Core は実値を決して見ない
+```
+
+最初に読むべきファイルは `agents/synthesis/test/pipeline.test.ts`。各ゲートに「何を保証するか」
+を名前で述べたテストがあり、ジャッジの flag が再実行でリリースに変わらないこと、どの拒否経路も
+rehydrate しないことも含まれている。
+
+**3. フリートを信用せずに 1 件の attestation を検証する。** あるリクエストについてゲートウェイが
+主張する内容は、ゲートウェイ自身が配信する成果物に対して、フリート以外のコードで検証できる:
+
+```bash
+just verify-answer <request_id>                                       # localhost:8081 に対して
+just verify-answer <request_id> https://privacy-gateway.kexi.dev      # 本番に対して
+```
+
+このレシピは `uv run clients/python/pgw.py verify <id> --base <url>` の 1 行ラッパーなので、
+呼び出しを直接見たい場合はクライアントをそのまま実行してもよい。クライアントはゲートウェイが
+配信するマスク済みプロンプトと Core レスポンスを再ハッシュし、OKF ドキュメントが記録する
+digest をすべて突き合わせ、スキャナを書き写した独自実装で verdict を再導出する。**検証できな
+かったもの**は合格としてカウントせずそのように報告する（`attester_sha256` と
+`computation_sha256` はこのリポジトリ内のファイルを指すため、チェックアウトからのみ比較できる）。
+
+**4. 稼働中のデプロイに対して。** 以下はプロジェクトへの `gcloud` 認証が必要:
+
+```bash
+just smoke                  # 固定 PII サンプルを POST し、200・プレースホルダあり・生 PII なしを確認
+just image-test             # 実物の Synthesis イメージを起動し、digest が実物であることを確認
+just verify-auth            # ラップトップから: 非公開サービスに到達「できない」ことの証明
+just verify-auth-internal   # VPC 内から: IAM が正当な呼び出し元を受け入れることの証明
+```
+
+`verify-auth` と `verify-auth-internal` が対になっているのは意図的である。外から `403` が返る
+ことだけを示すテストは「正しく閉じている」と「単に壊れている」を区別できないため、2 つ目で
+「正しい呼び出し元には同じ扉が開く」ことを示している。
+
+**5. `docs/proof/` の証跡を再現する。** 各ファイルは生成に使ったコマンドをヘッダのコメントに
+記録してあるので、鵜呑みにするのではなく再実行できる。
+[`docs/proof/README.ja.md`](docs/proof/README.ja.md) が索引であり、その冒頭には、この方法で
+発見され既に修正された欠陥（何もキャップしていないのに成功を報告していたキルスイッチを含む）
+を列挙してある。失敗は意図的に残している。自分の失敗を黙って消す proof ディレクトリは、
+失敗が閉じられていく過程を見せるものより価値が低いからである。
 
 ### API
 

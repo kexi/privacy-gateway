@@ -23,11 +23,42 @@ curl -sS http://localhost:8081/v1/ask \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
 
-`{text}` and nothing else. A body carrying `session_id` is rejected with `400`:
-there are no sessions, and a caller-supplied id would be a rehydration oracle.
-The response holds the masked prompt that actually crossed the boundary, the
-rehydrated answer (returned once, never stored), the OKF document, the four trust
-dimensions, and the attestation.
+`{text}` plus the optional `rehydrate_allow` (below) and nothing else. A body
+carrying `session_id` is rejected with `400`: there are no sessions, and a
+caller-supplied id would be a rehydration oracle. The response holds the masked
+prompt that actually crossed the boundary, the rehydrated answer (returned once,
+never stored), the OKF document, the four trust dimensions, and the attestation.
+
+**Per-request disclosure opt-in.** `API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD` and
+`MY_NUMBER` are never restored into an answer by default. A caller may allow
+specific ones back for one request:
+
+```bash
+curl -sS http://localhost:8081/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"...the charge on card 4242 4242 4242 4242 failed...",
+       "rehydrate_allow":["CREDIT_CARD"]}'
+```
+
+The list must be a subset of those five; anything else — including a category
+that is never withheld, such as `EMAIL` — is a `400`, because an opt-in that
+quietly did nothing is the one failure mode this must not have. The allowance
+covers only values submitted **in this same request** (one request, one vault
+key, no session to persist into) and is unioned with the deployment's
+`REHYDRATE_ALLOW_CATEGORIES`; neither can release a category outside the five.
+
+The response records the request and the outcome separately:
+`attestation.disclosure_requested` is what you asked for,
+`attestation.withheld` is what you still did not get. The stored OKF document
+keeps a masked body either way — the disclosure is for the one response, never
+for the audit trail.
+
+**Rehydration is verified.** Every release carries
+`attestation.rehydration: {substituted, withheld_remaining, verdict: "pass"}`.
+After the single rehydration the fleet checks deterministically that the
+surviving placeholders are exactly the withheld set, that every restored
+placeholder holds the vault's own value, and that no other identifier appeared.
+A violation is `500 rehydration_incomplete` and no answer is released.
 
 **Progress streaming.** Send `Accept: text/event-stream` and the same endpoint
 narrates the pipeline instead of waiting silently:
@@ -121,9 +152,37 @@ because there are no sessions.
 
 **Extension field.** The OpenAI schema has nowhere to put the privacy facts, so
 they travel in `x_privacy_gateway`: `request_id`, `trace_id`, `trust_tier`,
-`status`, `masked_prompt`, `withheld`. Stock clients ignore it; an aware client
-reads it. `id` is `chatcmpl-<request_id>`, so a caller holding only an
-OpenAI-shaped response can still fetch `/v1/requests/<id>` for the evidence.
+`status`, `masked_prompt`, `withheld`, and `disclosure_requested` when the
+request made one. Stock clients ignore it; an aware client reads it. `id` is
+`chatcmpl-<request_id>`, so a caller holding only an OpenAI-shaped response can
+still fetch `/v1/requests/<id>` for the evidence.
+
+**Request extension.** The same field carries the disclosure opt-in on the way
+in, since OpenAI has no place for it either:
+
+```json
+{
+  "model": "privacy-gateway",
+  "messages": [{ "role": "user", "content": "..." }],
+  "x_privacy_gateway": { "rehydrate_allow": ["CREDIT_CARD"] }
+}
+```
+
+Same rules as `/v1/ask`. The object is strict — a misspelled key inside it is a
+`400` rather than a silently ignored opt-in — while unknown _top-level_ sampling
+knobs are still stripped, so a stock SDK keeps working.
+
+**Text only, by design.** A message whose `content` is an array of parts is
+accepted only if every part is `{"type": "text"}`. Any other part kind
+(`image_url`, `input_audio`, …) is refused with `400` and
+`code: multimodal_unsupported`, naming the kinds it saw — never silently
+dropped. Redaction here is deterministic regex plus a text model, so PII inside
+an image or an audio clip (a face, a whiteboard, a screenshot of a card, a name
+read aloud) cannot be found, masked or verified. Accepting the part and dropping
+it would send a prompt you did not write; forwarding it would put unmaskable data
+across the boundary. In-boundary Gemma vision extraction is the planned way to
+support it. The Anthropic/Ollama shim refuses an `image` block the same way, and
+MCP `pgw_ask` takes a `string` with no shape an attachment could arrive in.
 
 **Refusals** come back as an OpenAI error object with the original status
 preserved (422 for a release the guard refused, 400 for reserved syntax, 504 for
@@ -144,6 +203,37 @@ mean releasing text before the verdict that decides whether it may be released a
 all. A refusal after the caller has rendered half an answer is not a refusal. The
 SSE framing exists so streaming clients work, not to make the answer arrive
 sooner — and a request that ends in a refusal never opens an SSE body.
+
+## 2a. Refusals, in full
+
+Every one of these releases nothing and stores no rejected text. The `error` code
+is the same on both `/v1/ask` and `/v1/chat/completions`; only the envelope
+differs.
+
+| code                        | HTTP | what it means                                                                       |
+| --------------------------- | ---- | ----------------------------------------------------------------------------------- |
+| `invalid_request`           | 400  | the body failed its schema — a stray `session_id`, or a bad `rehydrate_allow` entry |
+| `reserved_syntax`           | 400  | the request wrote the reserved `⟦…⟧` delimiters itself                              |
+| `multimodal_unsupported`    | 400  | a non-text content part; nothing was sent (see §2)                                  |
+| `outbound_guard_refused`    | 422  | raw PII survived masking; Core was never called                                     |
+| `vault_missing`             | 409  | no live token mapping for this request                                              |
+| `vault_expired`             | 410  | the mapping existed and aged out; retrying will not help                            |
+| `vault_generation_mismatch` | 409  | the mapping changed after the request was masked                                    |
+| `invented_token`            | 409  | Core used a placeholder it was never given                                          |
+| `leak_check_failed`         | 422  | the deterministic attester found a raw identifier in Core's answer                  |
+| `judge_flagged`             | 422  | the advisory Gemma judge flagged a possible leak (see below)                        |
+| `judge_unavailable`         | 422  | the judge returned no usable verdict; treated exactly like a flag                   |
+| `unresolved_token`          | 409  | the answer references a placeholder absent from the vault                           |
+| `rehydration_incomplete`    | 500  | the rehydration did not match the disclosure policy — **our** bug, hence 5xx        |
+| `extraction_unavailable`    | 502  | Gemma span extraction was unusable; the request was not forwarded                   |
+| `rate_limited`              | 429  | the per-IP demo rate limit                                                          |
+| `deadline_exceeded`         | 504  | the whole chain ran past its deadline                                               |
+
+`rehydration_incomplete` is the only 5xx refusal, and deliberately so: every other
+entry is the fleet declining something about the _request_, which the caller can
+act on. That one is the fleet catching a fault in its own rehydration — the caller
+did nothing wrong and changing the input would not help — so it reports as a server
+error while still withholding the body like any other refusal.
 
 ## 3. The MCP server
 

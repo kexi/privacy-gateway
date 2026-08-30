@@ -1,15 +1,7 @@
-:root {
-  --bg: #0f1115;
-  --surface: #171a21;
-  --surface-2: #1e222b;
-  --border: #2b313d;
-  --text: #e6e9ef;
-  --muted: #99a1b3;
-  --accent: #7aa2f7;
-  --pass: #7ee787;
-  --fail: #ff7b72;
-  --token: #f2cc60;
+/* The palette, shared with the audit view. See `tokens.css`. */
+@import './tokens.css';
 
+:root {
   /*
    * How a category hue is turned into a colour, per theme.
    *
@@ -87,6 +79,99 @@ textarea:focus-visible,
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/*
+ * A field group. The gap between a label and its own control is smaller than
+ * the gap between groups, so proximity does the grouping before any border does.
+ */
+.field {
+  margin-block-end: 1.25rem;
+}
+
+.hint {
+  margin: 0.4rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+/* --- the disclosure opt-in -------------------------------------------------- */
+
+.disclosure {
+  border: 1px solid color-mix(in srgb, var(--token) 35%, var(--border));
+  border-radius: 8px;
+  padding: 0.9rem 1rem 1rem;
+  margin: 0 0 1rem;
+  background: var(--surface);
+}
+
+.disclosure legend {
+  padding-inline: 0.4rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--token);
+}
+
+.disclosure .warning {
+  margin: 0 0 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--muted);
+  max-width: 68ch;
+}
+
+.disclosure .warning strong {
+  color: var(--token);
+}
+
+.disclosure-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+}
+
+.disclosure-check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  /* At least a 48px row without shifting the layout: the padding is absorbed by
+     the negative margin, so a coarse pointer gets a real target. */
+  padding-block: 0.6rem;
+  margin-block: -0.35rem;
+}
+
+.disclosure-check input[type='checkbox'] {
+  inline-size: 1.15rem;
+  block-size: 1.15rem;
+  accent-color: var(--token);
+  margin: 0;
+  cursor: pointer;
+}
+
+.disclosure-check label {
+  /* Overrides the block-level default so the box and its text sit on one line. */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.disclosure-check label code {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.disclosure-check input[type='checkbox']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* A checked box is a disclosure, so it is named in text as well as tinted. */
+.disclosure-check input[type='checkbox']:checked + label {
+  color: var(--token);
 }
 
 .actions {
@@ -587,8 +672,94 @@ summary {
   opacity: 0.65;
 }
 
+/*
+ * The step in flight.
+ *
+ * `position: relative` so the shimmer below can be laid over it, and
+ * `overflow: hidden` so the sweep is clipped to the row rather than running off
+ * the side of the list.
+ */
 .step.active {
   border-left-color: var(--accent);
+  position: relative;
+  overflow: hidden;
+}
+
+/*
+ * A slow sweep across the active row.
+ *
+ * Purely decorative: the mark, the label and the live seconds already say which
+ * step is running and for how long. It exists because a cold fleet's first stage
+ * takes about two minutes, and a checklist that renders once and then holds
+ * still for that long reads as a hung page. The element is omitted entirely
+ * under reduced motion (see `renderSteps`), so there is nothing to switch off
+ * here — but the rule below is kept as a second line of defence in case the
+ * element is ever rendered unconditionally.
+ */
+.step-shimmer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--accent) 12%, transparent) 50%,
+    transparent 100%
+  );
+  transform: translateX(-100%);
+  animation: step-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes step-sweep {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+/* The in-flight mark pulses gently, so the row moves even without the sweep. */
+.step.active .step-mark {
+  color: var(--accent);
+  animation: step-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes step-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* The live count is the one number that changes while waiting, so it leads. */
+.step.active .step-time {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Reduced motion: every animation off, nothing else changed.
+ *
+ * The mark, the label and the counting seconds carry the whole message, so what
+ * is lost here is decoration. `.static` is the class `renderSteps` adds when it
+ * has already withheld the shimmer element; both paths land on the same
+ * still image.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .step-shimmer {
+    animation: none;
+    display: none;
+  }
+
+  .step.active .step-mark {
+    animation: none;
+  }
+}
+
+.step.static .step-shimmer {
+  animation: none;
+  display: none;
+}
+
+.step.static .step-mark {
+  animation: none;
 }
 
 .step.done {
@@ -633,19 +804,9 @@ summary {
  * theme it is in.
  */
 
+/* The light palette itself is in `tokens.css`; these are the category ramps. */
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f7f8fa;
-    --surface: #ffffff;
-    --surface-2: #eef1f6;
-    --border: #d3d9e3;
-    --text: #14171d;
-    --muted: #5a6473;
-    --accent: #2a5bd7;
-    --pass: #1a7f37;
-    --fail: #c0392b;
-    --token: #8a6100;
-
     --cat-fill: 30%;
     --cat-fill-linked: 58%;
     --cat-text-l: 22%;

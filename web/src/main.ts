@@ -41,6 +41,7 @@ function el<T extends HTMLElement>(id: string): T {
   return node as T;
 }
 
+const composer = el<HTMLFormElement>('composer');
 const input = el<HTMLTextAreaElement>('input');
 const submit = el<HTMLButtonElement>('submit');
 const statusLine = el<HTMLParagraphElement>('status');
@@ -103,6 +104,20 @@ function isSettling(warmth: GemmaWarmth): boolean {
 }
 
 /**
+ * True once a warm-up has been dispatched and before the server admits it.
+ *
+ * `POST /v1/warmup` returns as soon as the wake is recorded, but `/v1/status`
+ * keeps reporting `cold` until the instance actually starts booting. Without
+ * this flag the very next poll overwrites "Starting the GPU… it is billed" with
+ * "The GPU is asleep" — telling the user the opposite of what just happened and
+ * dropping the cost warning at the exact moment billing begins.
+ *
+ * Cleared by the server, not by a timer: any status that is no longer `cold` is
+ * the server having caught up, whether that is `warming`, `warm` or `unknown`.
+ */
+let warmupDispatched = false;
+
+/**
  * Refresh the badge.
  *
  * `fleetStatus` never rejects, so there is no error path here: an unreachable
@@ -121,10 +136,16 @@ async function refreshStatus(): Promise<void> {
   // authority, so the two cannot disagree about whether pressing again is
   // useful. It is released as soon as the fleet is warm, or once the wake has
   // expired back to cold and pressing again is the right move.
-  setWarmupPending(status.gemma === 'warming');
+  // A dispatched wake outranks a `cold` reading, because the server has not yet
+  // caught up with a request it has already accepted. Anything other than `cold`
+  // is the server having caught up, so the flag is spent.
+  if (status.gemma !== 'cold') warmupDispatched = false;
+  const starting = status.gemma === 'warming' || warmupDispatched;
+
+  setWarmupPending(starting);
 
   const minutes = Math.round(coldStartSeconds / 60);
-  if (status.gemma === 'warming') {
+  if (starting) {
     gpuNote.textContent = `Starting up — up to about ${minutes} minutes until the first response. It is billed for as long as it stays running.`;
     gpuNote.hidden = false;
   } else if (status.gemma === 'cold') {
@@ -223,6 +244,7 @@ warmupButton.addEventListener('click', () => {
   // acknowledged even though the answer is a round trip away, which is the whole
   // complaint this state exists to fix.
   setWarmupPending(true);
+  warmupDispatched = true;
   gpuNote.textContent = 'Starting the GPU… it is billed for as long as it stays running.';
   gpuNote.hidden = false;
 
@@ -238,6 +260,8 @@ warmupButton.addEventListener('click', () => {
     .catch(() => {
       // Nothing was started, so the button must become pressable again; only
       // this path releases it, because a dispatched wake is still in flight.
+      // The flag goes with it: there is no wake for the server to catch up to.
+      warmupDispatched = false;
       setWarmupPending(false);
       gpuNote.textContent = 'The warm-up request was refused. Try again in a moment.';
       gpuNote.hidden = false;
@@ -283,6 +307,55 @@ interface Step {
 
 let steps: Step[] = [];
 
+/**
+ * When the current run started, so the in-flight step can show a live count.
+ *
+ * A cold fleet's first stage takes about two minutes. A checklist that renders
+ * once and then sits still for that long is indistinguishable from a hung page,
+ * so the active row counts up from here while it waits. `undefined` between
+ * runs, which is what stops the ticker.
+ */
+let runStartedAt: number | undefined;
+
+/** The ticker that repaints the in-flight row roughly ten times a second. */
+let tickTimer: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Whether the viewer asked for less motion.
+ *
+ * Read once per render rather than cached at load: a viewer can change the
+ * system setting while the page is open, and the next repaint should honour it.
+ * Everything the animation conveys is also carried by the mark and the live
+ * number, so the reduced-motion path loses decoration and no information.
+ */
+function prefersReducedMotion(): boolean {
+  return globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+}
+
+function stopTicking(): void {
+  if (tickTimer !== undefined) clearInterval(tickTimer);
+  tickTimer = undefined;
+}
+
+/**
+ * Repaint the in-flight row on a timer.
+ *
+ * 100ms so the tenths digit actually moves; the row is a handful of elements, so
+ * this is far cheaper than the request it is describing. It stops as soon as
+ * nothing is active, so an idle page holds no timer.
+ */
+function startTicking(): void {
+  if (tickTimer !== undefined) return;
+  tickTimer = setInterval(() => {
+    const hasActive = steps.some((step) => step.state === 'active');
+    if (!hasActive) {
+      stopTicking();
+      return;
+    }
+    renderSteps();
+  }, 100);
+}
+
 /** Lay out the checklist for a new request. */
 function resetSteps(includeWakeup: boolean): void {
   const stages = includeWakeup
@@ -296,15 +369,37 @@ function resetSteps(includeWakeup: boolean): void {
   const first = steps[0];
   if (first !== undefined) first.state = 'active';
 
+  runStartedAt = Date.now();
   progressPane.hidden = false;
+  renderSteps();
+  startTicking();
+}
+
+/** Stop the live count once the run is over, however it ended. */
+function finishSteps(): void {
+  stopTicking();
+  runStartedAt = undefined;
   renderSteps();
 }
 
 function renderSteps(): void {
+  const reduced = prefersReducedMotion();
+  const elapsedMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
+  // Where the in-flight step began, so its live count is its own duration rather
+  // than the whole run's.
+  const lastEnd = steps.reduce((latest, step) => Math.max(latest, step.endedAtMs ?? 0), 0);
+
   stepsList.innerHTML = steps
     .map((step) => {
+      // A finished step shows what it took; the one in flight counts up. Both
+      // are the same field, so the number never jumps position as it settles.
+      const liveMs = Math.max(0, elapsedMs - lastEnd);
       const seconds =
-        step.durationMs === undefined ? '' : `${(step.durationMs / 1000).toFixed(1)}s`;
+        step.durationMs !== undefined
+          ? `${(step.durationMs / 1000).toFixed(1)}s`
+          : step.state === 'active' && runStartedAt !== undefined
+            ? `${(liveMs / 1000).toFixed(1)}s`
+            : '';
       const mark =
         step.state === 'done'
           ? '✓'
@@ -313,10 +408,18 @@ function renderSteps(): void {
             : step.state === 'active'
               ? '…'
               : '';
-      return `<li class="step ${step.state}" data-stage="${escapeHtml(step.stage)}">
+      // The shimmer is decoration only, and it is omitted outright under reduced
+      // motion rather than being animated at zero duration: a moving gradient is
+      // exactly the kind of thing the setting exists to switch off.
+      const shimmer =
+        step.state === 'active' && !reduced
+          ? '<span class="step-shimmer" aria-hidden="true"></span>'
+          : '';
+      return `<li class="step ${step.state}${reduced ? ' static' : ''}" data-stage="${escapeHtml(step.stage)}">
         <span class="step-mark">${mark}</span>
         <span class="step-label">${escapeHtml(STEP_LABELS[step.stage])}</span>
         <span class="step-time">${escapeHtml(seconds)}</span>
+        ${shimmer}
       </li>`;
     })
     .join('');
@@ -363,7 +466,7 @@ function applyProgress(stage: ProgressStage, state: 'start' | 'end', elapsedMs: 
 function markStopped(): void {
   const active = steps.find((step) => step.state === 'active');
   if (active !== undefined) active.state = 'stopped';
-  renderSteps();
+  finishSteps();
 }
 
 /**
@@ -645,12 +748,32 @@ function setBusy(busy: boolean, message = ''): void {
   statusLine.className = busy ? 'status busy' : 'status';
 }
 
-submit.addEventListener('click', () => {
+/**
+ * Which high-risk categories the user allowed for this request.
+ *
+ * Read from the DOM at submit time rather than kept in a variable, so the boxes
+ * on screen are the single source of truth: a state mirror is one more place the
+ * "did I actually allow this?" answer could be wrong, and this is the one
+ * question in the UI where being wrong discloses a secret.
+ */
+function selectedDisclosures(): string[] {
+  return [
+    ...composer.querySelectorAll<HTMLInputElement>('input[name="rehydrate_allow"]:checked'),
+  ].map((box) => box.value);
+}
+
+composer.addEventListener('submit', (event) => {
+  // The request is streamed over fetch; letting the form navigate would replace
+  // the page that is about to render the answer.
+  event.preventDefault();
+
   const text = input.value.trim();
   if (!text) {
     setBusy(false, 'Enter a request first.');
     return;
   }
+
+  const rehydrateAllow = selectedDisclosures();
 
   // A cold fleet means the first Gemma call waits on a container start, so the
   // wait is named up front rather than left to look like a hang. `unknown` is
@@ -668,19 +791,24 @@ submit.addEventListener('click', () => {
   // the masking stage reports that Gemma answered, so it is closed from there.
   let wakeupOpen = mayNeedWakeup;
 
-  askStreaming(text, (event) => {
-    if (wakeupOpen && event.stage === 'masking') {
-      applyProgress('gpu_wakeup', 'end', event.elapsed_ms);
-      wakeupOpen = false;
-      setBusy(true, 'Masking, reasoning on the frontier model, verifying…');
-    }
-    applyProgress(event.stage, event.state, event.elapsed_ms);
-  })
+  askStreaming(
+    text,
+    (progressEvent) => {
+      if (wakeupOpen && progressEvent.stage === 'masking') {
+        applyProgress('gpu_wakeup', 'end', progressEvent.elapsed_ms);
+        wakeupOpen = false;
+        setBusy(true, 'Masking, reasoning on the frontier model, verifying…');
+      }
+      applyProgress(progressEvent.stage, progressEvent.state, progressEvent.elapsed_ms);
+    },
+    rehydrateAllow,
+  )
     .then((response) => {
       // The text as it was submitted, not as the textarea reads now: a user who
       // edits the box while the request is in flight must not shift the
       // alignment underneath the answer they get back.
       render(response, text);
+      finishSteps();
       setBusy(false, '');
       // The request just proved Gemma is up, so the badge is refreshed rather
       // than left showing the state from before the run.

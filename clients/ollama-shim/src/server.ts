@@ -22,6 +22,7 @@ import {
   anthropicErrorType,
   anthropicModelList,
   flattenMessagesRequest,
+  nonTextBlockTypes,
   messagesSseEvents,
   MessagesRequestSchema,
   resultToText,
@@ -214,6 +215,24 @@ async function handleMessages(
 
   if (!parsed.success) {
     json(res, 400, toAnthropicError('messages is required', 'invalid_request_error'));
+    return;
+  }
+
+  // Checked before flattening, so an attachment is refused rather than quietly
+  // discarded by a flattener that only knows how to read text.
+  const nonText = nonTextBlockTypes(parsed.data);
+  if (nonText.length > 0) {
+    json(
+      res,
+      400,
+      toAnthropicError(
+        `this gateway is text-only; the request carried non-text content block(s) ` +
+          `(${nonText.join(', ')}) and nothing was sent. Redaction is deterministic regex plus ` +
+          `a text model, so PII inside an image or an audio clip cannot be found, masked or ` +
+          `verified. Send the content as text.`,
+        'invalid_request_error',
+      ),
+    );
     return;
   }
 

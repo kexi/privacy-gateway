@@ -99,11 +99,22 @@ async function toApiError(response: Response): Promise<ApiError> {
  * There is no session parameter: the gateway mints one id per request and
  * rejects a body that carries `session_id` at all.
  */
-export function ask(text: string): Promise<AskResponse> {
+export function ask(text: string, rehydrateAllow: readonly string[] = []): Promise<AskResponse> {
   return request('/v1/ask', (value) => AskResponseSchema.parse(value), {
     method: 'POST',
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(askBody(text, rehydrateAllow)),
   });
+}
+
+/**
+ * The request body, with the opt-in present only when there is one.
+ *
+ * An empty `rehydrate_allow: []` is semantically identical to omitting it, but
+ * sending it makes every request look like a disclosure request in a log or a
+ * proxy trace. The absent field is the honest encoding of "asked for nothing".
+ */
+function askBody(text: string, rehydrateAllow: readonly string[]): Record<string, unknown> {
+  return rehydrateAllow.length > 0 ? { text, rehydrate_allow: [...rehydrateAllow] } : { text };
 }
 
 /**
@@ -153,11 +164,13 @@ export async function warmup(): Promise<void> {
 export async function askStreaming(
   text: string,
   onProgress: (event: ProgressEvent) => void,
+  /** High-risk categories the user allowed for this request only. */
+  rehydrateAllow: readonly string[] = [],
 ): Promise<AskResponse> {
   const response = await fetch('/v1/ask', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(askBody(text, rehydrateAllow)),
   });
 
   if (!response.ok) throw await toApiError(response);

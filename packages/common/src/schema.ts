@@ -56,6 +56,62 @@ export function isPiiCategory(value: unknown): value is PiiCategory {
 }
 
 /**
+ * The categories the disclosure policy withholds from a released answer by
+ * default (`docs/ARCHITECTURE.md` §9).
+ *
+ * Duplicated from `DEFAULT_WITHHELD_CATEGORIES` in `tokenizer.ts` rather than
+ * imported: this module imports nothing from the vault side so the Core Agent
+ * can consume `@privacy-gateway/common/schema` without gaining a path to the
+ * mapping, and the tokenizer reaches that side. A test in
+ * `packages/common/test/schema.test.ts` asserts the two lists stay identical.
+ */
+export const HIGH_RISK_CATEGORIES = [
+  'API_KEY',
+  'AWS_KEY',
+  'JWT',
+  'CREDIT_CARD',
+  'MY_NUMBER',
+] as const;
+
+export const HighRiskCategorySchema = z.enum(HIGH_RISK_CATEGORIES);
+export type HighRiskCategory = z.infer<typeof HighRiskCategorySchema>;
+
+/** True when `value` names a category the disclosure policy withholds by default. */
+export function isHighRiskCategoryName(value: unknown): value is HighRiskCategory {
+  return typeof value === 'string' && (HIGH_RISK_CATEGORIES as readonly string[]).includes(value);
+}
+
+/**
+ * Narrow an already-validated allow list back to its closed type.
+ *
+ * Needed where the list has travelled through a `readonly string[]` — the shape
+ * the pipeline options use, so the disclosure policy stays one plain list of
+ * strings — and is about to be written into a record whose schema is the closed
+ * enum. The values were validated at the boundary; this only recovers the type.
+ */
+export function filterHighRiskCategories(values: readonly unknown[]): HighRiskCategory[] {
+  return values.filter(isHighRiskCategoryName);
+}
+
+/**
+ * A per-request disclosure opt-in: `{rehydrate_allow: [...]}`.
+ *
+ * Closed to the high-risk set on purpose, and validated rather than filtered. A
+ * caller who names `EMAIL` is describing a category nothing withholds, so
+ * accepting it would report success for an opt-in that changed nothing; a caller
+ * who names `SUPERUSER` is either confused or probing. Both are a 400 — the
+ * whole point of an explicit opt-in is that the requester knows what they asked
+ * for.
+ *
+ * The list is deduplicated so `["JWT","JWT"]` is not a different request from
+ * `["JWT"]`, and capped at the size of the set it draws from.
+ */
+export const RehydrateAllowSchema = z
+  .array(HighRiskCategorySchema)
+  .max(HIGH_RISK_CATEGORIES.length)
+  .transform((values) => [...new Set(values)]);
+
+/**
  * Keep only recognised categories, reporting how many were discarded.
  *
  * The count is kept because silently shortening a list would hide a judge that
@@ -87,6 +143,28 @@ export const Sha256HexSchema = z
   .string()
   .regex(/^[0-9a-f]{64}$/u, 'must be 64 lowercase hex characters');
 
+/**
+ * What the single rehydration actually did, verified afterwards.
+ *
+ * Recorded rather than assumed. Rehydration is the one step that turns
+ * placeholders back into real values, so "it substituted what it was supposed to
+ * and nothing else" is the property most worth stating in the audit record — and
+ * the pipeline refuses the release outright when the check that produces this
+ * block does not come back `pass`. A released answer therefore never carries any
+ * other verdict; the field is an enum rather than a boolean so a future
+ * outcome that is neither can be added without a released `false`.
+ */
+export const RehydrationReportSchema = z
+  .object({
+    /** How many distinct placeholders were replaced with their vault value. */
+    substituted: z.number().int().min(0),
+    /** Placeholders left masked on purpose, as token names, sorted. */
+    withheld_remaining: z.array(z.string()),
+    verdict: z.literal('pass'),
+  })
+  .passthrough();
+export type RehydrationReport = z.infer<typeof RehydrationReportSchema>;
+
 /** Verdict from the deterministic attester (`knowledge/references/attesters/leak_check.ts`). */
 export const AttestationSchema = z
   .object({
@@ -104,6 +182,19 @@ export const AttestationSchema = z
     unresolved_tokens: z.array(z.string()).optional(),
     /** Categories left masked on purpose by the disclosure policy. */
     withheld: z.array(PiiCategorySchema).optional(),
+    /**
+     * The categories this request asked to have restored.
+     *
+     * Kept beside `withheld` rather than folded into it because they answer
+     * different questions: `withheld` is what the reader did not get, this is
+     * what the requester asked for. A record showing `disclosure_requested:
+     * [CREDIT_CARD]` with `withheld: []` is the audit trail of a deliberate
+     * disclosure; one showing the request with the category still in `withheld`
+     * means the answer never mentioned it.
+     */
+    disclosure_requested: z.array(HighRiskCategorySchema).optional(),
+    /** Present on a release; the post-rehydration completeness verdict. */
+    rehydration: RehydrationReportSchema.optional(),
     /**
      * How many category-enrichment attempts the advisory judge made on a
      * refusal — not verdict re-rolls. The judge's first `leak: true` is
@@ -136,6 +227,9 @@ export const AttestationBlockSchema = z
     request_id: z.string(),
     trace_id: z.string().optional(),
     withheld: z.array(PiiCategorySchema).optional(),
+    /** What this request asked to have restored, recorded next to what it did not get. */
+    disclosure_requested: z.array(HighRiskCategorySchema).optional(),
+    rehydration: RehydrationReportSchema.optional(),
   })
   .passthrough();
 export type AttestationBlock = z.infer<typeof AttestationBlockSchema>;
@@ -220,6 +314,14 @@ export type GatewayAnswerFrontmatter = z.infer<typeof GatewayAnswerFrontmatterSc
 export const AskRequestSchema = z
   .object({
     text: z.string().min(1, 'text must not be empty'),
+    /**
+     * Restore these high-risk categories in this response, this once.
+     *
+     * Scoped to the values *this* request submitted, because that is all the
+     * vault key names. Absent means the deployment's default policy applies
+     * unchanged, which is what every existing caller gets.
+     */
+    rehydrate_allow: RehydrateAllowSchema.optional(),
   })
   .strict();
 export type AskRequest = z.infer<typeof AskRequestSchema>;
@@ -368,17 +470,52 @@ export type ProgressEvent = z.infer<typeof ProgressEventSchema>;
 export const OPENAI_MODEL_ID = 'privacy-gateway';
 
 /**
+ * One part of an OpenAI multimodal `content` array.
+ *
+ * Only `type: 'text'` is representable. Every other part kind — `image_url`,
+ * `input_audio`, `file`, whatever OpenAI adds next — is carried by
+ * `OpenAiNonTextPartSchema` below so the endpoint can name what it refused
+ * instead of failing with a shape error that reads like a typo.
+ */
+export const OpenAiTextPartSchema = z
+  .object({
+    type: z.literal('text'),
+    text: z.string(),
+  })
+  .strip();
+
+/** Any content part that is not text; matched only to produce a precise refusal. */
+export const OpenAiNonTextPartSchema = z
+  .object({
+    type: z.string(),
+  })
+  .passthrough();
+
+/**
  * One message of an OpenAI `chat/completions` body.
  *
- * `content` is required and must be a string: the multimodal array form carries
- * image parts this fleet cannot mask, and accepting it would mean silently
- * dropping content the caller believed was sent. Refusing it is the fail-closed
- * reading.
+ * `content` is a string or an array of **text** parts. The multimodal array form
+ * is accepted as a shape and then refused by name at the endpoint (see
+ * `nonTextPartTypes` in `agents/gateway/src/openai_compat.ts`), which is the
+ * whole point: this fleet masks text with regexes and a text model, and it has
+ * no way to redact a face, a whiteboard, a screenshot of a credit card, or a
+ * name spoken in an audio clip. Accepting an image and quietly dropping it would
+ * send a prompt the caller never wrote; accepting it and forwarding it would put
+ * unmaskable PII across the boundary. Refusing is the only fail-closed reading,
+ * and it has to be explicit enough that a caller knows their image never went.
+ *
+ * `assistant` messages may carry `content: null` in a stock transcript (a
+ * tool-call turn); they are dropped by the flattener regardless, so a null is
+ * tolerated here rather than rejected as malformed.
  */
 export const OpenAiChatMessageSchema = z
   .object({
     role: z.enum(['system', 'user', 'assistant']),
-    content: z.string(),
+    content: z.union([
+      z.string(),
+      z.array(z.union([OpenAiTextPartSchema, OpenAiNonTextPartSchema])),
+      z.null(),
+    ]),
     name: z.string().optional(),
   })
   .strip();
@@ -402,6 +539,19 @@ export const OpenAiChatCompletionRequestSchema = z
     model: z.string().min(1),
     messages: z.array(OpenAiChatMessageSchema).min(1, 'messages must not be empty'),
     stream: z.boolean().optional(),
+    /**
+     * The same namespaced extension the response carries, on the way in.
+     *
+     * The disclosure opt-in has no OpenAI field to live in, and inventing a
+     * top-level `rehydrate_allow` would collide with whatever OpenAI ships under
+     * that name later. `strict()` inside so a misspelled key here is a 400
+     * rather than a silently ignored opt-in — the one failure mode an explicit
+     * disclosure request must not have.
+     */
+    x_privacy_gateway: z
+      .object({ rehydrate_allow: RehydrateAllowSchema.optional() })
+      .strict()
+      .optional(),
   })
   .strip();
 export type OpenAiChatCompletionRequest = z.infer<typeof OpenAiChatCompletionRequestSchema>;
@@ -422,6 +572,14 @@ export const OpenAiPrivacyExtensionSchema = z.object({
   status: AnswerStatusSchema,
   masked_prompt: z.string(),
   withheld: z.array(PiiCategorySchema),
+  /**
+   * Echoed so a caller can see the opt-in was understood.
+   *
+   * Omitted when the request made none, so a stock client's response shape is
+   * unchanged and only a caller who asked for something learns what happened
+   * to the request.
+   */
+  disclosure_requested: z.array(HighRiskCategorySchema).optional(),
 });
 export type OpenAiPrivacyExtension = z.infer<typeof OpenAiPrivacyExtensionSchema>;
 
@@ -497,6 +655,17 @@ export const SynthesizeRequestSchema = z.object({
   known_tokens: z.array(z.string()),
   /** The vault generation the gateway wrote; rehydration refuses any other. */
   vault_generation: z.number().int().positive(),
+  /**
+   * The categories this request asked to have restored.
+   *
+   * Forwarded from `/v1/ask` rather than re-read from an environment variable
+   * here: the opt-in is a property of one request, and Synthesis is the process
+   * that applies the disclosure policy, so the two have to travel together. It
+   * is validated again on arrival because this is its own boundary — a hop that
+   * trusted the caller to have validated would let an internal misroute widen
+   * the policy.
+   */
+  rehydrate_allow: RehydrateAllowSchema.optional(),
 });
 export type SynthesizeRequest = z.infer<typeof SynthesizeRequestSchema>;
 

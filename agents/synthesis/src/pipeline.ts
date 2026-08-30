@@ -33,6 +33,7 @@ import {
   computationSha256,
   currentTraceId,
   dump,
+  filterHighRiskCategories,
   filterPiiCategories,
   getTracer,
   findTokens,
@@ -100,7 +101,8 @@ export type RefusalKind =
   | 'invented_token'
   | 'leak_check_failed'
   | 'judge_flagged'
-  | 'judge_unavailable';
+  | 'judge_unavailable'
+  | 'rehydration_incomplete';
 
 const REFUSAL_STATUS: Readonly<Record<RefusalKind, number>> = {
   // A mapping that is simply not there is a conflict with the caller's premise.
@@ -114,6 +116,13 @@ const REFUSAL_STATUS: Readonly<Record<RefusalKind, number>> = {
   leak_check_failed: 422,
   judge_flagged: 422,
   judge_unavailable: 422,
+  // 5xx alone in this table, and deliberately: every other refusal here is the
+  // fleet declining something about the *request*, which a caller can act on. A
+  // rehydration that did not do exactly what the policy said is a fault in our
+  // own code — the caller did nothing wrong and changing their input would not
+  // help — so it is reported as a server error. The body is still withheld, on
+  // the same reasoning as every other refusal.
+  rehydration_incomplete: 500,
 };
 
 /**
@@ -225,6 +234,14 @@ export interface SynthesizeOptions {
   /** Categories the disclosure policy withholds; defaults to the env policy. */
   readonly withhold?: readonly string[] | undefined;
   /**
+   * Categories this request asked to have restored.
+   *
+   * Unioned with the operator's `REHYDRATE_ALLOW_CATEGORIES` to produce the
+   * effective withhold set. Ignored when `withhold` is given outright, which is
+   * the test seam that names the final set directly.
+   */
+  readonly rehydrateAllow?: readonly string[] | undefined;
+  /**
    * The rehydration step, injectable.
    *
    * Exists so a test can observe *whether* it was reached, which is the whole
@@ -325,6 +342,15 @@ function assembleWithin(
       coreResponseSha256: responseHash(coreAnswer),
       checkedAt,
       withheld: withheldCategoriesList,
+      // Lifted out of the runtime attestation rather than passed separately:
+      // these two are the record of what the caller asked for and what the
+      // rehydration did, and they belong in the replayable block for the same
+      // reason `withheld` does — a reader must be able to see that a value was
+      // restored on purpose, not by accident.
+      ...(attestation.disclosure_requested !== undefined
+        ? { disclosureRequested: attestation.disclosure_requested }
+        : {}),
+      ...(attestation.rehydration !== undefined ? { rehydration: attestation.rehydration } : {}),
     },
     ...(inputs.traceId !== undefined ? { traceId: inputs.traceId } : {}),
   });
@@ -391,6 +417,113 @@ export function unresolvableTokens(
 }
 
 /**
+ * What went wrong after the single rehydration, if anything.
+ *
+ * A string rather than a code: the caller turns it into a fixed public message
+ * and logs a fixed `refusal` enum, so this text reaches nothing outside the
+ * throw site. Keeping it descriptive is what makes the refusal debuggable from
+ * a stack trace without putting either the answer or a mapping value in a log.
+ */
+export type RehydrationDefect =
+  | { readonly kind: 'leftover_token'; readonly tokens: readonly string[] }
+  | { readonly kind: 'missing_withheld'; readonly tokens: readonly string[] }
+  | { readonly kind: 'substitution_mismatch'; readonly tokens: readonly string[] }
+  | { readonly kind: 'unrestored_pii'; readonly categories: readonly PiiCategory[] };
+
+/**
+ * Prove the rehydration did exactly what the policy said, and nothing else.
+ *
+ * Three independent properties, all decided deterministically over strings the
+ * function already holds — no model, no second vault read, no I/O:
+ *
+ * (a) **Exactly the withheld tokens survive.** The set of `⟦…⟧` still present in
+ *     the released text must equal the set the policy decided to withhold. A
+ *     leftover the policy did not ask for is a substitution that silently failed
+ *     — the user would see a raw placeholder where a value was promised. A
+ *     *missing* withheld token is worse: the only way a token the policy said to
+ *     keep can vanish is that something replaced it, which is a disclosure the
+ *     policy forbade.
+ *
+ * (b) **Every restored value is the vault's own.** Each placeholder the policy
+ *     restored must appear in the output as the exact string the mapping holds.
+ *     This is what a forged or corrupted substitution fails: a rehydrator that
+ *     wrote some other value would still produce a placeholder-free string that
+ *     passes (a).
+ *
+ * (c) **Nothing else that looks like PII appeared.** The deterministic attester
+ *     is re-run over the released text with the intentionally restored values
+ *     removed. Whatever it finds after that subtraction was not something this
+ *     request restored on purpose — it is text that materialized during
+ *     rehydration, which is precisely the failure mode nothing else here would
+ *     catch.
+ *
+ * Why (c) subtracts the restored values rather than skipping the scan: the whole
+ * point of a successful rehydration is that real identifiers are now in the
+ * string, so scanning it raw would flag every release. Subtracting exactly what
+ * was restored on purpose leaves the residue, and the residue must be empty.
+ *
+ * Why deterministic and post-hoc rather than trusting `rehydrateWithPolicy`:
+ * that function is the thing being checked. A verification that shares its
+ * implementation only proves the implementation agrees with itself, which is the
+ * same reason `pgw_verify` transcribes the scanner instead of importing it.
+ *
+ * @returns the defect, or `null` when all three properties hold.
+ */
+export function verifyRehydration(input: {
+  readonly released: string;
+  readonly restored: readonly string[];
+  readonly withheldTokens: readonly string[];
+  readonly mapping: Readonly<Record<string, string>>;
+}): RehydrationDefect | null {
+  const { released, restored, withheldTokens, mapping } = input;
+
+  // (a) The leftover set must equal the withheld set, in both directions.
+  const leftover = new Set(findTokens(released));
+  const expected = new Set(withheldTokens);
+
+  const unexpected = [...leftover].filter((token) => !expected.has(token)).sort();
+  if (unexpected.length > 0) return { kind: 'leftover_token', tokens: unexpected };
+
+  const vanished = [...expected].filter((token) => !leftover.has(token)).sort();
+  if (vanished.length > 0) return { kind: 'missing_withheld', tokens: vanished };
+
+  // (b) Each restored placeholder's value must be literally present.
+  const forged = restored
+    .filter((token) => {
+      const value = mapping[token];
+      // A placeholder with no mapping value should have been refused as
+      // `unresolved_token` long before this point; treating it as a mismatch
+      // here keeps the invariant total rather than assuming the earlier gate.
+      if (value === undefined) return true;
+      // The empty string is vacuously present and would make this check
+      // unfalsifiable, so it is accepted rather than searched for.
+      return value !== '' && !released.includes(value);
+    })
+    .sort();
+  if (forged.length > 0) return { kind: 'substitution_mismatch', tokens: forged };
+
+  // (c) The attester's residue after removing what was restored on purpose.
+  let residue = released;
+  // Longest first: a short value that is a substring of a longer one must not
+  // punch a hole through the middle of it and leave a fragment the scan then
+  // reads as something else.
+  const restoredValues = restored
+    .map((token) => mapping[token])
+    .filter((value): value is string => value !== undefined && value !== '')
+    .sort((a, b) => b.length - a.length);
+  for (const value of restoredValues) {
+    // A space, not the empty string, so two adjacent values cannot be welded
+    // into one spurious identifier by their own removal.
+    residue = residue.split(value).join(' ');
+  }
+
+  const planted = filterPiiCategories(scanForLeaks(residue)).categories;
+  if (planted.length > 0) return { kind: 'unrestored_pii', categories: planted };
+
+  return null;
+}
+
+/**
  * Verify Core's output and, only if every gate passes, release it.
  *
  * The order is fixed and load-bearing: vault -> consistency -> deterministic
@@ -440,7 +573,15 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   const staleAfter = entry.expiresAt;
 
   const traceId = currentTraceId();
-  const withhold = new Set(options.withhold ?? withheldCategories());
+  // The effective policy: the default-withheld set minus the operator allowance
+  // minus this request's own. `withhold`, when given, names the final set and
+  // skips the derivation entirely — it is how a test states the outcome it means
+  // rather than reconstructing it from two inputs.
+  const requestAllow = options.rehydrateAllow ?? [];
+  const withhold = new Set(
+    options.withhold ?? withheldCategories(process.env['REHYDRATE_ALLOW_CATEGORIES'], requestAllow),
+  );
+  const disclosureRequested = filterHighRiskCategories(requestAllow);
 
   const inputs: EvidenceInputs = {
     requestId,
@@ -667,6 +808,63 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   if (resolvability.withheldCategories.length > 0) {
     attestation.withheld = [...resolvability.withheldCategories];
   }
+  if (disclosureRequested.length > 0) {
+    attestation.disclosure_requested = [...disclosureRequested];
+  }
+
+  // --- gate 6: the rehydration is checked against what it was told to do. --
+  //
+  // Last, because it is the only gate whose subject is a string containing real
+  // values, and after it there is nothing left to decide. A defect here is our
+  // bug rather than the caller's, so it is a 500 — but the body is withheld
+  // exactly as every other refusal withholds it, because a rehydration that went
+  // wrong is precisely the text least safe to release.
+  const withheldTokens = findTokens(coreAnswer).filter((token) => {
+    const category = categoryOf(token);
+    return category !== null && withhold.has(category);
+  });
+  const restoredTokens = findTokens(coreAnswer).filter(
+    (token) => !withheldTokens.includes(token) && mapping[token] !== undefined,
+  );
+
+  const defect = verifyRehydration({
+    released: released.text,
+    restored: restoredTokens,
+    withheldTokens,
+    mapping,
+  });
+  if (defect !== null) {
+    attestation.ok = false;
+    attestation.reason ??= 'the rehydration did not match the disclosure policy';
+    logger?.event(
+      'release.refused',
+      {
+        refusal: 'rehydration_incomplete',
+        error_code: defect.kind,
+        // Token *names* and closed-enum categories only, exactly as every other
+        // refusal reports: never a value, never the released text.
+        ...('tokens' in defect ? { unresolved_tokens: [...defect.tokens] } : {}),
+        ...('categories' in defect ? { categories: [...defect.categories] } : {}),
+      },
+      'ERROR',
+    );
+    refuse(
+      'rehydration_incomplete',
+      'the rehydrated answer failed its completeness check, so nothing was released',
+      attestation,
+      consistency,
+      verdictFindings,
+      'categories' in defect ? defect.categories : [],
+    );
+  }
+
+  // Recorded only now that the check has passed: the block asserts a verdict,
+  // and writing it before the verification would make it an assumption.
+  attestation.rehydration = {
+    substituted: restoredTokens.length,
+    withheld_remaining: [...released.withheld],
+    verdict: 'pass',
+  };
 
   const result = assemble(
     inputs,

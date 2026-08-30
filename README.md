@@ -211,6 +211,39 @@ widens the blast radius of a logged or screenshotted response. The `REHYDRATE_AL
 env var (comma-separated) re-enables specific categories, e.g.
 `REHYDRATE_ALLOW_CATEGORIES=CREDIT_CARD,MY_NUMBER`; left unset, all five stay withheld.
 
+**Per-request opt-in.** A caller can also allow specific ones back for a single request:
+`POST /v1/ask` takes an optional `rehydrate_allow: ["CREDIT_CARD"]`, and the
+OpenAI-compatible endpoint takes the same list under
+`x_privacy_gateway: {rehydrate_allow}`. The demo UI exposes it as a checkbox group,
+default all off. The list must be a subset of those five — naming a category that is
+never withheld, such as `EMAIL`, is a `400`, because an opt-in that quietly did nothing
+is the one failure mode this must not have. It is unioned with
+`REHYDRATE_ALLOW_CATEGORIES`, and covers only values submitted **in that same request**:
+one request, one vault key, no session for the permission to persist into. The record
+keeps the two apart — `attestation.disclosure_requested` is what was asked for,
+`attestation.withheld` is what was still not given — and the stored OKF body stays masked
+either way.
+
+**Rehydration is verified.** After the single rehydration, Synthesis checks
+deterministically that the surviving placeholders are exactly the withheld set, that
+every restored placeholder holds the vault's own value, and that no other identifier
+appeared (the attester re-run over the released text minus the values restored on
+purpose). A violation is `500 rehydration_incomplete` — the only 5xx refusal, because it
+is our bug rather than the caller's — and the body is withheld like any other refusal.
+Releases carry `attestation.rehydration: {substituted, withheld_remaining, verdict}`.
+
+## Text only, by design
+
+Every surface is text-only. A non-text content part is refused by name, never dropped:
+`/v1/chat/completions` answers `400 multimodal_unsupported` listing the kinds it saw
+(`image_url`, `input_audio`, …), the Anthropic/Ollama shim refuses an `image` block the
+same way, and MCP `pgw_ask` takes a `string` with no shape an attachment could arrive in.
+Redaction here is deterministic regex plus a text model, so PII inside an image or an
+audio clip — a face, a whiteboard, a screenshot of a card, a name read aloud — cannot be
+found, masked or verified by any gate in this fleet. Accepting the part and dropping it
+would send a prompt the caller did not write; forwarding it would put unmaskable data
+across the boundary. In-boundary Gemma vision extraction is the planned way to support it.
+
 ## Open Knowledge Format (OKF v0.2)
 
 Every answer the fleet produces is agent-written content, so provenance and trust are
@@ -308,7 +341,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-545 vitest tests across 31 files. The root `vitest.config.ts` uses `test.projects`, so
+801 vitest tests across 43 files. The root `vitest.config.ts` uses `test.projects`, so
 `just test` runs everything from the repository root while each package keeps its own `test`
 script for `pnpm --filter X test`. `just test-coverage` uses `@vitest/coverage-v8` and
 enforces per-package floors: `packages/common` at 90% lines (it holds the masking, vault and
@@ -325,12 +358,93 @@ just web-e2e        # Playwright, chromium only
 just setup-browsers # once, outside Nix
 ```
 
-23 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
+50 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
 A2A) and Gemma (over the OpenAI-compatible API) mocked, so what the browser exercises is the
 production request path rather than a stubbed API. Chromium only: these assert application
 behaviour, not rendering differences, and a second engine would double the runtime for no
 extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outside Nix run
 `just setup-browsers` (`pnpm -C web exec playwright install chromium`) once.
+
+### Reproducible testing
+
+Every claim in this README is meant to be re-checkable by someone who did not write it.
+This section is the shortest path from a clean checkout to having verified them yourself.
+
+**1. Everything, offline, from a clean checkout.** No cloud account and no API key:
+
+```bash
+direnv allow                # or: nix develop
+just setup                  # pnpm install
+just check                  # fmt, recipe docs, lint, tf-validate, typecheck, pinact, gitleaks, tests
+just web-e2e                # 50 Playwright specs (needs `just setup-browsers` outside Nix)
+```
+
+`just check` is exactly what CI runs — same recipe, same order — so a green local run and a
+green CI run mean the same thing. Expect **801 vitest tests across 43 files** and **50
+Playwright specs**. If those counts have drifted from what you see, trust the numbers your
+run prints and treat this line as stale.
+
+Two caveats worth knowing before you conclude something is broken:
+
+- `agents/synthesis/test/dist_attestation.test.ts` builds the package and boots the built
+  output to prove the attestation digests are real in a production image rather than the
+  `unavailable` placeholder a packaging bug once produced. It is the slowest test and the
+  only timing-sensitive one; under heavy parallel load it can occasionally time out. Re-run
+  before investigating.
+- The suite pins **behaviour, not wording**. Tests assert refusal kinds and status codes, so
+  they survive prose changes and fail on semantic ones.
+
+**2. The privacy guarantees specifically.** The interesting tests are the ones that would
+fail if masking, the vault boundary or a fail-closed gate regressed:
+
+```bash
+pnpm --filter @privacy-gateway/common test      # masking, vault, OKF, logging allowlist
+pnpm --filter @privacy-gateway/synthesis test   # the five release gates, the judge asymmetry
+pnpm --filter @privacy-gateway/core test        # the boundary: Core never sees a real value
+```
+
+`agents/synthesis/test/pipeline.test.ts` is the file to read first. Each gate has a test
+that names what it guarantees, including that a judge flag can never be retried into a
+release and that no refusal path rehydrates.
+
+**3. Verify one answer's attestation without trusting the fleet.** The gateway's own claim
+about a request is checkable against the artifacts it serves, using code that is not the
+fleet's:
+
+```bash
+just verify-answer <request_id>                                       # against localhost:8081
+just verify-answer <request_id> https://privacy-gateway.kexi.dev      # against production
+```
+
+The recipe is a one-line wrapper over `uv run clients/python/pgw.py verify <id> --base <url>`,
+so the client can be run directly if you would rather see the invocation.
+
+The Python client re-hashes the masked prompt and the Core response the gateway serves,
+compares every digest the OKF document records, and re-derives the verdict with a
+transcribed copy of the scanner. It reports what it could **not** check rather than
+counting it as passed — `attester_sha256` and `computation_sha256` name files in this
+repository, so only a checkout can compare those two.
+
+**4. Against the live deployment.** These need `gcloud` auth to the project:
+
+```bash
+just smoke                  # POST a fixed PII sample; assert 200, placeholders present, raw PII absent
+just image-test             # boot the real Synthesis image; assert real attestation digests
+just verify-auth            # from a laptop: prove the private services are NOT reachable
+just verify-auth-internal   # from inside the VPC: prove IAM accepts an authorized caller
+```
+
+`verify-auth` and `verify-auth-internal` are a pair on purpose. A test that only shows a
+`403` from outside cannot distinguish "correctly locked down" from "broken", so the second
+one proves the same door opens for the right caller.
+
+**5. Reproduce the evidence in `docs/proof/`.** Every file there records the command that
+produced it in a comment header, so it can be re-run rather than taken on trust.
+[`docs/proof/README.md`](docs/proof/README.md) indexes them and, at the top, lists the
+defects that were found this way and have since been fixed — including a kill switch that
+reported success while capping nothing. The failures are kept deliberately: a proof
+directory that quietly deletes its own mistakes is worth less than one that shows them
+being closed.
 
 ### API
 

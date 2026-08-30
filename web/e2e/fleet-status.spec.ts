@@ -197,6 +197,23 @@ test.describe('the GPU badge', () => {
 test.describe('the pipeline checklist', () => {
   test('shows the waking note when submitting while cold', async ({ page }) => {
     await mockStatus(page, { gemma: 'cold' });
+
+    // The message this asserts is an *in-flight* state: it is replaced the
+    // moment the first progress frame lands, and cleared when the answer
+    // arrives. Against the mock fleet the whole pipeline finishes in a couple
+    // of hundred milliseconds, so without holding the request open the
+    // assertion is racing a message that has already been superseded — which is
+    // a flaky test, not a broken UI. Releasing the request afterwards keeps the
+    // rest of the flow real.
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route('**/v1/ask', async (route) => {
+      await held;
+      await route.continue();
+    });
+
     await page.goto('/');
     await page.fill('#input', CUSTOMER_EMAIL);
     await page.click('#submit');
@@ -206,6 +223,7 @@ test.describe('the pipeline checklist', () => {
     await expect(page.locator('#steps .step[data-stage="gpu_wakeup"]')).toBeVisible();
     await expect(page.locator('#status')).toContainText(/waking the gpu/i);
 
+    release?.();
     await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
   });
 
@@ -251,5 +269,123 @@ test.describe('the pipeline checklist', () => {
     await expect(page.locator('#steps .step[data-stage="leak_check"]')).toHaveClass(/stopped/);
     await expect(page.locator('#steps .step[data-stage="rehydrate"]')).toHaveClass(/pending/);
     await expect(page.locator('#steps .step[data-stage="core_reasoning"]')).toHaveClass(/done/);
+  });
+});
+
+test.describe('a dispatched warm-up outranks a stale cold reading', () => {
+  test('keeps the starting note and the cost warning across the next poll', async ({ page }) => {
+    // The server accepts the wake immediately but keeps reporting `cold` until
+    // the instance actually starts booting. The very next poll must not undo
+    // what the user was just told, or the cost warning disappears at exactly
+    // the moment billing begins.
+    await mockStatus(page, { gemma: 'cold' });
+    await page.route('**/v1/warmup', (route) =>
+      route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ started: true }),
+      }),
+    );
+
+    await page.goto('/');
+    await expect(page.locator('#gpu-badge')).toHaveAttribute('data-state', 'cold');
+    await page.click('#warmup');
+
+    await expect(page.locator('#gpu-note')).toContainText(/starting up/i);
+    await expect(page.locator('#gpu-note')).toContainText(/billed/i);
+
+    // Several polls later, with the server still saying `cold`, the message has
+    // not reverted to "the GPU is asleep".
+    await page.waitForTimeout(1200);
+    await expect(page.locator('#gpu-note')).toContainText(/starting up/i);
+    await expect(page.locator('#gpu-note')).not.toContainText(/asleep/i);
+    await expect(page.locator('#warmup')).toBeDisabled();
+  });
+
+  test('releases the flag as soon as the server catches up', async ({ page }) => {
+    const state = { gemma: 'cold' as string };
+    await page.route('**/v1/status', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ gemma: state.gemma, cold_start_estimate_seconds: 120 }),
+      }),
+    );
+    await page.route('**/v1/warmup', (route) =>
+      route.fulfill({
+        status: 202,
+        contentType: 'application/json',
+        body: JSON.stringify({ started: true }),
+      }),
+    );
+
+    await page.goto('/');
+    await page.click('#warmup');
+    await expect(page.locator('#gpu-note')).toContainText(/starting up/i);
+
+    // Any status other than `cold` is the server having caught up, so the flag
+    // is spent rather than expiring on a timer of its own.
+    state.gemma = 'warm';
+    await expect(page.locator('#gpu-note')).toBeHidden({ timeout: 15_000 });
+    await expect(page.locator('#warmup')).toBeEnabled();
+  });
+});
+
+test.describe('the checklist shows the request moving', () => {
+  test('counts the elapsed seconds up on the step in flight', async ({ page }) => {
+    await mockStatus(page, { gemma: 'cold' });
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.click('#submit');
+
+    // Every finished step carries the time it took, so the checklist reports
+    // duration rather than only order.
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('#steps .step.done .step-time').first()).toHaveText(/\d+\.\d+s/);
+  });
+
+  test('marks each step done as the pipeline advances', async ({ page }) => {
+    await mockStatus(page, { gemma: 'warm', last_active_at: new Date().toISOString() });
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // Every stage completed, and each one says so with a check rather than only
+    // with a colour.
+    const done = page.locator('#steps .step.done');
+    await expect(done).toHaveCount(5);
+    await expect(done.first().locator('.step-mark')).toHaveText('✓');
+  });
+
+  test('holds no live-update timer once the run has finished', async ({ page }) => {
+    await mockStatus(page, { gemma: 'warm', last_active_at: new Date().toISOString() });
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // A settled checklist must stop repainting: the times are final, and a timer
+    // left running would keep a finished page busy for nothing.
+    const settled = await page.locator('#steps').innerHTML();
+    await page.waitForTimeout(400);
+    expect(await page.locator('#steps').innerHTML()).toBe(settled);
+  });
+
+  test('falls back to a still checklist under reduced motion', async ({ browser }) => {
+    const context = await browser.newContext({ reducedMotion: 'reduce' });
+    const page = await context.newPage();
+    await mockStatus(page, { gemma: 'warm', last_active_at: new Date().toISOString() });
+    await page.goto('/');
+    await page.fill('#input', CUSTOMER_EMAIL);
+    await page.click('#submit');
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // No sweeping gradient anywhere, and the marks and times still carry the
+    // whole message — what the setting removes is decoration, not information.
+    await expect(page.locator('#steps .step-shimmer')).toHaveCount(0);
+    await expect(page.locator('#steps .step.done')).toHaveCount(5);
+    await expect(page.locator('#steps .step.done .step-time').first()).toHaveText(/\d+\.\d+s/);
+    await context.close();
   });
 });

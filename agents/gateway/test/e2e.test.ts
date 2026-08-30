@@ -213,6 +213,15 @@ function ask(text: string, headers: Record<string, string> = {}) {
   });
 }
 
+/** Sends a request that opts into restoring specific high-risk categories. */
+function askAllowing(text: string, rehydrateAllow: readonly string[]) {
+  return fetch(`${gatewayUrl}/v1/ask`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text, rehydrate_allow: [...rehydrateAllow] }),
+  });
+}
+
 /** Posts a raw body, for the cases that must send something the schema rejects. */
 function askRaw(body: unknown) {
   return fetch(`${gatewayUrl}/v1/ask`, {
@@ -749,5 +758,82 @@ describe('the deadline cancels the work, not only the wait (P1)', () => {
     listener.close();
 
     expect(captured?.aborted).toBe(true);
+  });
+});
+
+describe('the per-request disclosure opt-in', () => {
+  beforeEach(() => startFleet());
+
+  it('withholds the card and the API key by default', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+
+    expect(body.answer).toContain('⟦CREDIT_CARD_1⟧');
+    expect(body.answer).not.toContain('4242 4242 4242 4242');
+    expect(body.attestation.withheld).toContain('CREDIT_CARD');
+    // Nothing was asked for, so the record says nothing was asked for.
+    expect(body.attestation.disclosure_requested).toBeUndefined();
+  });
+
+  it('restores the card when this request allowed it', async () => {
+    const body = (await (await askAllowing(CUSTOMER_EMAIL, ['CREDIT_CARD'])).json()) as AskResponse;
+
+    expect(body.answer).toContain('4242 4242 4242 4242');
+    expect(body.answer).not.toContain('⟦CREDIT_CARD_1⟧');
+  });
+
+  it('records the request and the final withheld set separately', async () => {
+    const body = (await (await askAllowing(CUSTOMER_EMAIL, ['CREDIT_CARD'])).json()) as AskResponse;
+
+    // What was asked for, and what was still not given: two facts, two fields.
+    expect(body.attestation.disclosure_requested).toEqual(['CREDIT_CARD']);
+    expect(body.attestation.withheld).toContain('API_KEY');
+    expect(body.attestation.withheld).not.toContain('CREDIT_CARD');
+  });
+
+  it('writes both sets into the OKF attestation block', async () => {
+    const body = (await (await askAllowing(CUSTOMER_EMAIL, ['CREDIT_CARD'])).json()) as AskResponse;
+    const block = parseOkf(body.okf).metadata['attestation'] as Record<string, unknown>;
+
+    expect(block['disclosure_requested']).toEqual(['CREDIT_CARD']);
+    expect(block['withheld']).toContain('API_KEY');
+    // The stored document's body is still the masked answer, opt-in or not: the
+    // disclosure is for the one response, never for the audit record.
+    expect(body.okf).not.toContain('4242 4242 4242 4242');
+  });
+
+  it('leaves a category the request did not name masked', async () => {
+    const body = (await (await askAllowing(CUSTOMER_EMAIL, ['CREDIT_CARD'])).json()) as AskResponse;
+
+    expect(body.answer).toContain('⟦API_KEY_1⟧');
+    expect(body.answer).not.toContain('sk-abcdefghijklmnopqrstuvwxyz012345');
+  });
+
+  it('records the rehydration verdict on every release', async () => {
+    const body = (await (await ask(CUSTOMER_EMAIL)).json()) as AskResponse;
+
+    expect(body.attestation.rehydration?.verdict).toBe('pass');
+    expect(body.attestation.rehydration?.withheld_remaining).toContain('⟦CREDIT_CARD_1⟧');
+  });
+
+  it('rejects a category that is never withheld', async () => {
+    const response = await askAllowing(CUSTOMER_EMAIL, ['EMAIL']);
+
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe('invalid_request');
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('rejects a category that does not exist', async () => {
+    const response = await askAllowing(CUSTOMER_EMAIL, ['SUPERUSER']);
+
+    expect(response.status).toBe(400);
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('names the offending field so a caller can fix the request', async () => {
+    const response = await askAllowing(CUSTOMER_EMAIL, ['EMAIL']);
+    const body = (await response.json()) as { message?: string };
+
+    expect(body.message).toContain('rehydrate_allow');
   });
 });

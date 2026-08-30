@@ -71,6 +71,33 @@ export const MessagesRequestSchema = z
 
 export type MessagesRequest = z.infer<typeof MessagesRequestSchema>;
 
+/**
+ * The distinct non-text block kinds in a Messages request, sorted.
+ *
+ * Claude Desktop attaches images as `image` blocks, so this shim is the surface
+ * most likely to be handed one. The gateway behind it masks text with regexes
+ * and a text model and cannot redact a face, a whiteboard or a screenshot of a
+ * card, so an image must be refused rather than dropped: dropping it sends a
+ * prompt the user did not write, and forwarding it would put unmaskable data
+ * across the boundary. Non-`user` turns are inspected too, because "we ignore
+ * assistant turns" is not a reason to have accepted the attachment.
+ */
+export function nonTextBlockTypes(request: MessagesRequest): string[] {
+  const kinds = new Set<string>();
+
+  const collect = (content: MessagesRequest['messages'][number]['content']): void => {
+    if (typeof content === 'string') return;
+    for (const block of content) {
+      if (block.type !== 'text') kinds.add(block.type);
+    }
+  };
+
+  if (request.system !== undefined) collect(request.system);
+  for (const message of request.messages) collect(message.content);
+
+  return [...kinds].sort();
+}
+
 /** Flatten one message's content to text, dropping non-text blocks. */
 function blocksToText(content: string | readonly z.infer<typeof ContentBlockSchema>[]): string {
   if (typeof content === 'string') return content.trim();
