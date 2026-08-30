@@ -18,10 +18,10 @@ jobs:
     name: Lint (standalone Python scripts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
@@ -34,7 +34,7 @@ jobs:
         run: uvx ruff format --check clients/
 
       - name: Install just
-        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
 
       - name: PEP 723 headers
         run: just lint-pep723
@@ -45,7 +45,7 @@ jobs:
     outputs:
       web: ${{ steps.check.outputs.web }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check for web workspace
         id: check
@@ -63,13 +63,13 @@ jobs:
     needs: detect
     if: needs.detect.outputs.web == 'true'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: pnpm
@@ -107,10 +107,10 @@ jobs:
     name: Justfile hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install just
-        uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
 
       # Why not `just fmt-check`: it also runs fmt-nix-check / fmt-ts-check /
       # fmt-python-check / tf-fmt-check, whose tools are absent on this runner.
@@ -130,10 +130,10 @@ jobs:
     name: Terraform (fmt / validate / tflint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: 1.15.9
           # The wrapper rewrites stdout to feed step outputs, which mangles the
@@ -152,7 +152,7 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
       - name: Set up tflint
-        uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+        uses: terraform-linters/setup-tflint@6e1e0642c0289bd619021bf6b34e3c08ed1e005a # v6.3.0
 
       - name: tflint
         run: |
@@ -164,7 +164,7 @@ jobs:
     name: Workflow hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: actionlint
         uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1.73.2
@@ -192,13 +192,13 @@ jobs:
     # manifests, and every push to main is still scanned, so skip the job there.
     if: github.actor != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # gitleaks scans the full history, so disable the shallow clone.
           fetch-depth: 0
 
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_CONFIG: .gitleaks.toml
@@ -207,7 +207,7 @@ jobs:
     name: nix flake check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
