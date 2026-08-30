@@ -17,9 +17,12 @@ const SRC_DIR = fileURLToPath(new URL('../src', import.meta.url));
 /**
  * Subpaths of the shared package Core may import.
  *
- * None of them reach the vault: `config` and `schema` are pure declarations,
+ * None of them reach Firestore: `config` and `schema` are pure declarations,
  * `logging` and `telemetry` hold no persistence. The bare package entry point is
- * absent on purpose — it re-exports the vault and the tokenizer.
+ * absent on purpose — it re-exports the vault, the tokenizer and the fleet
+ * activity store, each of which opens a Firestore client Core has no role for.
+ * `activity.ts` is reachable only through that entry point, by design: it has no
+ * subpath of its own precisely so it cannot end up on this list by accident.
  */
 const ALLOWED_COMMON_SUBPATHS = new Set([
   '@privacy-gateway/common/config',

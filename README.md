@@ -342,7 +342,25 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 | `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                             |
 | `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                 |
 | `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                     |
+| `GET`  | `/v1/status`                         | is Gemma warm or cold, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU                              |
+| `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                |
 | `GET`  | `/healthz`                           | liveness                                                                                                                    |
+
+`POST /v1/ask` also answers `Accept: text/event-stream` with a progress stream: an
+`event: progress` frame per pipeline stage (`masking`, `egress_guard`, `core_reasoning`,
+`leak_check`, `rehydrate`) carrying only the stage name, a `start`/`end` marker and
+`elapsed_ms`, then a terminal `event: result` with the same `AskResponse` body the JSON
+path returns — or `event: refused` carrying the error body and the status it would have
+had — followed by `data: [DONE]`. No progress frame ever carries prompt text, an answer
+fragment or a placeholder. The status code is `200` from the first frame onwards, because
+the headers are flushed long before the pipeline knows whether it will refuse; a streaming
+client reads the refusal frame's `status` field instead. The OpenAI-compatible
+`stream: true` is unchanged (one content chunk, then `[DONE]`).
+
+`/v1/status` reports `warm` when a Gemma call was recorded in the last 10 minutes, `cold`
+when none was, and `unknown` when the record could not be read — it is derived from a
+timestamp written after each successful Gemma call, never by probing Gemma, because a probe
+would wake the instance it is reporting on.
 
 There is no session-based API any more: `GET /v1/sessions/{id}/answer`,
 `POST /v1/sessions/{id}/approve` and `GET /v1/sessions/{id}/tier` are all removed. The evidence

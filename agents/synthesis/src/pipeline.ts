@@ -69,7 +69,27 @@ export function actor(version = '0.1.0'): string {
 export type LeakJudge = (
   text: string,
   signal?: AbortSignal,
+  context?: LeakJudgeContext,
 ) => Promise<{ leak: boolean | null; categories?: readonly string[] }>;
+
+/**
+ * Safe metadata handed to the judge alongside the answer.
+ *
+ * Every field is PII-free by construction: the masked prompt is what crossed the
+ * boundary to Core, and the category counts are already public in the OKF
+ * document and the API response. Nothing here carries a value.
+ *
+ * It exists because the judge was flagging almost every masked answer while
+ * naming no category — the failure of a model asked to audit a text it had no
+ * context for. Telling it what the answer is answering, and what was masked out
+ * of it, replaces the guessing that produced those flags.
+ */
+export interface LeakJudgeContext {
+  /** The masked prompt Core was given. Placeholders are neutralized before sending. */
+  readonly maskedPrompt: string;
+  /** `{category: count}` of what the tokenizer masked. Counts only, never values. */
+  readonly maskedCounts: Readonly<Record<string, number>>;
+}
 
 /** Why a release was refused, and the HTTP status that expresses it. */
 export type RefusalKind =
@@ -515,22 +535,74 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   // hand real PII to a model and would make "there is a leak" the always-correct
   // answer, draining the signal of meaning.
   if (options.judge !== undefined) {
-    const opinion = await withSpan(SPAN.judgeGemma, { request_id: requestId }, async () => {
-      try {
-        const result = await options.judge?.(coreAnswer, options.signal);
-        return result ?? { leak: null };
-      } catch (error) {
-        logger?.event(
-          'judge.gemma',
-          { error_class: error instanceof Error ? error.name : 'unknown' },
-          'WARNING',
-        );
-        return { leak: null };
-      }
-    });
+    // Counted from the mapping's *keys* only. A placeholder's category is
+    // already public — it is in the placeholder, in the OKF document and in the
+    // API response — while the values on the other side of the mapping are never
+    // read here.
+    const maskedCounts: Record<string, number> = {};
+    for (const token of Object.keys(mapping)) {
+      const category = /^⟦([A-Z_]+)_\d+⟧$/u.exec(token)?.[1];
+      if (category === undefined) continue;
+      maskedCounts[category] = (maskedCounts[category] ?? 0) + 1;
+    }
+    const judgeContext: LeakJudgeContext = { maskedPrompt, maskedCounts };
 
-    const judgeCategories = filterPiiCategories(opinion.categories ?? []).categories;
+    /** One judge round trip, with a transport or parse failure flattened to "no opinion". */
+    const consult = (): Promise<{ leak: boolean | null; categories?: readonly string[] }> =>
+      withSpan(SPAN.judgeGemma, { request_id: requestId }, async () => {
+        try {
+          const result = await options.judge?.(coreAnswer, options.signal, judgeContext);
+          return result ?? { leak: null };
+        } catch (error) {
+          logger?.event(
+            'judge.gemma',
+            { error_class: error instanceof Error ? error.name : 'unknown' },
+            'WARNING',
+          );
+          return { leak: null };
+        }
+      });
+
+    let opinion = await consult();
+    let judgeCategories = filterPiiCategories(opinion.categories ?? []).categories;
+    let judgeRetries = 0;
+
+    /**
+     * A flag with no categories, over a body the deterministic attester passed,
+     * is the one case worth asking twice.
+     *
+     * Why not retry unconditionally: a flag that names categories is a specific
+     * suspicion, and re-rolling until it goes away is exactly how a probabilistic
+     * veto gets laundered into a pass. Why not retry more than once: past two
+     * attempts there is no way to distinguish "the first answer was noise" from
+     * "keep rolling until it lets us through", which is the same failure with
+     * more steps.
+     *
+     * The attester gate above has already refused anything it could see, so the
+     * only thing being re-asked here is a model's unexplained hunch about a body
+     * deterministic code found clean.
+     */
+    const isUnevidencedFlag = opinion.leak === true && judgeCategories.length === 0 && verdict.ok;
+    if (isUnevidencedFlag) {
+      const second = await consult();
+      judgeRetries = 1;
+      logger?.event('judge.retry', {
+        verdict: second.leak === true ? 'flagged' : second.leak === false ? 'clear' : 'unusable',
+      });
+
+      // A second attempt that comes back unusable is not an improvement on an
+      // unevidenced flag, so the original verdict stands and the request is
+      // refused as `judge_flagged` rather than downgraded to `judge_unavailable`.
+      if (second.leak === false) {
+        opinion = second;
+        judgeCategories = filterPiiCategories(second.categories ?? []).categories;
+      }
+    }
+
     attestation.judge = { leak: opinion.leak ?? null, categories: judgeCategories };
+    // Recorded in the audit document so a release that only passed on the second
+    // look is distinguishable from one that passed outright.
+    if (judgeRetries > 0) attestation.judge_retries = judgeRetries;
     logger?.event('judge.gemma', { leak: opinion.leak ?? null, categories: judgeCategories });
 
     // `false` deliberately does nothing: a probabilistic model may veto a

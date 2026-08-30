@@ -8,11 +8,29 @@
   <body>
     <main>
       <header>
-        <h1>Privacy-Preserving Gateway</h1>
+        <div class="header-top">
+          <h1>Privacy-Preserving Gateway</h1>
+          <!--
+            The GPU state is read from a recorded timestamp, never by probing
+            Gemma: a probe would wake the instance the badge is reporting on.
+          -->
+          <div class="gpu-status" id="gpu-status">
+            <span class="gpu-badge" id="gpu-badge" data-state="unknown">GPU: unknown</span>
+            <button
+              id="warmup"
+              type="button"
+              class="warmup"
+              title="Starts the GPU now. It is billed for as long as it stays running (about 15 idle minutes)."
+            >
+              Warm up
+            </button>
+          </div>
+        </div>
         <p class="lede">
           A frontier model reasons over tokenized text. The mapping back to real values never leaves
           the trust boundary.
         </p>
+        <p class="gpu-note" id="gpu-note" hidden></p>
       </header>
 
       <section class="composer">
@@ -22,6 +40,15 @@
           <button id="submit" type="button">Send through the gateway</button>
           <p id="status" class="status"></p>
         </div>
+      </section>
+
+      <!--
+        Filled from the /v1/ask progress stream. It says which stage the request
+        is in and nothing about what the request contains.
+      -->
+      <section id="progress" class="progress" hidden>
+        <h2>Pipeline</h2>
+        <ol id="steps" class="steps"></ol>
       </section>
 
       <section id="blocked" class="blocked" hidden></section>

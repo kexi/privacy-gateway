@@ -55,6 +55,39 @@ export function stripPlaceholders(text: string): string {
   return text.replace(TOKEN_RE, ' ');
 }
 
+/**
+ * Replace every placeholder with a readable neutral marker.
+ *
+ * Same guarantee as `stripPlaceholders` — no `⟦…⟧` survives, so the judge cannot
+ * answer the wrong question by reasoning about the masking syntax — but the
+ * sentence it leaves behind is grammatical. `Dear ⟦PERSON_1⟧, we wrote to
+ * ⟦EMAIL_1⟧` becomes `Dear [masked person], we wrote to [masked email]` rather
+ * than `Dear  , we wrote to  `.
+ *
+ * Why not keep stripping: the gap-riddled text was itself a source of false
+ * positives. A model asked "does this contain personal data" over a sentence
+ * with holes punched in it has to guess what the holes were, and it guessed
+ * "something sensitive" — which is how the judge came to flag essentially every
+ * masked answer while naming no category at all. Restoring the sentence's shape
+ * removes the thing it was inferring from.
+ *
+ * The category is lower-cased into the marker because it is already public: the
+ * placeholder disclosed it, the OKF document records it, and the API returns
+ * `counts_by_category`. It carries no value — `[masked email]` says an email was
+ * here, never which one.
+ *
+ * Deterministic by construction: the same input yields the same output, so a
+ * verdict cannot depend on which call rendered the text.
+ */
+export function neutralizePlaceholders(text: string): string {
+  TOKEN_RE.lastIndex = 0;
+  return text.replace(TOKEN_RE, (_match, category: string) => {
+    // `PHONE_NUMBER` reads better as `phone number` than as `phone_number`.
+    const label = category.toLowerCase().replace(/_/gu, ' ');
+    return `[masked ${label}]`;
+  });
+}
+
 /** A single detected PII span. */
 export interface Detection {
   readonly start: number;

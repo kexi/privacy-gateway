@@ -16,6 +16,7 @@ import { AGENT_CARD_PATH, type AgentCard } from '@a2a-js/sdk';
 import {
   ATTESTER_RESOURCE,
   attesterSha256,
+  buildActivityStore,
   buildVault,
   COMPUTATION_RESOURCE,
   computationSha256,
@@ -24,6 +25,7 @@ import {
   currentTraceId,
   initTelemetry,
   loadConfig,
+  recordGemmaActivity,
   REQUEST_ID_HEADER,
   resolveRequestId,
   setIdTokenAudienceAllowlist,
@@ -450,6 +452,11 @@ export async function main(): Promise<void> {
   });
 
   const port = config.PORT ?? DEFAULT_PORT;
+  // Shared with the Gateway through Firestore: whichever service last reached
+  // Gemma is what the warm/cold badge reports, so the judge's calls keep the
+  // badge accurate even when no extraction ran.
+  const activityStore = buildActivityStore(config.VAULT_BACKEND);
+
   const app = await createApp({
     config,
     logger,
@@ -460,6 +467,9 @@ export async function main(): Promise<void> {
       apiKey: config.GEMMA_API_KEY,
       ...(config.GEMMA_AUTH === undefined ? {} : { auth: config.GEMMA_AUTH }),
       logger,
+      onReached: () => {
+        recordGemmaActivity(activityStore);
+      },
     }),
   });
 

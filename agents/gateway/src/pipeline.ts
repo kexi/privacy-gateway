@@ -24,6 +24,8 @@ import {
   withSpan,
   type Detection,
   type Logger,
+  type ProgressEvent,
+  type ProgressStage,
   type SynthesizeResponse,
   type TokenizeResult,
   type TokenVault,
@@ -55,6 +57,19 @@ export type SpanExtractor = (text: string, signal?: AbortSignal) => Promise<Dete
  * while the tokenizer is working correctly.
  */
 export type Tokenize = (text: string, extra: readonly Detection[]) => TokenizeResult;
+
+/**
+ * Called as each stage opens and closes, when the caller asked to be told.
+ *
+ * The pipeline hands it a stage name and a duration and nothing else. This is
+ * the one channel that reports on a request *while* its content is still inside
+ * the boundary, so it is typed to make carrying that content impossible rather
+ * than merely discouraged: `ProgressEvent` has no free-text field.
+ *
+ * Failures are the caller's problem, not the pipeline's — a broken progress sink
+ * must never take down the request it is describing.
+ */
+export type ProgressSink = (event: ProgressEvent) => void;
 
 /** Raised when the raw input uses the reserved placeholder syntax. */
 export class ReservedSyntaxError extends Error {
@@ -109,6 +124,14 @@ export interface AskOptions {
    * caller had already received a 504.
    */
   readonly signal?: AbortSignal | undefined;
+  /**
+   * Where to report stage transitions, when the caller asked for them.
+   *
+   * Absent by default: the non-streaming path must behave exactly as it did
+   * before, so progress reporting is something a caller opts into rather than
+   * something the pipeline always does and the server usually discards.
+   */
+  readonly onProgress?: ProgressSink | undefined;
 }
 
 /** Raised when the request-scoped deadline fired between two pipeline steps. */
@@ -142,6 +165,37 @@ export async function ask(options: AskOptions): Promise<AskResult> {
     if (signal?.aborted === true) throw new RequestAbortedError();
   };
 
+  // Elapsed is measured from the pipeline's own start rather than from the
+  // HTTP request, so the numbers a client renders describe the work this
+  // function did and not the time it spent queued behind middleware.
+  const startedAt = Date.now();
+
+  /**
+   * Report a stage transition, absorbing anything the sink throws.
+   *
+   * A progress frame is decoration; a request that failed because a client
+   * disconnected mid-stream would be the tail wagging the dog. Wrapped here
+   * once so no individual stage can forget.
+   */
+  const progress = (stage: ProgressStage, state: 'start' | 'end'): void => {
+    if (options.onProgress === undefined) return;
+    try {
+      options.onProgress({ stage, state, elapsed_ms: Date.now() - startedAt });
+    } catch {
+      // Deliberately ignored: see above.
+    }
+  };
+
+  /** Run one stage, bracketing it with start/end frames even when it throws. */
+  const staged = async <T>(stage: ProgressStage, run: () => Promise<T>): Promise<T> => {
+    progress(stage, 'start');
+    const value = await run();
+    // Only on success: a stage that threw did not "end", it stopped, and the
+    // caller learns which stage that was from the absence of its end frame.
+    progress(stage, 'end');
+    return value;
+  };
+
   // 0. Reject the reserved syntax before anything else.
   //
   // A caller who writes `⟦EMAIL_1⟧` verbatim is not describing data, they are
@@ -157,21 +211,29 @@ export async function ask(options: AskOptions): Promise<AskResult> {
   //    existing mapping to carry over.
   const tokenizer = new SessionTokenizer();
 
-  const extra = await withSpan(SPAN.maskGemma, { request_id: requestId }, async (span) => {
-    if (options.extractSpans === undefined) return [];
-    const spans = await options.extractSpans(options.text, signal);
-    span.setAttribute('span_count', spans.length);
-    return spans;
-  });
-  checkpoint();
+  // Gemma extraction and the regex pass are one `masking` stage to a client:
+  // they are two implementation steps of a single answer to "is my PII hidden
+  // yet", and splitting them would expose that the fleet runs a model here.
+  const { result, extra } = await staged('masking', async () => {
+    const spans = await withSpan(SPAN.maskGemma, { request_id: requestId }, async (span) => {
+      if (options.extractSpans === undefined) return [];
+      const found = await options.extractSpans(options.text, signal);
+      span.setAttribute('span_count', found.length);
+      return found;
+    });
+    checkpoint();
 
-  const tokenize: Tokenize = options.tokenize ?? ((text, spans) => tokenizer.tokenize(text, spans));
+    const tokenize: Tokenize =
+      options.tokenize ?? ((text, detections) => tokenizer.tokenize(text, detections));
 
-  const result = await withSpan(SPAN.maskRegex, { request_id: requestId }, (span) => {
-    const masked = tokenize(options.text, extra);
-    span.setAttribute('placeholder_count', masked.detections.length);
-    return Promise.resolve(masked);
+    const masked = await withSpan(SPAN.maskRegex, { request_id: requestId }, (span) => {
+      const value = tokenize(options.text, spans);
+      span.setAttribute('placeholder_count', value.detections.length);
+      return Promise.resolve(value);
+    });
+    return { result: masked, extra: spans };
   });
+
   const maskedPrompt = result.text;
   const counts = countsByCategory(result.detections);
 
@@ -181,16 +243,18 @@ export async function ask(options: AskOptions): Promise<AskResult> {
 
   // 3. Egress guard: rerun the deterministic detection just before sending
   //    (defense in depth).
-  await withSpan(SPAN.guardEgress, { request_id: requestId }, (span) => {
-    const report = scan(maskedPrompt);
-    span.setAttribute('ok', report.ok);
-    if (!report.ok) {
-      span.setAttribute('categories', [...report.categories]);
-      logger.event('guard.egress.blocked', { categories: [...report.categories] }, 'ERROR');
-      throw new PiiLeakError(report.findings);
-    }
-    return Promise.resolve();
-  });
+  await staged('egress_guard', () =>
+    withSpan(SPAN.guardEgress, { request_id: requestId }, (span) => {
+      const report = scan(maskedPrompt);
+      span.setAttribute('ok', report.ok);
+      if (!report.ok) {
+        span.setAttribute('categories', [...report.categories]);
+        logger.event('guard.egress.blocked', { categories: [...report.categories] }, 'ERROR');
+        throw new PiiLeakError(report.findings);
+      }
+      return Promise.resolve();
+    }),
+  );
 
   logger.event('mask.done', {
     placeholder_count: result.detections.length,
@@ -200,16 +264,18 @@ export async function ask(options: AskOptions): Promise<AskResult> {
   });
 
   // 4. Send only the masked prompt to Core, which sits outside the boundary.
-  const coreAnswer = await withSpan(
-    SPAN.a2aCore,
-    { request_id: requestId, placeholder_count: result.detections.length },
-    async () => {
-      const startedAt = Date.now();
-      logger.event('a2a.core.send', {});
-      const answer = await options.callCore(maskedPrompt, signal);
-      logger.event('a2a.core.recv', { duration_ms: Date.now() - startedAt, status: 'ok' });
-      return answer;
-    },
+  const coreAnswer = await staged('core_reasoning', () =>
+    withSpan(
+      SPAN.a2aCore,
+      { request_id: requestId, placeholder_count: result.detections.length },
+      async () => {
+        const sentAt = Date.now();
+        logger.event('a2a.core.send', {});
+        const answer = await options.callCore(maskedPrompt, signal);
+        logger.event('a2a.core.recv', { duration_ms: Date.now() - sentAt, status: 'ok' });
+        return answer;
+      },
+    ),
   );
   checkpoint();
 
@@ -222,21 +288,33 @@ export async function ask(options: AskOptions): Promise<AskResult> {
     (token) => result.mapping[token] !== undefined,
   );
 
-  const synthesis = await withSpan(SPAN.synthesisCall, { request_id: requestId }, async (span) => {
-    const response = await options.callSynthesis(
-      {
-        maskedPrompt,
-        coreAnswer,
-        generatedBy: options.coreActor,
-        knownTokens,
-        vaultGeneration: entry.generation,
-      },
-      signal,
-    );
-    span.setAttribute('verdict', response.attestation.ok ? 'pass' : 'fail');
-    span.setAttribute('trust_tier', response.trust_tier);
-    return response;
-  });
+  // Synthesis verifies and rehydrates in a single round trip, so the two client
+  // stages are bracketed around one call rather than around two: `leak_check`
+  // covers the request, and `rehydrate` is reported once it returned an answer.
+  // Why not split them for real — by having Synthesis stream its own progress:
+  // that would put a second streaming hop inside the boundary for a cosmetic
+  // gain, and the gates it reports on are the ones that must not be observable
+  // to a caller before they have all passed.
+  const synthesis = await staged('leak_check', () =>
+    withSpan(SPAN.synthesisCall, { request_id: requestId }, async (span) => {
+      const response = await options.callSynthesis(
+        {
+          maskedPrompt,
+          coreAnswer,
+          generatedBy: options.coreActor,
+          knownTokens,
+          vaultGeneration: entry.generation,
+        },
+        signal,
+      );
+      span.setAttribute('verdict', response.attestation.ok ? 'pass' : 'fail');
+      span.setAttribute('trust_tier', response.trust_tier);
+      return response;
+    }),
+  );
+
+  progress('rehydrate', 'start');
+  progress('rehydrate', 'end');
 
   const traceId = currentTraceId();
   return {

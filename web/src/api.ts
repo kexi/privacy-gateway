@@ -12,9 +12,16 @@ import {
   AskResponseSchema,
   ErrorResponseSchema,
   GatewayAnswerFrontmatterSchema,
+  ProgressEventSchema,
+  StatusResponseSchema,
+  StreamRefusalSchema,
   type AskResponse,
   type Attestation,
   type ConsistencyReport,
+  type GemmaWarmth,
+  type ProgressEvent,
+  type ProgressStage,
+  type StatusResponse,
   type TrustDimensions,
   type TrustTier,
   type VerificationEvent,
@@ -25,6 +32,10 @@ export type {
   AskResponse,
   Attestation,
   ConsistencyReport,
+  GemmaWarmth,
+  ProgressEvent,
+  ProgressStage,
+  StatusResponse,
   TrustDimensions,
   TrustTier,
   VerificationEvent,
@@ -93,6 +104,149 @@ export function ask(text: string): Promise<AskResponse> {
     method: 'POST',
     body: JSON.stringify({ text }),
   });
+}
+
+/**
+ * Read the fleet's warm/cold state.
+ *
+ * Never throws: the badge is a convenience, and a UI that surfaces a network
+ * error where it meant to show a status is worse than one that shows `unknown`.
+ * The server has the same rule — see `agents/gateway/src/status.ts`.
+ */
+export async function fleetStatus(): Promise<StatusResponse> {
+  try {
+    const response = await fetch('/v1/status');
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    return StatusResponseSchema.parse(await response.json());
+  } catch {
+    return { gemma: 'unknown', cold_start_estimate_seconds: 120 };
+  }
+}
+
+/**
+ * Ask the gateway to start the GPU.
+ *
+ * Resolves once the request was dispatched, which is not the same as Gemma being
+ * ready: the caller re-polls `status()` to find that out.
+ */
+export async function warmup(): Promise<void> {
+  const response = await fetch('/v1/warmup', { method: 'POST' });
+  if (!response.ok) throw await toApiError(response);
+}
+
+/**
+ * Send one request and watch the pipeline work.
+ *
+ * The gateway streams a stage transition per pipeline step and finishes with the
+ * same `AskResponse` the JSON path returns, so the caller ends up with identical
+ * facts either way — only the waiting is narrated.
+ *
+ * A refusal arrives as a frame, not as an HTTP status: the response code was
+ * committed to 200 before the pipeline knew it would refuse. The `refused` frame
+ * carries the status it would have had, and it is rebuilt into the same
+ * `ApiError` the non-streaming path throws, so callers handle one shape.
+ *
+ * Falls back to the plain JSON request whenever streaming is unavailable — an
+ * environment without `ReadableStream`, or a gateway that ignored the `Accept`
+ * header and answered with JSON anyway.
+ */
+export async function askStreaming(
+  text: string,
+  onProgress: (event: ProgressEvent) => void,
+): Promise<AskResponse> {
+  const response = await fetch('/v1/ask', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!response.ok) throw await toApiError(response);
+
+  const isStream = response.headers.get('content-type')?.includes('text/event-stream') === true;
+  if (!isStream || response.body === null) {
+    // The gateway answered the old way; parse it as the plain response so a
+    // deployment mismatch degrades to "no progress" rather than to a failure.
+    return AskResponseSchema.parse(await response.json());
+  }
+
+  return consumeAskStream(response.body, onProgress);
+}
+
+/** Reads the SSE frames of one `/v1/ask` stream to their terminal event. */
+async function consumeAskStream(
+  body: ReadableStream<Uint8Array>,
+  onProgress: (event: ProgressEvent) => void,
+): Promise<AskResponse> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: AskResponse | undefined;
+  let refusal: ApiError | undefined;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // Frames are separated by a blank line. Everything before the last
+      // separator is complete; the remainder stays buffered for the next chunk.
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() ?? '';
+
+      for (const frame of frames) {
+        const parsed = parseFrame(frame);
+        if (parsed === null) continue;
+        if (parsed.event === 'progress') {
+          const progress = ProgressEventSchema.safeParse(parsed.data);
+          if (progress.success) onProgress(progress.data);
+        } else if (parsed.event === 'result') {
+          result = AskResponseSchema.parse(parsed.data);
+        } else if (parsed.event === 'refused') {
+          refusal = toStreamError(parsed.data);
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (refusal !== undefined) throw refusal;
+  if (result !== undefined) return result;
+  // The stream ended without a terminal frame: the connection dropped
+  // mid-pipeline, which is a failure rather than an empty answer.
+  throw new ApiError('the gateway closed the stream before answering', 502);
+}
+
+/** Splits one SSE frame into its event name and JSON payload. */
+function parseFrame(frame: string): { event: string; data: unknown } | null {
+  let event = 'message';
+  const dataLines: string[] = [];
+
+  for (const line of frame.split('\n')) {
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+  }
+
+  const data = dataLines.join('\n');
+  if (data === '' || data === '[DONE]') return null;
+
+  try {
+    return { event, data: JSON.parse(data) as unknown };
+  } catch {
+    // A frame that is not JSON is not something this client knows how to act on.
+    return null;
+  }
+}
+
+/** Rebuilds the streamed refusal into the same ApiError the JSON path throws. */
+function toStreamError(payload: unknown): ApiError {
+  const parsed = StreamRefusalSchema.safeParse(payload);
+  if (!parsed.success) return new ApiError('the request was refused', 502);
+
+  const { error, message, categories, request_id: requestId, status: httpStatus } = parsed.data;
+  const detail = categories?.length ? ` (${categories.join(', ')})` : '';
+  return new ApiError(`${message ?? error}${detail}`, httpStatus ?? 502, requestId, categories);
 }
 
 /** Fetch the stored masked OKF evidence document for one request. */

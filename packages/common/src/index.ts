@@ -1,14 +1,18 @@
 /**
  * Primitives shared inside the trust boundary.
  *
- * The Core Agent must NOT import this entry point: it re-exports the vault and
- * the tokenizer, and Core's inability to reach the token mapping is a structural
- * guarantee expressed in the dependency graph. Core imports the
+ * The Core Agent must NOT import this entry point: it re-exports the vault, the
+ * tokenizer and the activity store, and Core's inability to reach Firestore is a
+ * structural guarantee expressed in the dependency graph. Core imports the
  * `@privacy-gateway/common/{logging,config,schema,telemetry}` subpaths instead,
- * none of which reach the vault.
+ * none of which reach a Firestore-backed store. `activity.ts` deliberately has
+ * no subpath of its own for the same reason: Core's service account holds no
+ * Firestore role, so an import it could reach would fail in production rather
+ * than in review.
  */
 
 export * from './a2a.ts';
+export * from './activity.ts';
 export * from './attestation.ts';
 export * from './config.ts';
 export * from './guard.ts';

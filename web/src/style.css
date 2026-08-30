@@ -435,3 +435,146 @@ summary {
   font-size: 0.95em;
   color: var(--fg-muted, #6b7280);
 }
+
+/* --- GPU warmth badge ------------------------------------------------------ */
+
+.header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.gpu-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/*
+ * Three states, three colours, and none of them green-by-default: `unknown` is a
+ * real answer here rather than a failure to load, so it gets the neutral border
+ * the dimensions grid uses for an unasserted claim rather than a warning colour.
+ */
+.gpu-badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.gpu-badge[data-state='warm'] {
+  color: var(--pass);
+  border-color: color-mix(in srgb, var(--pass) 45%, transparent);
+}
+
+.gpu-badge[data-state='cold'] {
+  color: var(--token);
+  border-color: color-mix(in srgb, var(--token) 45%, transparent);
+}
+
+.warmup {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.warmup:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.gpu-note {
+  margin: -1.4rem 0 2rem;
+  font-size: 0.8rem;
+  color: var(--token);
+  max-width: 62ch;
+}
+
+/* --- Pipeline progress ----------------------------------------------------- */
+
+.progress {
+  margin: 1.5rem 0;
+}
+
+.progress h2 {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 0.6rem;
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 1.5rem 1fr auto;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-left-color: var(--border);
+  border-radius: 6px;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+/* A step nobody has reached yet is dimmed, not coloured: it makes no claim. */
+.step.pending {
+  color: var(--muted);
+  opacity: 0.65;
+}
+
+.step.active {
+  border-left-color: var(--accent);
+}
+
+.step.done {
+  border-left-color: var(--pass);
+}
+
+/*
+ * The gate that refused. Red on the stopped step alone -- the steps after it are
+ * left pending because they were never reached, which is a different fact from
+ * having failed.
+ */
+.step.stopped {
+  border-left-color: var(--fail);
+  color: var(--fail);
+}
+
+.step-mark {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: center;
+}
+
+.step.done .step-mark {
+  color: var(--pass);
+}
+
+.step.stopped .step-mark {
+  color: var(--fail);
+}
+
+.step-time {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--muted);
+}

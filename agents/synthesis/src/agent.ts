@@ -15,10 +15,11 @@ import {
   LeakJudgeSchema,
   ollamaModelId,
   registerOllamaLlm,
-  stripPlaceholders,
+  neutralizePlaceholders,
   type GemmaAuthMode,
   type Logger,
 } from '@privacy-gateway/common';
+import type { LeakJudgeContext } from './pipeline.ts';
 
 export const SYNTHESIS_AGENT_NAME = 'synthesis_agent';
 
@@ -56,15 +57,59 @@ export function buildSynthesisAgent(model?: string): LlmAgent {
   });
 }
 
-const JUDGE_PROMPT = `You are a privacy auditor. Answer with JSON only:
+/**
+ * How much of the masked prompt travels with the answer as context.
+ *
+ * The prompt is PII-free by construction, so the cap is about tokens rather than
+ * safety: 2000 characters is far inside gemma3:12b's window even alongside the
+ * answer and this instruction, and the opening of a request carries the task
+ * description that makes the answer legible. A truncated prompt is marked so the
+ * model does not read the cut as the request ending there.
+ */
+export const JUDGE_PROMPT_CONTEXT_LIMIT = 2000;
+
+const JUDGE_PROMPT = `You are a privacy auditor reviewing one exchange from a
+privacy-preserving gateway. Answer with JSON only:
 {"leak": true|false, "categories": [...]}.
 
-Does the following text contain any real personal data or secret (email, phone number,
-credit card, API key, address, personal name)?
+## What you are looking at
 
-The text has already been masked: every placeholder was removed before you were shown
-it, so what you receive is the residual prose alone. Judge only what is in front of you.
-Gaps where a value used to sit are expected and are not evidence of a leak.`;
+Personal data was removed from this exchange BEFORE it reached you and replaced with
+neutral markers like [masked email], [masked person] or [masked credit card]. Those
+markers are the system working correctly. They are not personal data, and the real
+values behind them are not available to you or to the model that wrote the answer.
+
+You are shown the request for context and the answer to judge. Judge the ANSWER.
+
+## The rule
+
+Report leak=true ONLY when an actual value appears in the answer — a real email
+address, phone number, credit card number, API key, postal address, or a specific
+person's name written out. Something a person could copy and use.
+
+Report leak=false for everything else. In particular:
+- A [masked ...] marker is never a leak, however many appear.
+- Discussing the topic — a customer, a failed charge, an account — is never a leak.
+- Referring to "the customer" or "their email address" without stating a value is
+  never a leak.
+- A sentence that reads as though a value belongs there is not a leak unless the
+  value is actually present.
+
+If you report leak=true, name the categories in \`categories\` (EMAIL, PHONE,
+CREDIT_CARD, API_KEY, ADDRESS, PERSON). An empty \`categories\` list alongside
+leak=true means you found nothing specific, which means the answer is leak=false.
+
+## Examples
+
+Answer: "Dear [masked person], we have logged the failed charge on card
+[masked credit card] and will write to [masked email]."
+→ {"leak": false, "categories": []}
+Every value is a marker; the system masked them all.
+
+Answer: "Dear Taro Yamada, we have logged the charge. Contact us at
+support@example.com or call 090-1234-5678."
+→ {"leak": true, "categories": ["PERSON", "EMAIL", "PHONE"]}
+Real values are written out in full.`;
 
 export interface JudgeOptions {
   readonly baseUrl?: string | undefined;
@@ -75,6 +120,59 @@ export interface JudgeOptions {
   readonly fetchImpl?: typeof fetch | undefined;
   readonly logger?: Logger | undefined;
   readonly timeoutMs?: number | undefined;
+  /**
+   * Called after Gemma answers, whatever the verdict was.
+   *
+   * Exists so the fleet's warm/cold badge can be fed from the one place that
+   * actually proves Gemma is resident. It is a plain callback rather than an
+   * activity store because the judge has no business knowing what a Firestore
+   * document is; the server wires the two together.
+   *
+   * Must not throw and must not block — the caller does not await it.
+   */
+  readonly onReached?: (() => void) | undefined;
+}
+
+/**
+ * Build the user message: the request for context, then the answer to judge.
+ *
+ * Both texts pass through `neutralizePlaceholders`, so the "no `⟦…⟧` reaches the
+ * judge" guarantee covers the context exactly as it covers the answer. The
+ * masked prompt is PII-free by construction — it is the string that crossed the
+ * boundary to Core — and the counts are category names only.
+ *
+ * Exported so a test can assert the shape without a model.
+ */
+export function buildJudgeMessage(text: string, context?: LeakJudgeContext): string {
+  const answer = neutralizePlaceholders(text);
+  if (context === undefined) return `## Answer to judge\n\n${answer}`;
+
+  const prompt = neutralizePlaceholders(context.maskedPrompt);
+  // Truncated rather than dropped: the opening carries the task description that
+  // makes the answer legible, and the tail is rarely what explains it. The marker
+  // stops the model reading the cut as the request ending there.
+  const isTruncated = prompt.length > JUDGE_PROMPT_CONTEXT_LIMIT;
+  const shownPrompt = isTruncated
+    ? `${prompt.slice(0, JUDGE_PROMPT_CONTEXT_LIMIT)}\n[… request truncated for length …]`
+    : prompt;
+
+  const counts = Object.entries(context.maskedCounts)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([category, count]) => `${category}: ${count}`)
+    .join(', ');
+  const summary = counts === '' ? 'nothing was masked in this exchange' : counts;
+
+  return `## The request this answers (already masked)
+
+${shownPrompt}
+
+## What was masked out of this exchange
+
+${summary}
+
+## Answer to judge
+
+${answer}`;
 }
 
 /**
@@ -84,10 +182,16 @@ export interface JudgeOptions {
  * unusable answer blocks the release, `leak: false` adds no trust whatsoever.
  * The deterministic attester remains the only thing that can pass a response.
  *
- * The text is stripped of every well-formed placeholder first, so the question
- * the model actually answers is "does the residual prose contain personal
- * data". Placeholders are not leaks by construction and the attester has
- * already checked them; leaving them in made the judge veto its own masking.
+ * Every well-formed placeholder is replaced with a neutral marker first, so the
+ * question the model actually answers is "does this prose contain a real value".
+ * Placeholders are not leaks by construction and the attester has already
+ * checked them; leaving them in made the judge veto its own masking.
+ *
+ * Why replace rather than strip, as this did until now: a stripped answer is a
+ * sentence with holes in it, and a model asked to audit it infers what the holes
+ * held — which is how the judge came to flag nearly every masked answer while
+ * naming no category. `[masked email]` says the same thing the gap said, without
+ * inviting the inference.
  *
  * The endpoint is called directly rather than through a runner because a single
  * JSON classification needs no session, no tools and no event stream.
@@ -97,6 +201,7 @@ export function createLeakJudge(
 ): (
   text: string,
   signal?: AbortSignal,
+  context?: LeakJudgeContext,
 ) => Promise<{ leak: boolean | null; categories?: readonly string[] }> {
   const baseUrl = (
     options.baseUrl ??
@@ -121,12 +226,12 @@ export function createLeakJudge(
     return { ...base, authorization: `Bearer ${apiKey}` };
   };
 
-  return async (text: string, signal?: AbortSignal) => {
-    // Placeholders are removed here, at the one place that talks to the model,
-    // rather than at the call site: the guarantee is "the judge never sees a
-    // placeholder", and a guarantee enforced at the boundary cannot be lost by
-    // a future second caller that forgets to strip.
-    const residual = stripPlaceholders(text);
+  return async (text: string, signal?: AbortSignal, context?: LeakJudgeContext) => {
+    // Placeholders are neutralized here, at the one place that talks to the
+    // model, rather than at the call site: the guarantee is "the judge never
+    // sees a placeholder", and a guarantee enforced at the boundary cannot be
+    // lost by a future second caller that forgets to apply it.
+    const userMessage = buildJudgeMessage(text, context);
 
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -151,7 +256,7 @@ export function createLeakJudge(
           model,
           messages: [
             { role: 'system', content: JUDGE_PROMPT },
-            { role: 'user', content: residual },
+            { role: 'user', content: userMessage },
           ],
           response_format: { type: 'json_object' },
           // Deterministic generation. The verdict can block a release, so the
@@ -162,6 +267,11 @@ export function createLeakJudge(
         }),
         signal: controller.signal,
       });
+
+      // Gemma answered, so it is demonstrably resident. Recorded before the body
+      // is read and regardless of the verdict: a non-200 from a running service
+      // still proves the GPU is up, which is the only thing this signal claims.
+      options.onReached?.();
 
       if (!response.ok) {
         return { leak: null };

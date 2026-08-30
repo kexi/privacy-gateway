@@ -17,6 +17,7 @@ import {
   rehydrate,
   rehydrateWithPolicy,
   SessionTokenizer,
+  neutralizePlaceholders,
   stripPlaceholders,
   tokenize,
   type Detection,
@@ -250,5 +251,52 @@ describe('disclosure policy on release', () => {
     expect(withheldCategories('api_key, jwt')).not.toContain('API_KEY');
     expect(withheldCategories('api_key, jwt')).not.toContain('JWT');
     expect(withheldCategories('')).toEqual([...DEFAULT_WITHHELD_CATEGORIES]);
+  });
+});
+
+describe('neutralizing placeholders for the advisory judge', () => {
+  it('replaces every placeholder with a readable marker naming its category', () => {
+    expect(neutralizePlaceholders('Dear ⟦PERSON_1⟧, we wrote to ⟦EMAIL_1⟧.')).toBe(
+      'Dear [masked person], we wrote to [masked email].',
+    );
+  });
+
+  it('leaves a grammatical sentence rather than holes', () => {
+    // The point of replacing instead of stripping: a model asked to audit a
+    // gap-riddled sentence infers what the gaps held, which is what made the
+    // judge flag nearly every masked answer while naming no category.
+    const neutralized = neutralizePlaceholders('Charge on ⟦CREDIT_CARD_1⟧ failed.');
+    expect(neutralized).toBe('Charge on [masked credit card] failed.');
+    expect(neutralized).not.toMatch(/\s{2,}/u);
+  });
+
+  it('renders a multi-word category readably', () => {
+    expect(neutralizePlaceholders('⟦PHONE_NUMBER_3⟧')).toBe('[masked phone number]');
+  });
+
+  it('leaks no placeholder syntax to the judge', () => {
+    // The guarantee the judge depends on: no ⟦…⟧ survives, so it cannot reason
+    // about the masking syntax instead of the content.
+    const neutralized = neutralizePlaceholders('a ⟦EMAIL_1⟧ b ⟦PERSON_2⟧ c');
+    expect(neutralized).not.toContain('⟦');
+    expect(neutralized).not.toContain('⟧');
+  });
+
+  it('leaves text that merely resembles a placeholder', () => {
+    // Same rule as stripping: only the form this system mints is provably a
+    // mask, so a near-miss still reaches the judge rather than being hidden.
+    const text = '⟦EMAIL⟧ ⟦email_1⟧ ⟦EMAIL_1';
+    expect(neutralizePlaceholders(text)).toBe(text);
+  });
+
+  it('keeps a real value visible, so a genuine leak still reaches the judge', () => {
+    const text = 'Write to taro@example.co.jp about ⟦PERSON_1⟧.';
+    expect(neutralizePlaceholders(text)).toContain('taro@example.co.jp');
+  });
+
+  it('is deterministic across calls, despite the shared global regex', () => {
+    // A verdict must not depend on which call rendered the text.
+    const text = 'a ⟦EMAIL_1⟧ b ⟦EMAIL_2⟧';
+    expect(neutralizePlaceholders(text)).toBe(neutralizePlaceholders(text));
   });
 });

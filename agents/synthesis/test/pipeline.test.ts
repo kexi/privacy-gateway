@@ -255,6 +255,139 @@ describe('the Gemma judge, applied asymmetrically', () => {
   });
 });
 
+/** A judge whose verdicts are scripted per call, so a retry is observable. */
+function scriptedJudge(...verdicts: Array<{ leak: boolean | null; categories?: string[] }>) {
+  const calls: number[] = [];
+  const judge = () => {
+    const index = calls.length;
+    calls.push(index);
+    return Promise.resolve(verdicts[index] ?? verdicts.at(-1) ?? { leak: null });
+  };
+  return { judge, callCount: () => calls.length };
+}
+
+describe('the judge is given safe context by the pipeline', () => {
+  it('hands it the masked prompt and the masked category counts', async () => {
+    let seen: { maskedPrompt: string; maskedCounts: Record<string, number> } | undefined;
+
+    await run('Dear ⟦PERSON_1⟧.', {
+      judge: (_text, _signal, context) => {
+        seen = context as typeof seen;
+        return Promise.resolve({ leak: false });
+      },
+    });
+
+    expect(seen?.maskedPrompt).toBe(MASKED_PROMPT);
+    // Counted from the mapping's keys, so the categories are reported without
+    // any value on the other side of the mapping being read.
+    expect(seen?.maskedCounts).toEqual({ PERSON: 1, EMAIL: 1 });
+  });
+
+  it('never puts a mapping value in the context', async () => {
+    let seen: { maskedPrompt: string; maskedCounts: Record<string, number> } | undefined;
+
+    await run('Dear ⟦PERSON_1⟧.', {
+      judge: (_text, _signal, context) => {
+        seen = context as typeof seen;
+        return Promise.resolve({ leak: false });
+      },
+    });
+
+    const serialized = JSON.stringify(seen);
+    expect(serialized).not.toContain('Taro Yamada');
+    expect(serialized).not.toContain('taro@example.co.jp');
+  });
+});
+
+describe('the judge is re-asked once, and only for an unevidenced flag', () => {
+  it('releases when a categoryless flag clears on the second look', async () => {
+    const { judge, callCount } = scriptedJudge({ leak: true, categories: [] }, { leak: false });
+
+    const result = await run('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(callCount()).toBe(2);
+    expect(result.answer).toContain('Taro Yamada');
+    // The audit record says the release needed a second look: a pass on retry is
+    // a materially weaker claim than a pass outright, and hiding that would
+    // overstate what was checked.
+    expect(result.attestation.judge_retries).toBe(1);
+  });
+
+  it('refuses when the second look flags it too', async () => {
+    const { judge, callCount } = scriptedJudge(
+      { leak: true, categories: [] },
+      { leak: true, categories: [] },
+    );
+
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(callCount()).toBe(2);
+    expect(error.kind).toBe('judge_flagged');
+    expect(error.status).toBe(422);
+  });
+
+  it('refuses immediately when the flag names a category, without re-asking', async () => {
+    // A flag with evidence is a specific suspicion. Re-rolling until it goes
+    // away is how a probabilistic veto gets laundered into a pass.
+    const { judge, callCount } = scriptedJudge({ leak: true, categories: ['PERSON'] });
+
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(callCount()).toBe(1);
+    expect(error.kind).toBe('judge_flagged');
+  });
+
+  it('never re-asks when the deterministic attester already failed', async () => {
+    // The attester gate refuses before the judge runs at all, so a retry here
+    // could not change the outcome and must not be spent.
+    const { judge, callCount } = scriptedJudge({ leak: true, categories: [] }, { leak: false });
+
+    const error = await refusal('Contact them at leaked.person@example.com.', { judge });
+
+    expect(error.kind).toBe('leak_check_failed');
+    expect(callCount()).toBe(0);
+  });
+
+  it('refuses immediately when the judge is unavailable, without re-asking', async () => {
+    const { judge, callCount } = scriptedJudge({ leak: null });
+
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(callCount()).toBe(1);
+    expect(error.kind).toBe('judge_unavailable');
+  });
+
+  it('keeps refusing when the retry itself comes back unusable', async () => {
+    // An unusable second answer is not an improvement on an unevidenced flag, so
+    // the original verdict stands rather than being downgraded.
+    const { judge } = scriptedJudge({ leak: true, categories: [] }, { leak: null });
+
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(error.kind).toBe('judge_flagged');
+  });
+
+  it('records no retry count on a release that passed outright', async () => {
+    const result = await run('Dear ⟦PERSON_1⟧.', {
+      judge: () => Promise.resolve({ leak: false }),
+    });
+
+    expect(result.attestation.judge_retries).toBeUndefined();
+  });
+
+  it('still adds no trust when the retry clears it', async () => {
+    // The asymmetry is unchanged: a judge may veto a release, never vouch for
+    // one. The tier still comes from the deterministic attester alone.
+    const { judge } = scriptedJudge({ leak: true, categories: [] }, { leak: false });
+
+    const retried = await run('Dear ⟦PERSON_1⟧.', { judge });
+    const plain = await run('Dear ⟦PERSON_1⟧.');
+
+    expect(retried.trustTier).toBe(plain.trustTier);
+    expect(retried.dimensions.policy_verdict).toBe(plain.dimensions.policy_verdict);
+  });
+});
+
 describe('unresolved tokens', () => {
   it('refuses rather than showing the user a stray symbol', async () => {
     const error = await refusal('See ⟦PERSON_1⟧ and ⟦PHONE_9⟧.', {

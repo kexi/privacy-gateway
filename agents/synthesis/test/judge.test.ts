@@ -7,14 +7,20 @@
  * attester passed them (docs/proof/openai-compat.md). Placeholders are the
  * evidence that masking worked, so the judge was vetoing its own masking.
  *
- * The fix is deterministic rather than a prompt tweak: placeholders are removed
- * before the model sees the text, so the question it answers is only ever "does
- * the residual prose contain personal data". These tests assert the text that
- * actually reaches the wire, because that is the part a prompt cannot promise.
+ * The fix is deterministic rather than a prompt tweak: placeholders are replaced
+ * with neutral markers before the model sees the text, so the question it
+ * answers is only ever "does this prose contain a real value". These tests
+ * assert the text that actually reaches the wire, because that is the part a
+ * prompt cannot promise.
+ *
+ * The replacement supersedes an earlier fix that deleted placeholders outright.
+ * Deleting left a sentence full of gaps, and a model asked to audit one infers
+ * what the gaps held — so the false positives it was meant to stop persisted at
+ * a lower rate. A marker says the same thing without inviting the inference.
  */
 
 import { describe, expect, it } from 'vitest';
-import { createLeakJudge } from '../src/agent.ts';
+import { buildJudgeMessage, createLeakJudge, JUDGE_PROMPT_CONTEXT_LIMIT } from '../src/agent.ts';
 
 /** The masked shape Core really returns: prose with placeholders in it. */
 const MASKED_ANSWER =
@@ -44,7 +50,7 @@ function userContent(body: { messages: Array<{ role: string; content: string }> 
 }
 
 describe('the judge never sees a placeholder', () => {
-  it('strips every well-formed placeholder before the model is asked', async () => {
+  it('replaces every well-formed placeholder before the model is asked', async () => {
     const { fetchImpl, bodies } = recordingFetch({ leak: false });
     const judge = createLeakJudge({ baseUrl: 'http://gemma.test/v1', auth: 'none', fetchImpl });
 
@@ -116,5 +122,94 @@ describe('stripping does not weaken the judge', () => {
     const judge = createLeakJudge({ baseUrl: 'http://gemma.test/v1', auth: 'none', fetchImpl });
 
     expect(await judge(MASKED_ANSWER)).toEqual({ leak: null });
+  });
+});
+
+describe('the judge is given context, not a text in a vacuum', () => {
+  const CONTEXT = {
+    maskedPrompt: 'Reply to ⟦PERSON_1⟧ at ⟦EMAIL_1⟧ about the failed charge.',
+    maskedCounts: { EMAIL: 1, PERSON: 1 },
+  };
+
+  it('shows the request, the masked counts, and the answer', () => {
+    const message = buildJudgeMessage(MASKED_ANSWER, CONTEXT);
+
+    expect(message).toContain('## The request this answers (already masked)');
+    expect(message).toContain('## What was masked out of this exchange');
+    expect(message).toContain('## Answer to judge');
+    // Counts are safe metadata: the categories are already public in the
+    // placeholders, the OKF document and the API response.
+    expect(message).toContain('EMAIL: 1, PERSON: 1');
+  });
+
+  it('neutralizes the context prompt too, so no placeholder reaches the judge', () => {
+    // The guarantee has to cover the context exactly as it covers the answer,
+    // or the context becomes the hole in it.
+    const message = buildJudgeMessage(MASKED_ANSWER, CONTEXT);
+
+    expect(message).not.toContain('⟦');
+    expect(message).toContain('[masked person]');
+    expect(message).toContain('[masked email]');
+  });
+
+  it('truncates a long request and says that it did', () => {
+    const message = buildJudgeMessage(MASKED_ANSWER, {
+      maskedPrompt: 'x'.repeat(JUDGE_PROMPT_CONTEXT_LIMIT + 500),
+      maskedCounts: {},
+    });
+
+    expect(message).toContain('[… request truncated for length …]');
+    // The marker stops the model reading the cut as the request ending there.
+    expect(message.length).toBeLessThan(JUDGE_PROMPT_CONTEXT_LIMIT + 500);
+  });
+
+  it('says so plainly when nothing was masked', () => {
+    const message = buildJudgeMessage('An ordinary answer.', {
+      maskedPrompt: 'An ordinary request.',
+      maskedCounts: {},
+    });
+
+    expect(message).toContain('nothing was masked in this exchange');
+  });
+
+  it('still works without context, for a caller that supplies none', () => {
+    const message = buildJudgeMessage(MASKED_ANSWER);
+
+    expect(message).toContain('## Answer to judge');
+    expect(message).not.toContain('## The request this answers');
+    expect(message).not.toContain('⟦');
+  });
+
+  it('is deterministic, so a verdict cannot depend on the rendering', () => {
+    expect(buildJudgeMessage(MASKED_ANSWER, CONTEXT)).toBe(
+      buildJudgeMessage(MASKED_ANSWER, CONTEXT),
+    );
+  });
+
+  it('puts the context on the wire when the pipeline supplies it', async () => {
+    const { fetchImpl, bodies } = recordingFetch({ leak: false });
+    const judge = createLeakJudge({ baseUrl: 'http://gemma.test/v1', auth: 'none', fetchImpl });
+
+    await judge(MASKED_ANSWER, undefined, CONTEXT);
+
+    const shown = userContent(bodies()[0]!);
+    expect(shown).toContain('about the failed charge');
+    expect(shown).toContain('EMAIL: 1');
+  });
+
+  it('still flags a real value that survives alongside the context', async () => {
+    // Context must not blunt the judge: an actual value is still in front of it
+    // and its verdict still blocks the release.
+    const { fetchImpl, bodies } = recordingFetch({ leak: true, categories: ['EMAIL'] });
+    const judge = createLeakJudge({ baseUrl: 'http://gemma.test/v1', auth: 'none', fetchImpl });
+
+    const verdict = await judge(
+      'Refund sent to ⟦PERSON_1⟧ at real.person@example.com',
+      undefined,
+      CONTEXT,
+    );
+
+    expect(userContent(bodies()[0]!)).toContain('real.person@example.com');
+    expect(verdict.leak).toBe(true);
   });
 });

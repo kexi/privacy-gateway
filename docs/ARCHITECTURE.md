@@ -114,6 +114,25 @@ be the reason one is trusted. It runs at temperature 0 for reproducibility and n
 sees the rehydrated body — only the masked (still-tokenized) response — so it cannot
 itself become a channel for real PII.
 
+**What it is shown.** Placeholders are replaced with readable neutral markers
+(`⟦EMAIL_1⟧` → `[masked email]`) rather than deleted, and the answer travels with the
+masked prompt it answers (truncated at 2000 characters) plus the per-category counts of
+what was masked. All of it is PII-free by construction — the prompt is the string that
+crossed the boundary, the categories are already public in the placeholders and the OKF
+document, and no mapping value is read. Why not the earlier deletion: a gap-riddled
+sentence made the model infer what the gaps held, which is exactly how it came to flag
+nearly every masked answer while naming no category. The retry above remains as a
+backstop for whatever survives the better input.
+
+One narrow exception exists to the "a flag blocks" rule: when the judge flags a leak while
+naming **no** category, over a body the deterministic attester has already passed, it is
+re-asked exactly once, and a clear second answer releases the request with
+`attestation.judge_retries: 1` recorded in the OKF document and a `judge.retry` log event.
+A flag that names categories is a specific suspicion and is never retried; an unavailable
+judge is never retried either; and the retry is capped at one, because beyond two attempts
+"the first answer was noise" is indistinguishable from re-rolling until the gate lets the
+request through. The asymmetry is unchanged — a cleared retry still adds no trust.
+
 ### Pseudonymization, not anonymization
 
 Masking here is pseudonymization, not anonymization or de-identification, and the

@@ -15,6 +15,7 @@
 import {
   AskRequestSchema,
   authorizedFetch,
+  buildActivityStore,
   buildVault,
   contextFromHeaders,
   createLogger,
@@ -23,6 +24,7 @@ import {
   initTelemetry,
   IdTokenError,
   loadConfig,
+  recordGemmaActivity,
   UnknownAudienceError,
   PiiLeakError,
   ReleaseRefusalSchema,
@@ -33,10 +35,12 @@ import {
   uuidv7,
   withContext,
   withSpan,
+  type ActivityStore,
   type AskResponse,
   type Config,
   type Detection,
   type Logger,
+  type ProgressEvent,
   type SynthesizeResponse,
   type TokenVault,
 } from '@privacy-gateway/common';
@@ -54,6 +58,8 @@ import {
   writeSseCompletion,
 } from './openai_compat.ts';
 import { ask, RequestAbortedError, ReservedSyntaxError, type AskResult } from './pipeline.ts';
+import { StatusCache } from './status.ts';
+import { wakeGemma } from './warmup.ts';
 
 /** Cloud Run injects PORT. Locally 8081 sits between web (5173) and core (8082). */
 const DEFAULT_PORT = 8081;
@@ -106,6 +112,15 @@ export interface CreateAppOptions {
     | ((text: string, signal?: AbortSignal) => Promise<Detection[]>)
     | undefined;
   readonly vault?: TokenVault | undefined;
+  /**
+   * Where Gemma's last-seen timestamp is kept.
+   *
+   * Injected by tests so the warm/cold badge can be driven without Firestore,
+   * and so the "a failing store never fails a request" guarantee is testable.
+   */
+  readonly activityStore?: ActivityStore | undefined;
+  /** Injected by the warmup test so no GPU is ever poked from a suite. */
+  readonly wakeGemmaImpl?: (() => Promise<boolean>) | undefined;
   /** Injectable clock so the rate-limit test does not sleep. */
   readonly now?: (() => number) | undefined;
   /**
@@ -174,6 +189,8 @@ export function createApp(options: CreateAppOptions): express.Application {
   const coreBase = config.CORE_BASE_URL ?? 'http://localhost:8082';
   const now = options.now ?? Date.now;
   const limiter = new RateLimiter(config.rateLimitPerMinute, now);
+  const activityStore = options.activityStore ?? buildActivityStore(config.VAULT_BACKEND);
+  const statusCache = new StatusCache(activityStore, 5_000, now);
 
   const app = express();
   app.use(express.json({ limit: config.maxBodyBytes }));
@@ -200,6 +217,17 @@ export function createApp(options: CreateAppOptions): express.Application {
 
   app.post('/v1/ask', (req, res, next) => {
     void handleAsk(req, res, next);
+  });
+
+  // Public, unauthenticated and deliberately cheap: it reads a cached timestamp
+  // and never touches Gemma, so a page that polls it cannot wake a GPU. See
+  // `status.ts`.
+  app.get('/v1/status', (req, res) => {
+    void handleStatus(req, res);
+  });
+
+  app.post('/v1/warmup', (req, res) => {
+    void handleWarmup(req, res);
   });
 
   // The OpenAI-compatible façade. Same gates, same vault discipline; only the
@@ -305,7 +333,12 @@ export function createApp(options: CreateAppOptions): express.Application {
    * gate, the cancellation semantics and the span structure are defined once, and
    * only the response shaping differs between the two callers.
    */
-  async function runAsk(req: Request, context: RequestContext, text: string): Promise<AskResult> {
+  async function runAsk(
+    req: Request,
+    context: RequestContext,
+    text: string,
+    onProgress?: (event: ProgressEvent) => void,
+  ): Promise<AskResult> {
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
     const routePath = req.path === '/v1/chat/completions' ? '/v1/chat/completions' : '/v1/ask';
 
@@ -355,15 +388,23 @@ export function createApp(options: CreateAppOptions): express.Application {
                 coreActor,
                 extractSpans:
                   options.extractSpans ??
-                  ((spanText) =>
-                    extractUnstructured(spanText, {
+                  (async (spanText) => {
+                    const spans = await extractUnstructured(spanText, {
                       logger: scoped,
                       model: config.GEMMA_MODEL,
                       baseUrl: config.GEMMA_BASE_URL,
                       apiKey: config.GEMMA_API_KEY,
                       ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
-                    })),
+                    });
+                    // Stamped only on success, and only after the call returned:
+                    // a failed extraction proves nothing about whether Gemma is
+                    // resident, and recording it would produce a `warm` badge
+                    // for a service that is refusing every request.
+                    recordGemmaActivity(activityStore);
+                    return spans;
+                  }),
                 logger: scoped,
+                ...(onProgress !== undefined ? { onProgress } : {}),
               });
 
               scoped.event('request.end', {
@@ -463,6 +504,65 @@ export function createApp(options: CreateAppOptions): express.Application {
       );
   }
 
+  /**
+   * Report whether Gemma is expected to be resident.
+   *
+   * Never 500s and never fails closed: a status endpoint is wanted most when the
+   * fleet is unhealthy, and `unknown` is a truthful answer that `StatusCache`
+   * already produces for an unreachable store. The short cache header lets a
+   * browser and any intermediary collapse a burst of polls.
+   */
+  async function handleStatus(_req: Request, res: Response): Promise<void> {
+    const status = await statusCache.read();
+    res.setHeader('Cache-Control', 'public, max-age=5');
+    res.status(200).json(status);
+  }
+
+  /**
+   * Start the GPU on request.
+   *
+   * Answers immediately rather than waiting for the wake to land: a cold start
+   * outlives any reasonable HTTP timeout, so `{started: true}` reports that the
+   * request was dispatched, not that Gemma is ready. The client re-polls
+   * `/v1/status` to find out.
+   *
+   * Rate-limited on the same counter as `/v1/ask`, because this is the one
+   * endpoint that can spend GPU money without producing an answer — an
+   * unthrottled public button that starts an L4 is a billing incident.
+   */
+  async function handleWarmup(req: Request, res: Response): Promise<void> {
+    const context = contextOf(req);
+    if (context === undefined) {
+      res.status(500).json({ error: 'internal_error' });
+      return;
+    }
+    if (rateLimited(req, res, context)) return;
+
+    context.logger.event('warmup.requested', {});
+
+    const wake =
+      options.wakeGemmaImpl ??
+      (() =>
+        wakeGemma({
+          baseUrl: config.GEMMA_BASE_URL,
+          apiKey: config.GEMMA_API_KEY,
+          ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+        }));
+
+    // Deliberately not awaited. The instance keeps booting after this promise
+    // settles either way, and holding the response open for two minutes would
+    // trip every proxy between here and the browser.
+    void wake().catch(() => {
+      // A failed probe is the expected outcome against a cold instance; the
+      // container is starting regardless, which is the point of the call.
+    });
+
+    // The next poll should reach the store rather than a verdict computed before
+    // the wake was dispatched.
+    statusCache.invalidate();
+    res.status(202).json({ started: true });
+  }
+
   async function handleAsk(req: Request, res: Response, next: NextFunction): Promise<void> {
     const context = contextOf(req);
     if (context === undefined) return next();
@@ -483,10 +583,92 @@ export function createApp(options: CreateAppOptions): express.Application {
       return;
     }
 
+    // Content negotiation, not a body flag: asking for a different *media type*
+    // of the same resource is what `Accept` is for, and keeping it out of the
+    // body means `AskRequestSchema` stays strict and a client that cannot stream
+    // is unaffected.
+    const wantsStream = /text\/event-stream/u.test(req.headers.accept ?? '');
+    if (wantsStream) {
+      await handleAskStream(req, res, context, parsed.data.text);
+      return;
+    }
+
     try {
       res.json(toPayload(await runAsk(req, context, parsed.data.text)));
     } catch (error) {
       handleAskError(error, res, context);
+    }
+  }
+
+  /**
+   * `/v1/ask` as a progress stream.
+   *
+   * Same pipeline, same gates, same deadline — the only difference is that the
+   * stage transitions reach the client as they happen instead of being
+   * discarded. The terminal frame carries exactly the body the JSON path would
+   * have sent, so a streaming client and a non-streaming one end up with
+   * identical facts.
+   *
+   * Why the status code is always 200: the headers are flushed with the first
+   * progress frame, long before the pipeline knows whether it will refuse. A
+   * refusal therefore arrives as an `event: refused` frame carrying the status
+   * it *would* have had, and clients are told to read that rather than the HTTP
+   * code. Buffering the whole response to preserve the status would defeat the
+   * purpose of streaming at all.
+   */
+  async function handleAskStream(
+    req: Request,
+    res: Response,
+    context: RequestContext,
+    text: string,
+  ): Promise<void> {
+    res.status(200);
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+    res.setHeader('cache-control', 'no-cache');
+    res.setHeader('connection', 'keep-alive');
+    // Cloud Run and any nginx in between will otherwise hold the whole stream
+    // until it closes, which would deliver every progress frame at once.
+    res.setHeader('x-accel-buffering', 'no');
+    res.flushHeaders?.();
+
+    const send = (event: string, payload: unknown): void => {
+      if (res.writableEnded) return;
+      res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    try {
+      const result = await runAsk(req, context, text, (progress) => {
+        send('progress', progress);
+      });
+      send('result', toPayload(result));
+    } catch (error) {
+      const classified = classifyAskError(error);
+
+      context.logger.event(
+        classified.event,
+        {
+          ...(classified.refusal !== undefined ? { refusal: classified.refusal } : {}),
+          ...(classified.errorCode !== undefined ? { error_code: classified.errorCode } : {}),
+          ...(classified.errorClass !== undefined ? { error_class: classified.errorClass } : {}),
+          ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
+        },
+        classified.severity,
+      );
+
+      // The same body the JSON path sends, plus the status it would have used —
+      // the HTTP code is already committed to 200 by the time this is known.
+      send('refused', {
+        error: classified.code,
+        ...(classified.exposeMessage ? { message: classified.message } : {}),
+        ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
+        request_id: context.requestId,
+        status: classified.status,
+      });
+    } finally {
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
     }
   }
 

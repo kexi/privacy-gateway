@@ -104,6 +104,15 @@ export const AttestationSchema = z
     unresolved_tokens: z.array(z.string()).optional(),
     /** Categories left masked on purpose by the disclosure policy. */
     withheld: z.array(PiiCategorySchema).optional(),
+    /**
+     * How many times the advisory judge was re-asked before this verdict.
+     *
+     * Present only when a re-ask happened, and capped at one by the pipeline. It
+     * is recorded because a release that passed only on the second look is a
+     * materially weaker claim than one that passed outright, and an audit record
+     * that hid the difference would overstate what was checked.
+     */
+    judge_retries: z.number().int().min(0).optional(),
   })
   .passthrough();
 export type Attestation = z.infer<typeof AttestationSchema>;
@@ -264,6 +273,82 @@ export const HealthResponseSchema = z.object({
 });
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 
+// --- Fleet status -------------------------------------------------------------
+
+/**
+ * Whether the GPU-backed Gemma service is currently expected to be resident.
+ *
+ * `unknown` is a first-class answer, not an error: the state is inferred from a
+ * recorded timestamp, and when that record cannot be read the honest report is
+ * that nobody knows. Guessing `cold` would be a claim the gateway has not
+ * earned, and guessing `warm` would promise a fast response it cannot deliver.
+ */
+export const GemmaWarmthSchema = z.enum(['warm', 'cold', 'unknown']);
+export type GemmaWarmth = z.infer<typeof GemmaWarmthSchema>;
+
+/**
+ * The public status document.
+ *
+ * Deliberately tiny and free of anything request-derived: this endpoint
+ * authenticates nobody, so every field here is world-readable by design. A
+ * timestamp of the fleet's last activity and a fixed cold-start estimate reveal
+ * nothing about who asked what.
+ */
+export const StatusResponseSchema = z.object({
+  gemma: GemmaWarmthSchema,
+  /** Absent when nothing was ever recorded, or when the store was unreachable. */
+  last_active_at: z.string().optional(),
+  cold_start_estimate_seconds: z.number(),
+});
+export type StatusResponse = z.infer<typeof StatusResponseSchema>;
+
+/** The reply to `POST /v1/warmup`: the wake was dispatched, not that it finished. */
+export const WarmupResponseSchema = z.object({
+  started: z.literal(true),
+});
+export type WarmupResponse = z.infer<typeof WarmupResponseSchema>;
+
+// --- Progress streaming (SSE on POST /v1/ask) ---------------------------------
+
+/**
+ * The pipeline stages a caller may be told about.
+ *
+ * These name *phases*, never content. The list is closed and lives here rather
+ * than being derived from the pipeline's internals, so a new step cannot start
+ * leaking a stage name that describes the request rather than the machinery.
+ *
+ * `gpu_wakeup` is emitted only when the fleet was cold on arrival: it explains a
+ * two-minute wait that would otherwise look like a hang.
+ */
+export const ProgressStageSchema = z.enum([
+  'gpu_wakeup',
+  'masking',
+  'egress_guard',
+  'core_reasoning',
+  'leak_check',
+  'rehydrate',
+]);
+export type ProgressStage = z.infer<typeof ProgressStageSchema>;
+
+/**
+ * One progress frame.
+ *
+ * `stage` plus elapsed milliseconds and nothing else. There is no field here
+ * that could carry prompt text, an answer fragment, a placeholder or a category
+ * — the whole point of the fleet is that intermediate state stays inside the
+ * boundary, and a progress channel is exactly where that discipline would be
+ * easiest to lose.
+ */
+export const ProgressEventSchema = z
+  .object({
+    stage: ProgressStageSchema,
+    elapsed_ms: z.number(),
+    /** `start` opens a stage, `end` closes it; a UI can time each step from the pair. */
+    state: z.enum(['start', 'end']),
+  })
+  .strict();
+export type ProgressEvent = z.infer<typeof ProgressEventSchema>;
+
 // --- OpenAI-compatible surface -----------------------------------------------
 
 /**
@@ -373,6 +458,19 @@ export const ErrorResponseSchema = z.object({
   categories: z.array(PiiCategorySchema).optional(),
 });
 export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
+
+/**
+ * A refusal delivered inside an SSE stream.
+ *
+ * Identical to `ErrorResponseSchema` plus the HTTP status the request would have
+ * carried. The status has to travel in the body because the response code is
+ * already committed to 200 by the time the first progress frame is flushed, and
+ * a streaming client must still be able to tell a 400 from a 502.
+ */
+export const StreamRefusalSchema = ErrorResponseSchema.extend({
+  status: z.number().optional(),
+});
+export type StreamRefusal = z.infer<typeof StreamRefusalSchema>;
 
 // --- synthesis HTTP API ------------------------------------------------------
 

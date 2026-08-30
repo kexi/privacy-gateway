@@ -12,12 +12,16 @@
 
 import {
   ApiError,
-  ask,
+  askStreaming,
   deriveTrustTier,
   extractVerified,
   logsConsoleUrl,
+  fleetStatus,
   traceConsoleUrl,
+  warmup,
   type AskResponse,
+  type GemmaWarmth,
+  type ProgressStage,
   type TrustTier,
 } from './api.ts';
 // eslint-disable-next-line import/no-unassigned-import -- Vite bundles the stylesheet via this side-effect import
@@ -48,8 +52,231 @@ const attestationPane = el<HTMLDivElement>('attestation');
 const statsPane = el<HTMLDivElement>('stats');
 const okfPane = el<HTMLPreElement>('okf');
 const correlationPane = el<HTMLDivElement>('correlation');
+const gpuBadge = el<HTMLSpanElement>('gpu-badge');
+const gpuNote = el<HTMLParagraphElement>('gpu-note');
+const warmupButton = el<HTMLButtonElement>('warmup');
+const progressPane = el<HTMLElement>('progress');
+const stepsList = el<HTMLOListElement>('steps');
 
 input.value = SAMPLE;
+
+// --- GPU warmth --------------------------------------------------------------
+
+/** How often the badge is refreshed while the tab is visible. */
+const STATUS_POLL_MS = 30_000;
+
+/** The last state the badge showed, used to decide whether to warn before a submit. */
+let gemmaWarmth: GemmaWarmth = 'unknown';
+let coldStartSeconds = 120;
+
+const WARMTH_LABEL: Record<GemmaWarmth, string> = {
+  warm: 'GPU: warm',
+  cold: 'GPU: cold',
+  unknown: 'GPU: unknown',
+};
+
+/**
+ * Refresh the badge.
+ *
+ * `fleetStatus` never rejects, so there is no error path here: an unreachable
+ * gateway shows `unknown`, which is what the server would have said anyway.
+ */
+async function refreshStatus(): Promise<void> {
+  const status = await fleetStatus();
+  gemmaWarmth = status.gemma;
+  coldStartSeconds = status.cold_start_estimate_seconds;
+
+  gpuBadge.dataset['state'] = status.gemma;
+  gpuBadge.textContent = WARMTH_LABEL[status.gemma];
+
+  const minutes = Math.round(coldStartSeconds / 60);
+  if (status.gemma === 'cold') {
+    gpuNote.textContent = `The GPU is asleep — the first request may take about ${minutes} minutes while it starts.`;
+    gpuNote.hidden = false;
+  } else if (status.gemma === 'unknown') {
+    gpuNote.textContent =
+      'The GPU state could not be read, so the first request may or may not need a cold start.';
+    gpuNote.hidden = false;
+  } else {
+    gpuNote.hidden = true;
+  }
+}
+
+/**
+ * Poll only while the tab is visible.
+ *
+ * A background tab polling a public endpoint every 30s costs the fleet reads for
+ * a badge nobody is looking at; the state is refreshed on the way back instead.
+ */
+function startStatusPolling(): void {
+  let timer: ReturnType<typeof setInterval> | undefined;
+
+  const stop = (): void => {
+    if (timer !== undefined) clearInterval(timer);
+    timer = undefined;
+  };
+
+  const start = (): void => {
+    if (timer !== undefined) return;
+    timer = setInterval(() => {
+      void refreshStatus();
+    }, STATUS_POLL_MS);
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stop();
+      return;
+    }
+    void refreshStatus();
+    start();
+  });
+
+  void refreshStatus();
+  start();
+}
+
+warmupButton.addEventListener('click', () => {
+  warmupButton.disabled = true;
+  gpuNote.textContent = 'Starting the GPU… it is billed for as long as it stays running.';
+  gpuNote.hidden = false;
+
+  warmup()
+    .then(async () => {
+      // The wake was dispatched, not completed: the badge only flips once a real
+      // Gemma call has been recorded, so it is re-polled rather than assumed.
+      await refreshStatus();
+      return true;
+    })
+    .catch(() => {
+      gpuNote.textContent = 'The warm-up request was refused. Try again in a moment.';
+    })
+    .finally(() => {
+      warmupButton.disabled = false;
+    });
+});
+
+// --- Pipeline progress --------------------------------------------------------
+
+/**
+ * The steps a user sees, in the order they happen.
+ *
+ * `gpu_wakeup` is not in this list: it is prepended only when the fleet was cold
+ * at submit time, because a step that is always displayed and usually instant
+ * teaches the reader to ignore it.
+ */
+const STEP_LABELS: Record<ProgressStage, string> = {
+  gpu_wakeup: 'Starting the GPU (up to ~2 min)',
+  masking: 'Masking PII (Gemma)',
+  egress_guard: 'Egress guard',
+  core_reasoning: 'Reasoning on Gemini',
+  leak_check: 'Leak check',
+  rehydrate: 'Restoring real values',
+};
+
+const BASE_STEPS: readonly ProgressStage[] = [
+  'masking',
+  'egress_guard',
+  'core_reasoning',
+  'leak_check',
+  'rehydrate',
+];
+
+type StepState = 'pending' | 'active' | 'done' | 'stopped';
+
+interface Step {
+  readonly stage: ProgressStage;
+  state: StepState;
+  /** Cumulative milliseconds since the pipeline began, recorded when the step ended. */
+  endedAtMs?: number;
+  /** This step's own duration, derived from the previous step's end. */
+  durationMs?: number;
+}
+
+let steps: Step[] = [];
+
+/** Lay out the checklist for a new request. */
+function resetSteps(includeWakeup: boolean): void {
+  const stages = includeWakeup
+    ? (['gpu_wakeup', ...BASE_STEPS] as ProgressStage[])
+    : [...BASE_STEPS];
+  steps = stages.map((stage) => ({ stage, state: 'pending' }));
+
+  // The first step is marked active immediately: the request is already in
+  // flight when this runs, and showing every step as pending would suggest
+  // nothing had started.
+  const first = steps[0];
+  if (first !== undefined) first.state = 'active';
+
+  progressPane.hidden = false;
+  renderSteps();
+}
+
+function renderSteps(): void {
+  stepsList.innerHTML = steps
+    .map((step) => {
+      const seconds =
+        step.durationMs === undefined ? '' : `${(step.durationMs / 1000).toFixed(1)}s`;
+      const mark =
+        step.state === 'done'
+          ? '✓'
+          : step.state === 'stopped'
+            ? '×'
+            : step.state === 'active'
+              ? '…'
+              : '';
+      return `<li class="step ${step.state}" data-stage="${escapeHtml(step.stage)}">
+        <span class="step-mark">${mark}</span>
+        <span class="step-label">${escapeHtml(STEP_LABELS[step.stage])}</span>
+        <span class="step-time">${escapeHtml(seconds)}</span>
+      </li>`;
+    })
+    .join('');
+}
+
+/**
+ * Apply one progress frame.
+ *
+ * Elapsed times arrive cumulative from the pipeline's start, so a step's own
+ * duration is the difference from the previous step's end — computed here rather
+ * than server-side, which keeps the wire format a single number per frame.
+ */
+function applyProgress(stage: ProgressStage, state: 'start' | 'end', elapsedMs: number): void {
+  const index = steps.findIndex((step) => step.stage === stage);
+  if (index === -1) return;
+  const step = steps[index];
+  if (step === undefined) return;
+
+  if (state === 'start') {
+    step.state = 'active';
+    renderSteps();
+    return;
+  }
+
+  step.state = 'done';
+  step.endedAtMs = elapsedMs;
+  const previousEnd = steps[index - 1]?.endedAtMs ?? 0;
+  step.durationMs = Math.max(0, elapsedMs - previousEnd);
+
+  // Advance the cursor so the list always shows one step in flight rather than
+  // going blank between a stage ending and the next one starting.
+  const next = steps[index + 1];
+  if (next !== undefined && next.state === 'pending') next.state = 'active';
+  renderSteps();
+}
+
+/**
+ * Mark wherever the pipeline stopped.
+ *
+ * A refusal's whole value to the reader is *which gate* refused, so the step
+ * that was in flight is marked stopped and everything after it stays pending —
+ * unreached, not failed.
+ */
+function markStopped(): void {
+  const active = steps.find((step) => step.state === 'active');
+  if (active !== undefined) active.state = 'stopped';
+  renderSteps();
+}
 
 /**
  * Escaping that every string must pass through before it is inserted into HTML.
@@ -315,14 +542,41 @@ submit.addEventListener('click', () => {
     setBusy(false, 'Enter a request first.');
     return;
   }
-  setBusy(true, 'Masking, reasoning on the frontier model, verifying...');
-  ask(text)
+
+  // A cold fleet means the first Gemma call waits on a container start, so the
+  // wait is named up front rather than left to look like a hang. `unknown` is
+  // treated as cold here on purpose: warning about a wait that does not happen
+  // costs the reader nothing, while an unannounced two-minute pause reads as a
+  // broken demo.
+  const mayNeedWakeup = gemmaWarmth !== 'warm';
+  const minutes = Math.round(coldStartSeconds / 60);
+  const waking = `Waking the GPU (up to ~${minutes} min)…`;
+
+  resetSteps(mayNeedWakeup);
+  setBusy(true, mayNeedWakeup ? waking : 'Masking, reasoning on the frontier model, verifying…');
+
+  // The wake-up step has no progress frame of its own: it is over precisely when
+  // the masking stage reports that Gemma answered, so it is closed from there.
+  let wakeupOpen = mayNeedWakeup;
+
+  askStreaming(text, (event) => {
+    if (wakeupOpen && event.stage === 'masking') {
+      applyProgress('gpu_wakeup', 'end', event.elapsed_ms);
+      wakeupOpen = false;
+      setBusy(true, 'Masking, reasoning on the frontier model, verifying…');
+    }
+    applyProgress(event.stage, event.state, event.elapsed_ms);
+  })
     .then((response) => {
       render(response);
       setBusy(false, '');
+      // The request just proved Gemma is up, so the badge is refreshed rather
+      // than left showing the state from before the run.
+      void refreshStatus();
       return response;
     })
     .catch((error: unknown) => {
+      markStopped();
       if (error instanceof ApiError) {
         renderBlocked(error);
         setBusy(false, `Refused (${error.status}).`);
@@ -335,3 +589,5 @@ submit.addEventListener('click', () => {
       statusLine.className = 'status error';
     });
 });
+
+startStatusPolling();

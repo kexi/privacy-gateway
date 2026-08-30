@@ -346,7 +346,25 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 | `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                 |
 | `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                    |
 | `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                              |
+| `GET`    | `/v1/status`                         | Gemma が warm か cold か、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない                     |
+| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける     |
 | `GET`    | `/healthz`                           | 死活監視                                                                                                                  |
+
+`POST /v1/ask` は `Accept: text/event-stream` に対して進捗ストリームでも応答する。パイプ
+ラインの各段階（`masking`、`egress_guard`、`core_reasoning`、`leak_check`、`rehydrate`）
+ごとに `event: progress` フレームを送り、載せるのは段階名と `start`/`end` の別、そして
+`elapsed_ms` だけ。最後に `event: result` で JSON 経路と同じ `AskResponse` ボディを——
+拒否時は `event: refused` でエラーボディと本来の HTTP ステータスを——返し、`data: [DONE]`
+で終わる。progress フレームにプロンプト本文・回答断片・プレースホルダが載ることはない。
+最初のフレームの時点でヘッダは送出済みなので、ステータスコードは常に `200` になる。パイプ
+ラインが拒否を決めるのはその後であり、ストリーミングクライアントは refused フレームの
+`status` フィールドを読む。OpenAI 互換の `stream: true` は従来どおり（コンテンツ 1
+チャンクのあと `[DONE]`）で変更していない。
+
+`/v1/status` は直近 10 分以内に Gemma 呼び出しが記録されていれば `warm`、なければ `cold`、
+記録を読めなければ `unknown` を返す。判定は Gemma 呼び出しの成功後に書き込まれるタイム
+スタンプから導出しており、Gemma を叩いて確かめることはしない——叩けば、報告対象である
+インスタンスをその場で起こしてしまうからである。
 
 セッションベースの API はもう存在しない: `GET /v1/sessions/{id}/answer`、
 `POST /v1/sessions/{id}/approve`、`GET /v1/sessions/{id}/tier` はすべて削除された。

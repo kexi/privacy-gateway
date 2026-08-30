@@ -29,6 +29,42 @@ The response holds the masked prompt that actually crossed the boundary, the
 rehydrated answer (returned once, never stored), the OKF document, the four trust
 dimensions, and the attestation.
 
+**Progress streaming.** Send `Accept: text/event-stream` and the same endpoint
+narrates the pipeline instead of waiting silently:
+
+```bash
+curl -sS -N http://localhost:8081/v1/ask \
+  -H 'content-type: application/json' -H 'accept: text/event-stream' \
+  -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
+```
+
+One `event: progress` frame per stage (`masking`, `egress_guard`,
+`core_reasoning`, `leak_check`, `rehydrate`) carrying only the stage name, a
+`start`/`end` marker and `elapsed_ms` — never prompt text, an answer fragment or
+a placeholder. Then `event: result` with the identical `AskResponse` body, or
+`event: refused` with the error body and a `status` field, followed by
+`data: [DONE]`.
+
+This narrates the wait; it does not release text early. The HTTP status is `200`
+from the first frame onwards because the headers are flushed before the pipeline
+knows its verdict, so a streaming client reads the refusal frame's `status`
+rather than the response code. The OpenAI `stream: true` framing is separate and
+unchanged — see §2.
+
+**Warm/cold.** `GET /v1/status` reports `{gemma: warm|cold|unknown,
+last_active_at?, cold_start_estimate_seconds}`. The GPU-backed Gemma service
+scales to zero, so a cold fleet's first request waits roughly two minutes. The
+verdict comes from a timestamp recorded after each successful Gemma call, never
+from probing Gemma — a probe would wake the instance being reported on. It is
+cheap, cached about five seconds, and never 500s: an unreadable store is
+`unknown`, not an error.
+
+`POST /v1/warmup` starts the GPU and returns `{started: true}` (202) without
+waiting for it — a cold start outlives any sane HTTP timeout, so poll `/v1/status`
+to learn when it landed. **It costs money**: the instance is billed until it idles
+out, roughly fifteen minutes after the last request. It shares the `/v1/ask` rate
+limit for exactly that reason.
+
 ## 2. The OpenAI-compatible endpoint
 
 Point any OpenAI-compatible client at the gateway as its `base_url` and select
@@ -91,6 +127,13 @@ OpenAI-shaped response can still fetch `/v1/requests/<id>` for the evidence.
 preserved (422 for a release the guard refused, 400 for reserved syntax, 504 for
 the deadline), carrying the category findings. A refusal is never laundered into
 a 200 completion whose content happens to be an apology.
+
+A `judge_flagged` refusal (422) may have cost two judge calls rather than one: an
+unevidenced flag over an attester-clean body is re-asked exactly once, and a
+clear second answer releases the request with `attestation.judge_retries: 1` in
+the evidence document. Callers see no new status — a request that is refused was
+refused twice, and one that passes on the retry is an ordinary success whose
+audit record says it needed a second look.
 
 **Streaming** (`stream: true`) emits one content chunk and then `[DONE]`. This is
 not a stub to be improved later: every gate here is fail-closed and the leak
