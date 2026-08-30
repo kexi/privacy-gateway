@@ -1016,6 +1016,66 @@ Do not confuse `min-instances` with the kill switch's `max-instances`. `just war
 the floor; the kill switch drops the **ceiling** to zero. If the switch has tripped,
 `just warm` will not bring Gemma back — restore with `just restore-after-kill` first.
 
+### 9.5 The audit view for judges
+
+`GET /audit` is a read-only page that turns the OKF evidence store into something a judge
+can browse: one row per stored `Gateway Answer` document, newest first, with its status,
+derived trust tier, attestation verdict, masked-category counts, judge retries and
+withheld categories. Clicking a row fetches `/v1/requests/<id>` and renders the document —
+frontmatter as labelled facts, body as text — with links to the two masked sources it
+names and to its Cloud Trace.
+
+**Everything it shows is masked evidence.** The rehydrated answer is returned in one API
+response and never stored, so there is nothing unmasked for this page to display even in
+principle. The page says so in its header. It is also read-only in the strict sense: there
+is no approve, no delete and no re-run, because an audit view that can change what it
+reports is not evidence.
+
+#### The token is a capability, not an identity
+
+Access is gated on `ADMIN_TOKEN`, a single shared string:
+
+- **Unset (the default)** — neither `/v1/audit` nor `/audit` is registered at all. Both
+  answer 404 because the routes do not exist.
+- **Set** — the token must arrive as `?key=<token>` or an `X-Admin-Token` header. It is
+  compared in constant time, and a wrong token answers **404, not 401**, so the surface is
+  never advertised to someone who does not already hold it. The two states are
+  deliberately indistinguishable from outside.
+
+This is demo-grade on purpose. The public gateway authenticates nobody, so there is no
+principal behind the token — holding the string is the whole claim. In particular **it
+never mints an OKF `human:` actor**: an approval clicked by an unidentified token-holder
+would be a claim by nobody, which is exactly why human review is out of scope for this
+product (see `docs/ARCHITECTURE.md`). Every document the view lists stays
+`machine-confirmed` at best.
+
+The token also buys only _enumeration_. `/v1/requests/<id>` is already public by
+capability — knowing a UUIDv7 is the capability — so the audit view adds the ability to
+list what exists, not the ability to read something otherwise unreadable.
+
+#### Enabling, rotating and disabling
+
+The token is a Terraform variable (`admin_token`, `sensitive`, default `""`). It is never
+committed; pass it per apply:
+
+```bash
+# generate and enable
+token=$(openssl rand -hex 16)
+just tf-apply admin_token="$token"
+echo "$token"          # paste this into the page, or use /audit?key=$token
+
+# rotate: apply a new value; the old token stops working immediately
+just tf-apply admin_token="$(openssl rand -hex 16)"
+
+# disable: apply an empty value, and both routes disappear
+just tf-apply admin_token=""
+```
+
+Rotating or disabling takes effect on the next revision, which the apply creates. The page
+keeps the token in `sessionStorage`, so it survives a reload and is gone when the tab
+closes; a `?key=` in the URL is consumed once and stripped from the address bar, so a
+shared demo link does not leave the capability in browser history.
+
 ---
 
 ## 10. Teardown

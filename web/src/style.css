@@ -9,6 +9,22 @@
   --pass: #7ee787;
   --fail: #ff7b72;
   --token: #f2cc60;
+
+  /*
+   * How a category hue is turned into a colour, per theme.
+   *
+   * Only the hue is per-category (see `src/categories.ts`); the lightness and
+   * alpha live here so the same eleven hues stay legible against a dark surface
+   * and a light one without maintaining two hue tables.
+   */
+  --cat-fill: 26%;
+  --cat-fill-linked: 52%;
+  --cat-text-l: 88%;
+  --cat-text-linked-l: 96%;
+  --cat-line-l: 62%;
+  --cat-chip-fill: 18%;
+  --cat-chip-text-l: 82%;
+  --cat-chip-border: 45%;
   font-family:
     ui-sans-serif,
     system-ui,
@@ -606,4 +622,295 @@ summary {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.75rem;
   color: var(--muted);
+}
+
+/* --- light theme ----------------------------------------------------------- */
+/*
+ * The page was dark-only, which was fine while everything on it was chrome. The
+ * category colours are not chrome: they are the only thing tying a value in one
+ * panel to a placeholder in another, so they have to survive a reader whose
+ * system is set to light. Only the tokens change; no component below knows which
+ * theme it is in.
+ */
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --surface-2: #eef1f6;
+    --border: #d3d9e3;
+    --text: #14171d;
+    --muted: #5a6473;
+    --accent: #2a5bd7;
+    --pass: #1a7f37;
+    --fail: #c0392b;
+    --token: #8a6100;
+
+    --cat-fill: 30%;
+    --cat-fill-linked: 58%;
+    --cat-text-l: 22%;
+    --cat-text-linked-l: 14%;
+    --cat-line-l: 42%;
+    --cat-chip-fill: 16%;
+    --cat-chip-text-l: 30%;
+    --cat-chip-border: 40%;
+  }
+}
+
+/* --- what was masked: legend ----------------------------------------------- */
+
+.legend-section {
+  margin: 1.5rem 0;
+}
+
+.legend-section h2 {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 0.6rem;
+}
+
+/*
+ * A list, not a strip of swatches. The category name, the count and the
+ * placeholder names are all text, so the legend still reads with the colours
+ * removed -- which is the case that matters, because a highlight cannot carry a
+ * label of its own.
+ */
+.legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-left-color: hsl(var(--cat-hue) 70% var(--cat-line-l));
+  border-radius: 6px;
+  padding: 0.4rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.legend-swatch {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 3px;
+  background: hsl(var(--cat-hue) 70% 50% / 0.55);
+  border: 1px solid hsl(var(--cat-hue) 70% var(--cat-line-l));
+  flex: none;
+}
+
+.legend-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 600;
+}
+
+.legend-count {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.legend-tokens {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.legend-withheld {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--token);
+  border: 1px solid color-mix(in srgb, var(--token) 45%, transparent);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+}
+
+.legend-empty {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.legend-note {
+  margin: 0.6rem 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  max-width: 68ch;
+}
+
+/* --- placeholder chips ------------------------------------------------------ */
+/*
+ * A chip is a button because it is one: pressing it pins the trace across the
+ * panels, and a keyboard user has to be able to reach it. It carries the
+ * category name and index as text, so it is never the colour alone that says
+ * which placeholder this is.
+ */
+
+.pii-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.2rem;
+  background: hsl(var(--cat-hue) 70% 50% / var(--cat-chip-fill));
+  color: hsl(var(--cat-hue) 65% var(--cat-chip-text-l));
+  border: 1px solid hsl(var(--cat-hue) 65% 50% / var(--cat-chip-border));
+  border-radius: 4px;
+  padding: 0 0.35rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition:
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.pii-chip:hover,
+.pii-chip.linked {
+  background: hsl(var(--cat-hue) 70% 50% / calc(var(--cat-chip-fill) * 2.2));
+  box-shadow: 0 0 0 2px hsl(var(--cat-hue) 70% 55% / 0.45);
+}
+
+/* A withheld placeholder is not a link to anywhere: nothing came back for it. */
+.pii-chip.withheld {
+  border-style: dashed;
+  cursor: help;
+}
+
+/*
+ * The emphasis is a colour and a ring, both instant when the reader asks for
+ * less motion -- the transition is polish, and the ring says the same thing
+ * without it.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .pii-chip {
+    transition: none;
+  }
+}
+
+/* --- custom highlights ------------------------------------------------------ */
+/*
+ * Registered from `src/highlight.ts`, one registry entry per category plus a
+ * second `-linked` entry for the emphasised state: `::highlight()` is selected by
+ * registry name, so two appearances of one range means two names.
+ *
+ * `::highlight()` honours only colour, background-color, text-decoration and
+ * friends -- no border, no padding, no outline -- which is why the underline
+ * carries the meaning alongside the fill, and why the panel-level chips and the
+ * legend exist at all.
+ */
+
+::highlight(pii-email),
+::highlight(pii-phone),
+::highlight(pii-credit-card),
+::highlight(pii-my-number),
+::highlight(pii-ipv4),
+::highlight(pii-api-key),
+::highlight(pii-aws-key),
+::highlight(pii-jwt),
+::highlight(pii-person),
+::highlight(pii-address),
+::highlight(pii-organization) {
+  background-color: hsl(var(--cat-hue) 70% 50% / var(--cat-fill));
+  color: hsl(var(--cat-hue) 75% var(--cat-text-l));
+  text-decoration: underline;
+  text-decoration-color: hsl(var(--cat-hue) 75% var(--cat-line-l));
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+}
+
+::highlight(pii-email-linked),
+::highlight(pii-phone-linked),
+::highlight(pii-credit-card-linked),
+::highlight(pii-my-number-linked),
+::highlight(pii-ipv4-linked),
+::highlight(pii-api-key-linked),
+::highlight(pii-aws-key-linked),
+::highlight(pii-jwt-linked),
+::highlight(pii-person-linked),
+::highlight(pii-address-linked),
+::highlight(pii-organization-linked) {
+  background-color: hsl(var(--cat-hue) 80% 50% / var(--cat-fill-linked));
+  color: hsl(var(--cat-hue) 85% var(--cat-text-linked-l));
+  text-decoration: underline;
+  text-decoration-color: hsl(var(--cat-hue) 85% var(--cat-line-l));
+  text-decoration-thickness: 3px;
+  text-underline-offset: 2px;
+}
+
+/*
+ * The hue table, mirroring `CATEGORY_HUES` in `src/categories.ts`. Kept as a
+ * custom property on the pseudo-element so the two rules above stay generic:
+ * eleven hues, one appearance.
+ */
+
+::highlight(pii-email),
+::highlight(pii-email-linked) {
+  --cat-hue: 210;
+}
+
+::highlight(pii-phone),
+::highlight(pii-phone-linked) {
+  --cat-hue: 145;
+}
+
+::highlight(pii-credit-card),
+::highlight(pii-credit-card-linked) {
+  --cat-hue: 25;
+}
+
+::highlight(pii-my-number),
+::highlight(pii-my-number-linked) {
+  --cat-hue: 330;
+}
+
+::highlight(pii-ipv4),
+::highlight(pii-ipv4-linked) {
+  --cat-hue: 190;
+}
+
+::highlight(pii-api-key),
+::highlight(pii-api-key-linked) {
+  --cat-hue: 55;
+}
+
+::highlight(pii-aws-key),
+::highlight(pii-aws-key-linked) {
+  --cat-hue: 80;
+}
+
+::highlight(pii-jwt),
+::highlight(pii-jwt-linked) {
+  --cat-hue: 285;
+}
+
+::highlight(pii-person),
+::highlight(pii-person-linked) {
+  --cat-hue: 265;
+}
+
+::highlight(pii-address),
+::highlight(pii-address-linked) {
+  --cat-hue: 5;
+}
+
+::highlight(pii-organization),
+::highlight(pii-organization-linked) {
+  --cat-hue: 170;
+}
+
+/* A single-column row of panes (the answer, which spans the full width). */
+.panes-single {
+  grid-template-columns: 1fr;
+  margin-top: 1rem;
 }

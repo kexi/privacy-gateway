@@ -12,7 +12,7 @@ use, the same fail-closed gates run and the same evidence is stored.
 | Ollama/Anthropic shim (`clients/ollama-shim`) | selecting the fleet as a _model_ in Claude Desktop's picker                           |
 | `clients/python/pgw.py`                       | a dependency-light CLI example, and the only client that can check the bundle digests |
 
-Deployed Gateway: `https://gateway-agent-turszib42q-uc.a.run.app`. Local: `http://localhost:8081`.
+Deployed Gateway: `https://privacy-gateway.kexi.dev`. Local: `http://localhost:8081`.
 Substitute either for the base URL in the examples below.
 
 ## 1. The native endpoint
@@ -100,7 +100,7 @@ Codex CLI selects it through a provider profile in `~/.codex/config.toml`:
 ```toml
 [model_providers.privacy-gateway]
 name = "Privacy Gateway"
-base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "chat"
 
 [profiles.privacy-gateway]
@@ -204,6 +204,12 @@ uv run clients/python/pgw.py verify <request_id>
 
 The only client that can check all four digests, because it can hash the bundle
 files in the checkout it lives in.
+
+**Audit view.** `GET /v1/audit` lists stored evidence metadata newest-first (max 50,
+no document bodies) and `/audit` is its read-only page; both need `?key=` or an
+`X-Admin-Token` header and answer **404 — not 401** when `ADMIN_TOKEN` is unset or
+wrong, so a client cannot tell "disabled" from "wrong token". The token is a
+capability, not an identity: it never makes a document `human-reviewed`.
 
 ## 6. What to say about the guarantee
 

@@ -14,6 +14,7 @@
     "fmt:check": "oxfmt --check"
   },
   "dependencies": {
+    "@google-cloud/firestore": "^7.11.0",
     "@google/adk": "2.0.0",
     "@privacy-gateway/common": "workspace:*",
     "express": "^5.1.0",

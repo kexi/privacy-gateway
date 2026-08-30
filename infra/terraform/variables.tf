@@ -190,3 +190,20 @@ variable "budget_jpy" {
     error_message = "budget_jpy must be greater than zero."
   }
 }
+
+variable "admin_token" {
+  description = <<-EOT
+    Capability token for the read-only audit view at /audit. Empty (the
+    default) switches the feature off: the gateway registers no /v1/audit and
+    no /audit route at all, so both answer 404 because they do not exist.
+
+    A capability, not an identity. The public gateway authenticates nobody, so
+    there is no principal behind this string — holding it is the whole claim,
+    and nothing in the fleet may mint an OKF `human:` actor from it. It is
+    demo-grade on purpose: pass it per apply (`-var admin_token=...`), never
+    commit it, and rotate it by applying a new value.
+  EOT
+  type        = string
+  sensitive   = true
+  default     = ""
+}

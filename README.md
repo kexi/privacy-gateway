@@ -81,14 +81,14 @@ every other service is private (IAM invoker + ID token) or internal-ingress only
 
 | Service           | URL                                               | Access                            |
 | ----------------- | ------------------------------------------------- | --------------------------------- |
-| `gateway-agent`   | <https://gateway-agent-turszib42q-uc.a.run.app>   | **public** — the demo entry point |
+| `gateway-agent`   | <https://privacy-gateway.kexi.dev>                | **public** — the demo entry point |
 | `core-agent`      | `https://core-agent-turszib42q-uc.a.run.app`      | private (A2A, ID token)           |
 | `synthesis-agent` | `https://synthesis-agent-turszib42q-uc.a.run.app` | private (HTTP, ID token)          |
 | `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress only             |
 | `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private (Pub/Sub push + OIDC)     |
 
 ```bash
-curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
+curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -H 'content-type: application/json' \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
@@ -334,17 +334,18 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 
 ### API
 
-| Method | Path                                 | Purpose                                                                                                                     |
-| ------ | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats |
-| `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                      |
-| `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                              |
-| `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                             |
-| `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                 |
-| `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                     |
-| `GET`  | `/v1/status`                         | is Gemma `warm`/`warming`/`cold`/`unknown`, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU         |
-| `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                |
-| `GET`  | `/healthz`                           | liveness                                                                                                                    |
+| Method | Path                                 | Purpose                                                                                                                                          |
+| ------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats                      |
+| `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                                           |
+| `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                                                   |
+| `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                                                  |
+| `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                                      |
+| `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                                          |
+| `GET`  | `/v1/status`                         | is Gemma `warm`/`warming`/`cold`/`unknown`, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU                              |
+| `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                                     |
+| `GET`  | `/v1/audit`                          | read-only list of stored evidence metadata, newest first (max 50). Requires `?key=` or `X-Admin-Token`; 404 when `ADMIN_TOKEN` is unset or wrong |
+| `GET`  | `/healthz`                           | liveness                                                                                                                                         |
 
 `POST /v1/ask` also answers `Accept: text/event-stream` with a progress stream: an
 `event: progress` frame per pipeline stage (`masking`, `egress_guard`, `core_reasoning`,
@@ -428,7 +429,7 @@ In `~/.codex/config.toml`:
 ```toml
 [model_providers.privacy-gateway]
 name = "Privacy Gateway"
-base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "chat"
 
 [profiles.privacy-gateway]
@@ -476,7 +477,7 @@ Build it once (`pnpm -r build`), then register it. Claude Desktop, in
     "privacy-gateway": {
       "command": "node",
       "args": ["/absolute/path/to/all-things-agentic-hackathon/clients/mcp/dist/index.js"],
-      "env": { "PGW_GATEWAY_URL": "https://gateway-agent-turszib42q-uc.a.run.app" }
+      "env": { "PGW_GATEWAY_URL": "https://privacy-gateway.kexi.dev" }
     }
   }
 }
@@ -486,7 +487,7 @@ Claude Code and Codex register the same binary:
 
 ```bash
 claude mcp add privacy-gateway \
-  --env PGW_GATEWAY_URL=https://gateway-agent-turszib42q-uc.a.run.app \
+  --env PGW_GATEWAY_URL=https://privacy-gateway.kexi.dev \
   -- node /absolute/path/to/clients/mcp/dist/index.js
 ```
 
@@ -494,7 +495,7 @@ claude mcp add privacy-gateway \
 [mcp_servers.privacy-gateway]
 command = "node"
 args = ["/absolute/path/to/clients/mcp/dist/index.js"]
-env = { PGW_GATEWAY_URL = "https://gateway-agent-turszib42q-uc.a.run.app" }
+env = { PGW_GATEWAY_URL = "https://privacy-gateway.kexi.dev" }
 ```
 
 Full notes — what `pgw_verify` can and cannot check, and why a refusal is a result rather

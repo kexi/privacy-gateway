@@ -300,3 +300,12 @@ describe('neutralizing placeholders for the advisory judge', () => {
     expect(neutralizePlaceholders(text)).toBe(neutralizePlaceholders(text));
   });
 });
+
+describe('digit-bearing categories', () => {
+  // Regression: `[A-Z_]+` could not match IPV4 — the digit broke the run and
+  // ⟦IPV4_1⟧ passed through strip/neutralize/categoryOf untouched.
+  it('strips and neutralizes an IPV4 placeholder', () => {
+    expect(stripPlaceholders('at ⟦IPV4_1⟧ today')).not.toContain('⟦');
+    expect(neutralizePlaceholders('at ⟦IPV4_1⟧ today')).toContain('[masked');
+  });
+});

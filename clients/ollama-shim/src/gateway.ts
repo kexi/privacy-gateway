@@ -19,7 +19,7 @@ import { z } from 'zod';
 export const GATEWAY_MODEL_ID = 'privacy-gateway';
 
 /** Deployed Gateway. Overridable with `PGW_GATEWAY_URL` for local runs. */
-export const DEFAULT_GATEWAY_URL = 'https://gateway-agent-turszib42q-uc.a.run.app';
+export const DEFAULT_GATEWAY_URL = 'https://privacy-gateway.kexi.dev';
 
 /**
  * The privacy facts the fleet rides on its OpenAI-shaped response.

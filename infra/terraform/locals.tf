@@ -107,6 +107,13 @@ locals {
         # continuously; `just warm` buys that trade deliberately for a filming
         # window, and `just chill` gives it back.
         REQUEST_DEADLINE_SECONDS = "150"
+
+        # The read-only audit view's capability token. Empty means the routes
+        # are never registered, so the feature is genuinely absent rather than
+        # present behind a check. Only the Gateway gets it: Core and Synthesis
+        # have no audit surface to gate, and a secret is not handed to a service
+        # that has no use for it.
+        ADMIN_TOKEN = var.admin_token
       }
     }
   }

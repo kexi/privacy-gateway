@@ -32,6 +32,10 @@ export default defineConfig({
       'services/kill-switch',
       'clients/mcp',
       'clients/ollama-shim',
+      // The UI's pure logic only. Its `package.json` `test` script stays
+      // Playwright, so this is reached through the project's own vitest.config
+      // rather than by recursing into the package script.
+      'web',
     ],
     coverage: {
       provider: 'v8',

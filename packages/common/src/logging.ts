@@ -92,6 +92,9 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   vault_generation: 'number',
   body_bytes: 'number',
   finding_count: 'number',
+  // How many rows the read-only audit list returned. A count of stored evidence
+  // documents, never anything about what any of them contains.
+  entry_count: 'number',
   text_length: 'number',
   tokens_withheld: 'number',
   dropped_categories: 'number',
@@ -141,7 +144,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/u;
 const ENUM_RE = /^[A-Za-z][A-Za-z0-9._/:-]{0,63}$/u;
 
 /** A masked placeholder, the only token shape that may be named in a log. */
-const TOKEN_RE = /^⟦[A-Z_]+_\d+⟧$/u;
+const TOKEN_RE = /^⟦[A-Z][A-Z0-9_]*?_\d+⟧$/u; // digits admitted: IPV4
 
 /** Fields every log line may carry; `event` is the searchable discriminator. */
 export interface LogFields {

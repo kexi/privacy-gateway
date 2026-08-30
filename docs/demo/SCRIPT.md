@@ -9,7 +9,7 @@ captions; narration can be Japanese or English.
 1. `just warm` — pin gemma-serving to one warm instance (≈ $3.5/h while warm).
 2. `just smoke` twice — confirm sub-10s responses.
 3. Open browser tabs in this order:
-   - T1: Web UI `https://gateway-agent-turszib42q-uc.a.run.app`
+   - T1: Web UI `https://privacy-gateway.kexi.dev`
    - T2: Cloud Run services list (Console, project **all-thinkgs** visible in header)
    - T3: Cloud Trace list (Console)
    - T4: IAM page filtered to `sa-core@all-thinkgs.iam.gserviceaccount.com`

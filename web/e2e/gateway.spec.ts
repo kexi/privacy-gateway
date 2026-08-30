@@ -72,6 +72,109 @@ test.describe('the masking boundary', () => {
   });
 });
 
+test.describe('what was masked', () => {
+  test.beforeEach(async ({ page }) => {
+    await submit(page, CUSTOMER_EMAIL);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+  });
+
+  test('lists every detected category with its count, in text', async ({ page }) => {
+    // The legend is the fallback for everything the colours cannot say, so the
+    // category name and the count are asserted as text rather than as styling.
+    const legend = page.locator('#legend');
+    await expect(legend.locator('.legend-row')).not.toHaveCount(0);
+
+    const email = legend.locator('.legend-row', { hasText: 'EMAIL' }).first();
+    await expect(email.locator('.legend-name')).toHaveText('EMAIL');
+    await expect(email.locator('.legend-count')).toHaveText(/^\d+ masked$/);
+
+    await expect(legend).toContainText('PERSON');
+    await expect(legend).toContainText('CREDIT_CARD');
+  });
+
+  test('names the masking as pseudonymization rather than anonymization', async ({ page }) => {
+    await expect(page.locator('#legend-note')).toContainText('not anonymization');
+  });
+
+  test('shows the request you typed and highlights the email span in it', async ({ page }) => {
+    const original = page.locator('#original');
+    await expect(original).toContainText('taro@example.co.jp');
+
+    const supported = await page.evaluate(() => 'highlights' in CSS);
+    test.skip(!supported, 'this browser has no CSS Custom Highlight API');
+
+    // The registry is the observable output: the painter registers one entry per
+    // category, and the email span is the one this test cares about.
+    const highlighted = await page.evaluate(() => {
+      const email = CSS.highlights.get('pii-email');
+      if (email === undefined) return null;
+      return [...email].map((range) => range.toString());
+    });
+    expect(highlighted).toContain('taro@example.co.jp');
+  });
+
+  test('renders each placeholder in the masked prompt as a labelled chip', async ({ page }) => {
+    const chip = page.locator('#masked .pii-chip[data-token="⟦EMAIL_1⟧"]').first();
+
+    await expect(chip).toBeVisible();
+    // The label is text: the colour repeats it, never replaces it.
+    await expect(chip).toContainText('EMAIL');
+    await expect(chip).toContainText('1');
+  });
+
+  test('highlights the restored value in the answer, closing the loop', async ({ page }) => {
+    const supported = await page.evaluate(() => 'highlights' in CSS);
+    test.skip(!supported, 'this browser has no CSS Custom Highlight API');
+
+    // The chips inserted into the answer carry the placeholder verbatim, so the
+    // pane's text still concatenates to the answer string and the offsets line
+    // up. A shortened chip label would land these ranges on the wrong words.
+    const inAnswer = await page.evaluate(() => {
+      const pane = document.getElementById('answer');
+      if (pane === null) return null;
+      const found: string[] = [];
+      for (const [name, highlight] of CSS.highlights) {
+        if (!name.startsWith('pii-')) continue;
+        for (const range of highlight) {
+          if (pane.contains(range.startContainer)) found.push(range.toString());
+        }
+      }
+      return found;
+    });
+    expect(inAnswer).toContain('taro@example.co.jp');
+  });
+
+  test('marks a withheld category in the answer with the reason', async ({ page }) => {
+    // A withheld placeholder is still in the answer text, so the chip is what
+    // tells the reader the gap is policy rather than a failure.
+    const withheld = page.locator('#answer .pii-chip.withheld').first();
+
+    await expect(withheld).toBeVisible();
+    await expect(withheld).toHaveAttribute('title', 'withheld by policy');
+  });
+
+  test('emphasises the linked spans everywhere when a chip is clicked', async ({ page }) => {
+    const supported = await page.evaluate(() => 'highlights' in CSS);
+    test.skip(!supported, 'this browser has no CSS Custom Highlight API');
+
+    await page.locator('#masked .pii-chip[data-token="⟦EMAIL_1⟧"]').first().click();
+
+    // The emphasis moves the ranges into a second registry entry, which is what
+    // `::highlight(pii-email-linked)` styles.
+    const linked = await page.evaluate(() => {
+      const entry = CSS.highlights.get('pii-email-linked');
+      return entry === undefined ? null : [...entry].map((range) => range.toString());
+    });
+    expect(linked).toContain('taro@example.co.jp');
+
+    // Every chip for that placeholder reports itself as pressed, so the state is
+    // not carried by colour alone.
+    await expect(
+      page.locator('.pii-chip[data-token="⟦EMAIL_1⟧"][aria-pressed="true"]').first(),
+    ).toBeVisible();
+  });
+});
+
 test.describe('the four trust dimensions', () => {
   test.beforeEach(async ({ page }) => {
     await submit(page, CUSTOMER_EMAIL);

@@ -24,6 +24,7 @@ import {
   type ProgressStage,
   type TrustTier,
 } from './api.ts';
+import { MaskedView } from './masked-view.ts';
 // eslint-disable-next-line import/no-unassigned-import -- Vite bundles the stylesheet via this side-effect import
 import './style.css';
 
@@ -47,6 +48,10 @@ const results = el<HTMLElement>('results');
 const blockedPane = el<HTMLElement>('blocked');
 const maskedPane = el<HTMLPreElement>('masked');
 const answerPane = el<HTMLPreElement>('answer');
+const originalPane = el<HTMLPreElement>('original');
+const legendSection = el<HTMLElement>('legend-section');
+const legendList = el<HTMLUListElement>('legend');
+const legendNote = el<HTMLParagraphElement>('legend-note');
 const dimensionsPane = el<HTMLDivElement>('dimensions');
 const attestationPane = el<HTMLDivElement>('attestation');
 const statsPane = el<HTMLDivElement>('stats');
@@ -376,11 +381,6 @@ function escapeHtml(value: string): string {
   );
 }
 
-/** Return HTML with the placeholders highlighted. */
-function highlightPlaceholders(text: string): string {
-  return escapeHtml(text).replace(/⟦[A-Z_]+_\d+⟧/g, '<mark class="token">$&</mark>');
-}
-
 /**
  * Render the four dimensions side by side.
  *
@@ -572,13 +572,36 @@ function idRow(label: string, value: string, href: string | undefined, linkLabel
   </div>`;
 }
 
-function render(response: AskResponse): void {
+/**
+ * The three text panels and the legend.
+ *
+ * Constructed once: the linking listeners are delegated from the results
+ * section, which outlives every individual response.
+ */
+const maskedView = new MaskedView({
+  legendSection,
+  legend: legendList,
+  legendNote,
+  original: originalPane,
+  masked: maskedPane,
+  answer: answerPane,
+});
+
+function render(response: AskResponse, submittedText: string): void {
   // Re-derive the tier from the OKF verified field rather than trusting the server's
   // value (SPEC §5.3).
   const tier = deriveTrustTier(extractVerified(response.okf));
   renderDimensions(response, tier);
-  maskedPane.innerHTML = highlightPlaceholders(response.masked_prompt);
-  answerPane.textContent = response.answer;
+  // The text the user typed is only ever held here, in the page that typed it:
+  // the mapping between it and the masked prompt is recomputed locally so the
+  // panels can be linked without asking the vault for anything.
+  maskedView.render({
+    originalText: submittedText,
+    maskedPrompt: response.masked_prompt,
+    answer: response.answer,
+    countsByCategory: response.stats.counts_by_category,
+    withheld: response.attestation.withheld ?? [],
+  });
   okfPane.textContent = response.okf;
   renderAttestation(response);
   renderStats(response);
@@ -609,6 +632,9 @@ function renderBlocked(error: ApiError): void {
       Nothing was rehydrated, and no unmasked text was stored. HTTP ${error.status}.
     </p>`;
   if (error.requestId) renderCorrelation(error.requestId);
+  // Nothing was released, so there is nothing to trace: the highlights from a
+  // previous answer are dropped rather than left pointing at stale panels.
+  maskedView.reset();
   blockedPane.hidden = false;
   results.hidden = true;
 }
@@ -651,7 +677,10 @@ submit.addEventListener('click', () => {
     applyProgress(event.stage, event.state, event.elapsed_ms);
   })
     .then((response) => {
-      render(response);
+      // The text as it was submitted, not as the textarea reads now: a user who
+      // edits the box while the request is in flight must not shift the
+      // alignment underneath the answer they get back.
+      render(response, text);
       setBusy(false, '');
       // The request just proved Gemma is up, so the badge is refreshed rather
       // than left showing the state from before the run.

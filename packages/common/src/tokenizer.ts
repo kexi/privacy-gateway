@@ -21,11 +21,17 @@
 export const TOKEN_OPEN = '⟦';
 export const TOKEN_CLOSE = '⟧';
 
-/** Matches one placeholder and captures its category and index. */
-const TOKEN_RE = new RegExp(`${TOKEN_OPEN}([A-Z_]+)_(\\d+)${TOKEN_CLOSE}`, 'gu');
+/**
+ * Matches one placeholder and captures its category and index. The category
+ * class must admit digits: IPV4 broke the `[A-Z_]+` form because the greedy
+ * run stopped at the digit and the mandatory `_` never matched, leaving
+ * ⟦IPV4_1⟧ invisible to every consumer of this regex. Lazy so the final
+ * `_<index>` pair stays the separator.
+ */
+const TOKEN_RE = new RegExp(`${TOKEN_OPEN}([A-Z][A-Z0-9_]*?)_(\\d+)${TOKEN_CLOSE}`, 'gu');
 
 /** Anchored form used to validate a whole string as a placeholder. */
-const TOKEN_FULL_RE = new RegExp(`^${TOKEN_OPEN}([A-Z_]+)_(\\d+)${TOKEN_CLOSE}$`, 'u');
+const TOKEN_FULL_RE = new RegExp(`^${TOKEN_OPEN}([A-Z][A-Z0-9_]*?)_(\\d+)${TOKEN_CLOSE}$`, 'u');
 
 /**
  * Remove every well-formed placeholder, leaving the residual prose.

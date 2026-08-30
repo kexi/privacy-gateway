@@ -58,7 +58,7 @@ Local pipe: `just dev 2>&1 | tee /tmp/pgw-dev.log`, then `just logs-local <reque
 | synthesis | `POST /v1/synthesize`                               | HTTP route used by gateway                                                                                                         |
 | gemma     | `GET /v1/models`, `POST /v1/chat/completions`       | Ollama OpenAI-compatible API (internal ingress only)                                                                               |
 
-Deployed gateway: `https://gateway-agent-turszib42q-uc.a.run.app` (the only public service).
+Deployed gateway: `https://privacy-gateway.kexi.dev` (the only public service).
 Every Cloud Run URL: `just urls`. Liveness across all services: `just health`.
 Agent Card for one service: `just agent-card <service>` (both attach the ID token that
 IAM-protected services require; the audience must be the callee's URL).

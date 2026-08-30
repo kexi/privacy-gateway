@@ -18,5 +18,9 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["src", "vite.config.ts"]
+  // Why not `e2e`: the container image builds the UI without `agents/synthesis`
+  // on disk, and the Playwright fixture imports it — including the specs here
+  // makes `pnpm build` fail inside the image while passing locally. The browser
+  // specs are type-checked by Playwright's own run instead.
+  "include": ["src", "test", "vite.config.ts", "vitest.config.ts"]
 }

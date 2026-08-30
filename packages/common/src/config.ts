@@ -150,6 +150,21 @@ export const EnvSchema = z.object({
   // --- web / misc ---
   WEB_DIR: z.string().optional(),
 
+  /**
+   * Capability token for the read-only audit view. Unset (or empty) removes the
+   * routes entirely rather than leaving them behind a check.
+   *
+   * A capability, not an identity: holding the string is the whole claim, so
+   * nothing may derive an OKF `human:` actor from it. An empty string is
+   * normalised to `undefined` because a Terraform variable defaulting to `""`
+   * is how the feature is switched off, and `ADMIN_TOKEN=` in a .env file must
+   * mean the same thing.
+   */
+  ADMIN_TOKEN: z
+    .string()
+    .optional()
+    .transform((value) => (value === undefined || value.trim() === '' ? undefined : value)),
+
   // --- observability ---
   OTEL_ENABLED: BooleanFromEnv,
   OTEL_SERVICE_NAME: z.string().optional(),

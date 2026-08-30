@@ -541,7 +541,7 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
     // read here.
     const maskedCounts: Record<string, number> = {};
     for (const token of Object.keys(mapping)) {
-      const category = /^⟦([A-Z_]+)_\d+⟧$/u.exec(token)?.[1];
+      const category = /^⟦([A-Z][A-Z0-9_]*?)_\d+⟧$/u.exec(token)?.[1]; // digits admitted: IPV4
       if (category === undefined) continue;
       maskedCounts[category] = (maskedCounts[category] ?? 0) + 1;
     }

@@ -98,7 +98,7 @@ zod · vitest · Playwright · MCP · OKF v0.2
 
 ## Links
 
-- Hosted demo: https://gateway-agent-turszib42q-uc.a.run.app
+- Hosted demo: https://privacy-gateway.kexi.dev
 - Repository: https://github.com/kexi/all-things-agentic-hackathon ⟨confirm access for judges⟩
 - Video: ⟨YouTube URL, ≤4 min, English subtitles⟩
 - Architecture diagram: docs/diagram/architecture.png (also embedded in README)

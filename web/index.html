@@ -64,11 +64,28 @@
 
         <div id="attestation" class="attestation"></div>
 
+        <!--
+          What was masked, in one place. The legend is a list with a text label
+          per row, so the mapping survives without the colours.
+        -->
+        <section id="legend-section" class="legend-section" hidden>
+          <h2>What was masked</h2>
+          <ul id="legend" class="legend"></ul>
+          <p id="legend-note" class="legend-note"></p>
+        </section>
+
         <div class="panes">
+          <article>
+            <h2>Your request <small>never left this page unmasked</small></h2>
+            <pre id="original" class="pane"></pre>
+          </article>
           <article>
             <h2>Masked prompt <small>sent to Gemini</small></h2>
             <pre id="masked" class="pane"></pre>
           </article>
+        </div>
+
+        <div class="panes panes-single">
           <article>
             <h2>Final answer <small>rehydrated for you</small></h2>
             <pre id="answer" class="pane"></pre>

@@ -83,14 +83,14 @@ Ollama と本番の Cloud Run GPU を同一のコードパスで扱える。
 
 | サービス          | URL                                               | アクセス                       |
 | ----------------- | ------------------------------------------------- | ------------------------------ |
-| `gateway-agent`   | <https://gateway-agent-turszib42q-uc.a.run.app>   | **公開** — デモの入口          |
+| `gateway-agent`   | <https://privacy-gateway.kexi.dev>                | **公開** — デモの入口          |
 | `core-agent`      | `https://core-agent-turszib42q-uc.a.run.app`      | private（A2A、ID トークン）    |
 | `synthesis-agent` | `https://synthesis-agent-turszib42q-uc.a.run.app` | private（HTTP、ID トークン）   |
 | `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress のみ          |
 | `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private（Pub/Sub push + OIDC） |
 
 ```bash
-curl -sS https://gateway-agent-turszib42q-uc.a.run.app/v1/ask \
+curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -H 'content-type: application/json' \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
@@ -338,17 +338,18 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 
 ### API
 
-| メソッド | パス                                 | 用途                                                                                                                               |
-| -------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計          |
-| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                     |
-| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                |
-| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                          |
-| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                             |
-| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                                       |
-| `GET`    | `/v1/status`                         | Gemma が `warm`/`warming`/`cold`/`unknown` のいずれか、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない |
-| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける              |
-| `GET`    | `/healthz`                           | 死活監視                                                                                                                           |
+| メソッド | パス                                 | 用途                                                                                                                                                  |
+| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計                             |
+| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                                        |
+| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                                   |
+| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                                             |
+| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                                                |
+| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                                                          |
+| `GET`    | `/v1/status`                         | Gemma が `warm`/`warming`/`cold`/`unknown` のいずれか、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない                    |
+| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける                                 |
+| `GET`    | `/v1/audit`                          | 保存済み evidence のメタデータ一覧（読み取り専用・新しい順・最大 50 件）。`?key=` か `X-Admin-Token` が必要で、`ADMIN_TOKEN` 未設定時や不一致時は 404 |
+| `GET`    | `/healthz`                           | 死活監視                                                                                                                                              |
 
 `POST /v1/ask` は `Accept: text/event-stream` に対して進捗ストリームでも応答する。パイプ
 ラインの各段階（`masking`、`egress_guard`、`core_reasoning`、`leak_check`、`rehydrate`）
@@ -432,7 +433,7 @@ Codex CLI も同じ要領で選べる——このフリートは単なる OpenAI
 ```toml
 [model_providers.privacy-gateway]
 name = "Privacy Gateway"
-base_url = "https://gateway-agent-turszib42q-uc.a.run.app/v1"
+base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "chat"
 
 [profiles.privacy-gateway]
@@ -479,7 +480,7 @@ attestation を独立に再実行できる。拒否は例外ではなく構造�
     "privacy-gateway": {
       "command": "node",
       "args": ["/absolute/path/to/all-things-agentic-hackathon/clients/mcp/dist/index.js"],
-      "env": { "PGW_GATEWAY_URL": "https://gateway-agent-turszib42q-uc.a.run.app" }
+      "env": { "PGW_GATEWAY_URL": "https://privacy-gateway.kexi.dev" }
     }
   }
 }
@@ -489,7 +490,7 @@ Claude Code と Codex も同じバイナリを登録する:
 
 ```bash
 claude mcp add privacy-gateway \
-  --env PGW_GATEWAY_URL=https://gateway-agent-turszib42q-uc.a.run.app \
+  --env PGW_GATEWAY_URL=https://privacy-gateway.kexi.dev \
   -- node /absolute/path/to/clients/mcp/dist/index.js
 ```
 
@@ -497,7 +498,7 @@ claude mcp add privacy-gateway \
 [mcp_servers.privacy-gateway]
 command = "node"
 args = ["/absolute/path/to/clients/mcp/dist/index.js"]
-env = { PGW_GATEWAY_URL = "https://gateway-agent-turszib42q-uc.a.run.app" }
+env = { PGW_GATEWAY_URL = "https://privacy-gateway.kexi.dev" }
 ```
 
 `pgw_verify` が何を検証でき何をできないか、拒否がなぜ例外ではなく結果なのか——詳細は

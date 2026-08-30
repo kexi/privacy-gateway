@@ -1,0 +1,404 @@
+/*
+ * Styling for the read-only audit view.
+ *
+ * The palette and the chip/badge vocabulary are copied from `style.css` rather
+ * than imported from it: the two pages are separate Vite entry points, and
+ * pulling the whole main-app stylesheet in would ship the composer, the
+ * pipeline checklist and the mask legend to a page that has none of them. The
+ * shared vocabulary is the token set below, which is small enough to keep in
+ * step by eye and is what makes a status chip mean the same thing on both pages.
+ */
+
+:root {
+  --bg: #0f1115;
+  --surface: #171a21;
+  --surface-2: #1e222b;
+  --border: #2b313d;
+  --text: #e6e9ef;
+  --muted: #99a1b3;
+  --accent: #7aa2f7;
+  --pass: #7ee787;
+  --fail: #ff7b72;
+  --token: #f2cc60;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+}
+
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 4rem;
+}
+
+header h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.75rem;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 1.4rem 0 0.5rem;
+}
+
+h3 small {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+/*
+ * The read-only claim, given the weight of a standing statement rather than a
+ * transient message: it is true of every row on the page, always.
+ */
+.notice {
+  margin: 0 0 0.9rem;
+  padding: 0.7rem 0.95rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font-size: 0.87rem;
+}
+
+.lede {
+  margin: 0 0 2rem;
+  color: var(--muted);
+  max-width: 76ch;
+  font-size: 0.9rem;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  color: var(--token);
+}
+
+label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+/* --- the token gate --------------------------------------------------------- */
+
+.gate {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.15rem;
+  margin-bottom: 2rem;
+}
+
+.gate-row {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+input[type='password'],
+input[type='text'] {
+  flex: 1 1 22rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+input:focus-visible,
+button:focus-visible,
+tr:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button {
+  background: var(--accent);
+  color: #0b0d12;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.6rem 1.1rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+
+.status {
+  margin: 0.65rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+  min-height: 1.2em;
+}
+
+.status.error {
+  color: var(--fail);
+}
+
+.status.ok {
+  color: var(--pass);
+}
+
+/* --- the list --------------------------------------------------------------- */
+
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.list-head small {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.82rem;
+}
+
+/*
+ * The table scrolls inside its own box rather than widening the page: eight
+ * columns do not fit a narrow window, and a horizontally scrolling body would
+ * take the header and the read-only notice off screen with it.
+ */
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.audit-table th {
+  text-align: left;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 0.7rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.audit-table td {
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.audit-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.audit-table tbody tr {
+  cursor: pointer;
+}
+
+.audit-table tbody tr:hover,
+.audit-table tbody tr[aria-selected='true'] {
+  background: var(--surface-2);
+}
+
+.request-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.timestamp {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.empty {
+  margin: 1rem 0 0;
+  color: var(--muted);
+  font-size: 0.87rem;
+}
+
+/* --- chips: the same vocabulary as the main UI's badges ---------------------- */
+
+.chip {
+  display: inline-block;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.chip.good {
+  color: var(--pass);
+  border-color: color-mix(in srgb, var(--pass) 45%, transparent);
+}
+
+.chip.bad {
+  color: var(--fail);
+  border-color: color-mix(in srgb, var(--fail) 45%, transparent);
+}
+
+.chip.info {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Square chips for counts, matching the main UI's `.chip` for masked values. */
+.count-chip {
+  display: inline-block;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.12rem 0.42rem;
+  margin: 0 0.25rem 0.25rem 0;
+  font-size: 0.72rem;
+  color: var(--token);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
+}
+
+.count-chip.muted {
+  color: var(--muted);
+}
+
+.dash {
+  color: var(--muted);
+}
+
+/* --- the opened document ----------------------------------------------------- */
+
+.detail {
+  margin-top: 2.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.15rem 1.35rem 1.5rem;
+}
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.detail-head h2 {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92rem;
+  word-break: break-all;
+}
+
+.detail-links {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.8rem;
+}
+
+.detail-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.65rem;
+  background: var(--surface-2);
+}
+
+.detail-links a:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/*
+ * Frontmatter as a definition list, not as re-serialized YAML.
+ *
+ * The point of the audit view is that a reader can see each recorded claim as
+ * its own labelled fact; a YAML blob would make them find it. The raw document
+ * is one link away for anyone who wants the bytes.
+ */
+.frontmatter {
+  display: grid;
+  grid-template-columns: minmax(11rem, max-content) 1fr;
+  gap: 0.4rem 1.1rem;
+  margin: 0;
+  font-size: 0.83rem;
+}
+
+.frontmatter dt {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding-top: 0.15rem;
+}
+
+.frontmatter dd {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.79rem;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.pane {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.85rem;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}

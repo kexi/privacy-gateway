@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Nothing on this page should ever end up in a search index or a referrer:
+      it is reached with a capability token, and a leaked URL is a leaked token.
+    -->
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Audit view — Privacy-Preserving Gateway</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Audit view</h1>
+        <!--
+          Stated on the page rather than only in the docs, because the page is
+          what a judge actually reads. Both halves matter: nothing here can be
+          changed, and nothing here is unmasked.
+        -->
+        <p class="notice">
+          Read-only audit view. All content is masked evidence; rehydrated answers are never stored.
+        </p>
+        <p class="lede">
+          Every row is one OKF <code>Gateway Answer</code> document from the evidence store. Open a
+          row to read the document itself, follow its provenance to the two masked artifacts it
+          names, or replay its attestation against them.
+        </p>
+      </header>
+
+      <!--
+        The token is a capability, not an identity: holding the string is the
+        whole claim. It is kept in sessionStorage so a reload does not ask
+        again, and it is gone when the tab closes.
+      -->
+      <section class="gate" id="gate">
+        <label for="token">Audit token</label>
+        <div class="gate-row">
+          <input
+            id="token"
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="paste the demo audit token"
+          />
+          <button id="unlock" type="button">Open</button>
+          <button id="forget" type="button" class="secondary" hidden>Forget token</button>
+        </div>
+        <p id="gate-status" class="status"></p>
+      </section>
+
+      <section id="list-section" hidden>
+        <div class="list-head">
+          <h2>Stored evidence <small id="list-count"></small></h2>
+          <button id="refresh" type="button" class="secondary">Refresh</button>
+        </div>
+        <div class="table-scroll">
+          <table class="audit-table" id="audit-table">
+            <thead>
+              <tr>
+                <th scope="col">Request</th>
+                <th scope="col">Created</th>
+                <th scope="col">Status</th>
+                <th scope="col">Trust tier</th>
+                <th scope="col">Attestation</th>
+                <th scope="col">Masked</th>
+                <th scope="col">Judge retries</th>
+                <th scope="col">Withheld</th>
+              </tr>
+            </thead>
+            <tbody id="audit-rows"></tbody>
+          </table>
+        </div>
+        <p class="empty" id="empty" hidden>
+          No evidence documents are stored. Send a request through the gateway first — records
+          expire with the token vault TTL.
+        </p>
+      </section>
+
+      <!-- Filled when a row is opened. The OKF document, rendered as itself. -->
+      <section id="detail" class="detail" hidden>
+        <div class="detail-head">
+          <h2 id="detail-title">Evidence</h2>
+          <button id="close-detail" type="button" class="secondary">Close</button>
+        </div>
+        <p id="detail-status" class="status"></p>
+        <div id="detail-links" class="detail-links"></div>
+        <h3>Frontmatter</h3>
+        <dl id="detail-frontmatter" class="frontmatter"></dl>
+        <h3>Body <small>the masked answer</small></h3>
+        <pre id="detail-body" class="pane"></pre>
+      </section>
+    </main>
+    <script type="module" src="/src/audit.ts"></script>
+  </body>
+</html>

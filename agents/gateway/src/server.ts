@@ -51,6 +51,13 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ExtractionFailedError, extractUnstructured } from './agent.ts';
 import {
+  AUDIT_LIST_LIMIT,
+  buildAuditStore,
+  presentedToken,
+  tokenMatches,
+  type AuditStore,
+} from './audit.ts';
+import {
   handleModels,
   logChatStart,
   parseChatRequest,
@@ -120,6 +127,8 @@ export interface CreateAppOptions {
    * and so the "a failing store never fails a request" guarantee is testable.
    */
   readonly activityStore?: ActivityStore | undefined;
+  /** Injected by the audit tests so the list runs without Firestore. */
+  readonly auditStore?: AuditStore | undefined;
   /** Injected by the warmup test so no GPU is ever poked from a suite. */
   readonly wakeGemmaImpl?: (() => Promise<boolean>) | undefined;
   /** Injectable clock so the rate-limit test does not sleep. */
@@ -252,6 +261,55 @@ export function createApp(options: CreateAppOptions): express.Application {
   app.get('/v1/requests/:id/core-response.md', (req, res, next) => {
     void handleArtifact(req, res, next, 'core-response.md');
   });
+
+  // The audit view exists only when a token is configured. Registering the
+  // routes conditionally — rather than registering them and checking inside —
+  // is what makes the feature-off 404 the literal truth rather than a
+  // hand-written status: there is no route to reach.
+  if (config.ADMIN_TOKEN !== undefined) {
+    const adminToken = config.ADMIN_TOKEN;
+    const auditStore = options.auditStore ?? buildAuditStore(config.VAULT_BACKEND);
+
+    /**
+     * True when the caller presented the configured token.
+     *
+     * A failure answers 404 with no body detail and logs `audit.denied` without
+     * the presented value: a rejected token is exactly the kind of string that
+     * must not reach a log line, and the allowlist would drop it anyway.
+     */
+    const authorized = (req: Request, res: Response, context: RequestContext): boolean => {
+      const presented = presentedToken(req.query, req.headers['x-admin-token']);
+      if (presented !== null && tokenMatches(presented, adminToken)) return true;
+
+      context.logger.event('audit.denied', {}, 'WARNING');
+      res.status(404).json({ error: 'not_found', request_id: context.requestId });
+      return false;
+    };
+
+    app.get('/v1/audit', (req, res, next) => {
+      void handleAuditList(req, res, next);
+    });
+
+    /** Newest-first evidence metadata. Never any document bodies. */
+    async function handleAuditList(req: Request, res: Response, next: NextFunction): Promise<void> {
+      const context = contextOf(req);
+      if (context === undefined) return next();
+      // Same counter as `/v1/ask`: a Firestore listing is cheap next to three
+      // model calls, but an unthrottled public path is still a way to spend.
+      if (rateLimited(req, res, context)) return;
+      if (!authorized(req, res, context)) return;
+
+      try {
+        const entries = await auditStore.list(AUDIT_LIST_LIMIT);
+        context.logger.event('audit.list', { entry_count: entries.length });
+        res.json({ entries, limit: AUDIT_LIST_LIMIT });
+      } catch (error) {
+        next(error);
+      }
+    }
+
+    mountAuditPage(app, config);
+  }
 
   mountWebUi(app, config);
 
@@ -1027,6 +1085,32 @@ function toPayload(result: AskResult): AskResponse {
     consistency: result.consistency,
     stats: result.stats,
   };
+}
+
+/**
+ * Serve the audit page at a bare `/audit`.
+ *
+ * `audit.html` is already reachable through `express.static` when the build
+ * exists; this only adds the extension-less path a person would type or paste.
+ * The route is registered only when `ADMIN_TOKEN` is set, so a fleet with the
+ * feature off answers 404 because the route genuinely does not exist.
+ *
+ * Why the page itself is not token-gated while `/v1/audit` is: the page is an
+ * empty shell — a token field and an empty table — and gating it would make the
+ * token unusable from a browser, since the holder would have to put it in a URL
+ * before the page that stores it could ever run. Nothing is disclosed by
+ * serving the shell; every byte of evidence comes from the gated endpoint.
+ */
+function mountAuditPage(app: express.Application, config: Config): void {
+  const webDir = config.WEB_DIR ?? path.resolve(here, '../../../web/dist');
+  const entry = path.join(webDir, 'audit.html');
+  if (!existsSync(entry)) return;
+
+  app.get('/audit', (_req, res) => {
+    // Relative to an explicit root, for the same reason `/` is: with no root,
+    // `send` refuses any absolute path containing a dot-segment.
+    res.sendFile('audit.html', { root: webDir });
+  });
 }
 
 /**
