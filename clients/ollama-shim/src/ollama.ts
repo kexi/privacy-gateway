@@ -67,9 +67,23 @@ export function showResponse(): Record<string, unknown> {
   };
 }
 
+/**
+ * Ollama carries images as an array of base64 strings on the message
+ * (`/api/chat`) or on the request itself (`/api/generate`).
+ *
+ * Declared rather than left to `.passthrough()` on purpose: an undeclared field
+ * survives parsing but nothing looks at it, and "nothing looks at it" is exactly
+ * how an image gets silently dropped. Naming it here is what lets the refusal
+ * below see it. The element type is deliberately loose — a caller that sends
+ * something other than base64 strings still triggers the refusal rather than a
+ * shape error, because the point is that images are unsupported, not malformed.
+ */
+const OllamaImagesSchema = z.array(z.unknown()).optional();
+
 const OllamaMessageSchema = z.object({
   role: z.string(),
   content: z.string(),
+  images: OllamaImagesSchema,
 });
 
 export const OllamaChatRequestSchema = z
@@ -86,11 +100,36 @@ export const OllamaGenerateRequestSchema = z
     prompt: z.string(),
     system: z.string().optional(),
     stream: z.boolean().optional(),
+    images: OllamaImagesSchema,
   })
   .passthrough();
 
 export type OllamaChatRequest = z.infer<typeof OllamaChatRequestSchema>;
 export type OllamaGenerateRequest = z.infer<typeof OllamaGenerateRequestSchema>;
+
+/**
+ * The text an Ollama client reads when it attaches an image.
+ *
+ * Mirrors the OpenAI surface's `multimodal_unsupported` semantics — the native
+ * Ollama error shape is a bare `{"error": string}` with no code field, so the
+ * reason has to live in the message or it is lost.
+ */
+export const OLLAMA_MULTIMODAL_REFUSAL =
+  'this gateway is text-only; the request carried image(s) and nothing was sent. ' +
+  'Redaction here is deterministic regex plus a text model, so PII inside an image — ' +
+  'a face, a screenshot of a card — cannot be found, masked or verified. Accepting the ' +
+  'image and dropping it would send a prompt you did not write; forwarding it would put ' +
+  'unmaskable data across the boundary. Send the content as text.';
+
+/** True when a `/api/chat` request attaches an image to any message. */
+export function chatCarriesImages(request: OllamaChatRequest): boolean {
+  return request.messages.some((message) => (message.images?.length ?? 0) > 0);
+}
+
+/** True when a `/api/generate` request attaches an image. */
+export function generateCarriesImages(request: OllamaGenerateRequest): boolean {
+  return (request.images?.length ?? 0) > 0;
+}
 
 /**
  * Flatten Ollama messages into the single text the pipeline masks.

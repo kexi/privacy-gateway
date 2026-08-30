@@ -458,4 +458,69 @@ describe('the shim is text-only', () => {
       expect(res.status).toBe(200);
     });
   });
+
+  it('refuses /api/chat images without calling the gateway', async () => {
+    const captured: { request?: unknown } = {};
+    await withServer(stubFetch({ status: 200, body: SUCCESS_BODY }, captured), async (base) => {
+      const res = await fetch(`${base}/api/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL_NAME,
+          messages: [{ role: 'user', content: 'What is on this card?', images: ['aGk='] }],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain('text-only');
+      expect(body.error).toContain('image');
+      // The prompt would otherwise have been forwarded with the image silently
+      // stripped, which is a different prompt than the caller wrote.
+      expect(captured.request).toBeUndefined();
+    });
+  });
+
+  it('refuses /api/generate images without calling the gateway', async () => {
+    const captured: { request?: unknown } = {};
+    await withServer(stubFetch({ status: 200, body: SUCCESS_BODY }, captured), async (base) => {
+      const res = await fetch(`${base}/api/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: OLLAMA_MODEL_NAME,
+          prompt: 'What is on this card?',
+          images: ['aGk='],
+          stream: false,
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as { error: string };
+      expect(body.error).toContain('text-only');
+      expect(captured.request).toBeUndefined();
+    });
+  });
+
+  it('accepts both Ollama routes when the images array is empty', async () => {
+    await withServer(stubFetch({ status: 200, body: SUCCESS_BODY }), async (base) => {
+      const chat = await fetch(`${base}/api/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'Just words.', images: [] }],
+          stream: false,
+        }),
+      });
+      expect(chat.status).toBe(200);
+
+      const generate = await fetch(`${base}/api/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt: 'Just words.', images: [], stream: false }),
+      });
+      expect(generate.status).toBe(200);
+    });
+  });
 });

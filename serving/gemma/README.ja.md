@@ -9,7 +9,7 @@ Gateway / Synthesis Agent が `OllamaLlm`（`packages/common` にある ADK `Bas
 | モデル              | サイズ   | 用途                                                                      |
 | ------------------- | -------- | ------------------------------------------------------------------------- |
 | `gemma4:12b` (既定) | 約 8.1GB | L4 (VRAM 24GB) に収まる最大級。PII スパン抽出と leak check の精度が要件。 |
-| `gemma4:e4b` (退避)  | 約 3.3GB | L4 quota が取れない、またはコールドスタートを更に縮めたい場合。           |
+| `gemma4:e4b` (退避) | 約 3.3GB | L4 quota が取れない、またはコールドスタートを更に縮めたい場合。           |
 
 切り替えは Terraform 変数 `gemma_model` で行う
 （例: `GEMMA_MODEL=gemma4:e4b just build gemma` のあと

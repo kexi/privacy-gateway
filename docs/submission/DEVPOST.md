@@ -42,15 +42,20 @@ reasons never sees a secret at all.
   names it in `mask_terms` and it is substituted for ⟦CUSTOM_1⟧ before any
   detector runs. Both boundary scans then look for the literal string — the one
   check that _proves_ the masking worked rather than re-running the pattern that
-  decided it. Terms are never persisted: the audit record keeps a count only.
+  decided it. The term list is never persisted to evidence or logs; matched
+  values are stored only in the TTL'd Token Vault for rehydration, like every
+  masked value. The audit record keeps a count only.
 - **Fail closed, everywhere**: extraction failure, placeholder injection, vault
   expiry, invented tokens, a surviving secret term, or a flagged leak → no
   answer, only masked evidence ("content withheld"). High-risk categories
-  (cards, keys) are never rehydrated.
-- **Consume it five ways**: web UI, REST, an OpenAI-compatible endpoint (select
+  (cards, keys) are withheld by default; they are restored only through an
+  explicit per-request opt-in, recorded as `disclosure_requested`, while the
+  stored evidence remains masked either way.
+- **Consume it six ways**: web UI, REST, an OpenAI-compatible endpoint (select
   `privacy-gateway` as a model in Codex CLI/Cursor/any custom-base-URL tool),
-  an MCP server for Claude Desktop/Claude Code, and a single-file PEP 723
-  Python CLI.
+  an MCP server for Claude Desktop/Claude Code, a localhost model-picker shim
+  (Anthropic Messages + native Ollama APIs), and a single-file PEP 723 Python
+  CLI.
 - **Fleet operations**: one request = one Cloud Trace trace across all hops;
   structured logs behind a typed allowlist; scale-to-zero GPU; a billing budget
   that trips a kill switch which unpublishes the gateway.
@@ -114,7 +119,8 @@ zod · vitest · Playwright · MCP · OKF v0.2
 - Hosted demo: https://privacy-gateway.kexi.dev
 - Repository: https://github.com/kexi/privacy-gateway ⟨confirm access for judges⟩
 - Video: ⟨YouTube URL, ≤4 min, English subtitles⟩
-- Architecture diagram: docs/diagram/architecture.png (also embedded in README)
+- Architecture diagram: https://github.com/kexi/privacy-gateway/blob/main/docs/diagram/architecture.drawio.png
+  (embedded at the top of the README; the PNG carries its own editable draw.io source)
 
 ## Gemma integration (bonus)
 

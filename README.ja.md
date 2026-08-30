@@ -25,6 +25,11 @@ User ──HTTP──▶ Gateway (Gemma)
                User  (OKF 回答ドキュメント + 監査証跡)
 ```
 
+![アーキテクチャ図: トラストバウンダリ、3 エージェント、6 つの利用面、コストキルスイッチ](docs/diagram/architecture.drawio.png)
+
+この PNG には draw.io のソースが埋め込まれている（draw.io で開けばそのまま編集できる。
+同じ図の実体は [`docs/diagram/architecture.drawio`](docs/diagram/architecture.drawio)）。
+
 A2A を使うのは Gateway → Core のこの 1 ホップのみ。Gateway → Synthesis は意図的に
 通常の認証付き HTTP——OKF ドキュメントは監査アーティファクトであり、途中で LLM に
 言い換えられることなく取得できなければならない。詳細は下の
@@ -275,11 +280,15 @@ verdict}` が付く。
 リテラル比較なら置換の失敗をそのまま捕捉できる。マスキングが機能したことを**証明**できる
 唯一のカテゴリである。
 
-語句は永続化されない。Gateway → Synthesis（どちらも境界の内側）を流れるだけで、監査記録が
-保持するのは `attestation.custom_terms: {count: N}` のみ。ダイジェストにしない理由は、
-コードネームが推測可能な小さい空間から選ばれるため、そのハッシュが秘匿ではなく確認オラクル
-になるからである。ログに載るのは `term_count` と `surviving_term_count` だけで、ログの
-allowlist には語句が入り得るフィールドが存在しない。
+語句リストは evidence にもログにも永続化されない。マッチした値だけが、他のマスク済みの値と
+同じく、再水和のために TTL 付き Token Vault に保存される。リスト自体は Gateway → Synthesis
+（どちらも境界の内側）を流れるだけでどこにも書かれない。一方、実際にマッチした語句は
+request id をキーとする vault のマッピング項目になり、request id とともに失効する——
+再水和にはそれ以外の復元手段がないからである。監査記録が保持するのは
+`attestation.custom_terms: {count: N}` のみ。ダイジェストにしない理由は、コードネームが
+推測可能な小さい空間から選ばれるため、そのハッシュが秘匿ではなく確認オラクルになるから
+である。ログに載るのは `term_count` と `surviving_term_count` だけで、ログの allowlist には
+語句が入り得るフィールドが存在しない。
 
 ## 設計としてのテキスト専用
 

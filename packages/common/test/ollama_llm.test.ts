@@ -62,7 +62,7 @@ function bodyOf(init: RequestInit): Record<string, unknown> {
 describe('non-streaming generation', () => {
   it('returns the completion text as model content', async () => {
     const { impl } = stubFetch(completion('{"spans": []}'));
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
 
     const responses = await collect(llm.generateContentAsync(request()));
     expect(responses).toHaveLength(1);
@@ -72,7 +72,7 @@ describe('non-streaming generation', () => {
 
   it('reports token usage', async () => {
     const { impl } = stubFetch(completion('ok'));
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
 
     const [response] = await collect(llm.generateContentAsync(request()));
     expect(response?.usageMetadata).toMatchObject({
@@ -84,16 +84,16 @@ describe('non-streaming generation', () => {
 
   it('strips the registry prefix from the model name it sends', async () => {
     const { impl, calls } = stubFetch(completion('ok'));
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
     await collect(llm.generateContentAsync(request()));
 
-    expect(bodyOf(calls[0]?.init ?? {})['model']).toBe('gemma3:12b');
+    expect(bodyOf(calls[0]?.init ?? {})['model']).toBe('gemma4:12b');
     expect(calls[0]?.url).toBe('http://localhost:11434/v1/chat/completions');
   });
 
   it('surfaces an HTTP failure as an error response rather than throwing', async () => {
     const { impl } = stubFetch({ error: 'model not found' }, 404);
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
 
     const [response] = await collect(llm.generateContentAsync(request()));
     expect(response?.errorCode).toBe('404');
@@ -104,7 +104,7 @@ describe('non-streaming generation', () => {
 describe('JSON mode', () => {
   it('asks for a JSON object when the request sets the JSON MIME type', async () => {
     const { impl, calls } = stubFetch(completion('{}'));
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
 
     await collect(
       llm.generateContentAsync(request({ config: { responseMimeType: 'application/json' } })),
@@ -114,7 +114,7 @@ describe('JSON mode', () => {
 
   it('omits response_format for a plain text request', async () => {
     const { impl, calls } = stubFetch(completion('hi'));
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
 
     await collect(llm.generateContentAsync(request()));
     expect(bodyOf(calls[0]?.init ?? {})['response_format']).toBeUndefined();
@@ -179,7 +179,7 @@ describe('streaming', () => {
         }),
       )) as unknown as typeof fetch;
 
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
     const responses = await collect(llm.generateContentAsync(request(), true));
 
     expect(responses.filter((response) => response.partial === true)).toHaveLength(2);
@@ -198,7 +198,7 @@ describe('streaming', () => {
     const impl = (() =>
       Promise.resolve(new Response(frames, { status: 200 }))) as unknown as typeof fetch;
 
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b', fetchImpl: impl });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
     const responses = await collect(llm.generateContentAsync(request(), true));
     expect(responses.at(-1)?.content?.parts?.[0]?.text).toBe('AB');
   });
@@ -207,18 +207,18 @@ describe('streaming', () => {
 describe('registry', () => {
   it('resolves an ollama/ model name to this class', () => {
     registerOllamaLlm();
-    expect(LLMRegistry.resolve('ollama/gemma3:12b')).toBe(OllamaLlm);
+    expect(LLMRegistry.resolve('ollama/gemma4:12b')).toBe(OllamaLlm);
   });
 
   it('adds the prefix only when it is missing', () => {
-    expect(ollamaModelId('gemma3:12b')).toBe('ollama/gemma3:12b');
-    expect(ollamaModelId('ollama/gemma3:12b')).toBe('ollama/gemma3:12b');
+    expect(ollamaModelId('gemma4:12b')).toBe('ollama/gemma4:12b');
+    expect(ollamaModelId('ollama/gemma4:12b')).toBe('ollama/gemma4:12b');
   });
 });
 
 describe('live connections', () => {
   it('refuses rather than degrading silently', async () => {
-    const llm = new OllamaLlm({ model: 'ollama/gemma3:12b' });
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b' });
     await expect(llm.connect(request())).rejects.toThrow(/does not support live connections/u);
   });
 });
@@ -265,7 +265,7 @@ describe('gemma auth header selection', () => {
 
     await drain(
       new OllamaLlm({
-        model: 'ollama/gemma3:12b',
+        model: 'ollama/gemma4:12b',
         baseUrl: 'http://localhost:11434/v1',
         apiKey: 'ollama',
         fetchImpl: impl,
@@ -283,7 +283,7 @@ describe('gemma auth header selection', () => {
 
     await drain(
       new OllamaLlm({
-        model: 'ollama/gemma3:12b',
+        model: 'ollama/gemma4:12b',
         baseUrl: 'https://gemma-serving-123.us-central1.run.app/v1',
         apiKey: 'ollama',
         fetchImpl: impl,
@@ -302,7 +302,7 @@ describe('gemma auth header selection', () => {
 
     await drain(
       new OllamaLlm({
-        model: 'ollama/gemma3:12b',
+        model: 'ollama/gemma4:12b',
         baseUrl: 'https://tunnel.test/v1',
         apiKey: 'static-key',
         auth: 'none',
@@ -321,7 +321,7 @@ describe('gemma auth header selection', () => {
 
     await drain(
       new OllamaLlm({
-        model: 'ollama/gemma3:12b',
+        model: 'ollama/gemma4:12b',
         baseUrl: 'http://gemma.internal/v1',
         auth: 'iam',
         fetchImpl: impl,
@@ -340,7 +340,7 @@ describe('gemma auth header selection', () => {
     const { impl, calls } = stubFetch(completion('{}'));
 
     const llm = new OllamaLlm({
-      model: 'ollama/gemma3:12b',
+      model: 'ollama/gemma4:12b',
       baseUrl: 'https://gemma.test/v1',
       fetchImpl: impl,
     });

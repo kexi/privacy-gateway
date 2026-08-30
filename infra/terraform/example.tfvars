@@ -15,4 +15,4 @@ image_tag = "latest"
 gpu_enabled = true
 
 gemini_model = "gemini-3.5-flash"
-gemma_model  = "gemma3:12b"
+gemma_model  = "gemma4:12b"

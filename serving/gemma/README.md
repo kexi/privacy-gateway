@@ -7,9 +7,9 @@ The OpenAI-compatible endpoint that the Gateway and Synthesis agents call throug
 
 ## Model choice
 
-| Model                  | Size   | Use                                                                                                          |
-| ---------------------- | ------ | ------------------------------------------------------------------------------------------------------------ |
-| `gemma4:12b` (default) | ~8.1GB | The largest that comfortably fits an L4 (24GB VRAM). Needed for PII span extraction and leak-check accuracy. |
+| Model                   | Size   | Use                                                                                                          |
+| ----------------------- | ------ | ------------------------------------------------------------------------------------------------------------ |
+| `gemma4:12b` (default)  | ~8.1GB | The largest that comfortably fits an L4 (24GB VRAM). Needed for PII span extraction and leak-check accuracy. |
 | `gemma4:e4b` (fallback) | ~3.3GB | When L4 quota is unavailable, or to shorten cold starts further.                                             |
 
 Switch with the `gemma_model` Terraform variable (for example

@@ -22,16 +22,18 @@ import {
   type LlmResponse,
 } from '@google/adk';
 import type { Content, Part } from '@google/genai';
-import { gemmaAuthMode, type GemmaAuthMode } from './config.ts';
+import { DEFAULT_GEMMA_MODEL, gemmaAuthMode, type GemmaAuthMode } from './config.ts';
 import { authorizedHeaders } from './http_client.ts';
 
-/** Model names this class claims in the registry, e.g. `ollama/gemma3:12b`. */
+/** Model names this class claims in the registry, e.g. `ollama/<gemma tag>`. */
 const SUPPORTED_MODEL_PATTERN = /^ollama\/.*/u;
 
 /** Prefix stripped before the name is sent to Ollama. */
 const MODEL_PREFIX = 'ollama/';
 
-export const DEFAULT_GEMMA_MODEL = 'gemma3:12b';
+// Re-exported from `config`, never redeclared: a second literal here is how the
+// adapter drifted a major model version behind the env default once already.
+export { DEFAULT_GEMMA_MODEL };
 export const DEFAULT_GEMMA_BASE_URL = 'http://localhost:11434/v1';
 
 /** One message in the OpenAI chat format. */
@@ -73,7 +75,7 @@ export interface OllamaLlmOptions {
  * ADK model adapter for an OpenAI-compatible Ollama endpoint.
  *
  * Registered for the `ollama/` prefix, so an `LlmAgent` can be given
- * `model: 'ollama/gemma3:12b'` as a plain string and the registry resolves it.
+ * `model: ollamaModelId(DEFAULT_GEMMA_MODEL)` and the registry resolves it.
  */
 export class OllamaLlm extends BaseLlm {
   static override readonly supportedModels: Array<string | RegExp> = [SUPPORTED_MODEL_PATTERN];

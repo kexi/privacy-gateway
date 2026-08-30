@@ -57,7 +57,7 @@ function config(overrides: Record<string, string> = {}) {
       VAULT_BACKEND: 'memory',
       CORE_BASE_URL,
       GEMINI_MODEL: 'gemini-3.5-flash',
-      GEMMA_MODEL: 'gemma3:12b',
+      GEMMA_MODEL: 'gemma4:12b',
       // Playwright fires several requests from one address in quick succession;
       // the limiter is exercised by the vitest suite instead.
       RATE_LIMIT_PER_MINUTE: '0',

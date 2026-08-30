@@ -447,54 +447,72 @@ export type RehydrationDefect =
   | { readonly kind: 'leftover_token'; readonly tokens: readonly string[] }
   | { readonly kind: 'missing_withheld'; readonly tokens: readonly string[] }
   | { readonly kind: 'substitution_mismatch'; readonly tokens: readonly string[] }
-  | { readonly kind: 'unrestored_pii'; readonly categories: readonly PiiCategory[] };
+  // The released string is not the one the policy describes, and the difference
+  // is not attributable to a single token — text moved, was inserted, or was
+  // dropped between placeholders. It carries no token list because there is no
+  // honest one to give, and it can carry no excerpt because the two strings
+  // under comparison are the answer itself.
+  | { readonly kind: 'rebuild_mismatch'; readonly tokens: readonly [] };
+
+/**
+ * Matches one placeholder, transcribed rather than imported.
+ *
+ * Deliberately a second copy of the tokenizer's pattern: this function's whole
+ * job is to disagree with the rehydrator when the rehydrator is wrong, and
+ * sharing the regex that produced the placeholders would make a tokenizer bug
+ * invisible to the check built to catch it. Same reason `pgw_verify` transcribes
+ * the scanner instead of importing it.
+ */
+const VERIFY_TOKEN_RE = /⟦([A-Z][A-Z0-9_]*?)_(\d+)⟧/gu;
 
 /**
  * Prove the rehydration did exactly what the policy said, and nothing else.
  *
- * Three independent properties, all decided deterministically over strings the
- * function already holds — no model, no second vault read, no I/O:
+ * The decisive property is **positional reconstruction**: `coreAnswer` is walked
+ * once, each placeholder is replaced by its vault value (or kept verbatim when
+ * the policy withheld it), and the result must equal `released` as strings.
+ * Nothing else can hold if that does — a rehydrator that swapped two values of
+ * the same category, wrote a value the vault does not hold, restored a token the
+ * policy withheld, or inserted text anywhere fails a byte comparison.
  *
- * (a) **Exactly the withheld tokens survive.** The set of `⟦…⟧` still present in
- *     the released text must equal the set the policy decided to withhold. A
- *     leftover the policy did not ask for is a substitution that silently failed
- *     — the user would see a raw placeholder where a value was promised. A
- *     *missing* withheld token is worse: the only way a token the policy said to
- *     keep can vanish is that something replaced it, which is a disclosure the
- *     policy forbade.
+ * Why exact equality rather than the set-and-substring properties this replaced:
+ * those asked only whether each value appeared *somewhere*. Given
+ * `⟦EMAIL_1⟧ → alice@…` and `⟦EMAIL_2⟧ → bob@…`, an answer that filled them in
+ * the wrong order still contained both values, still had no leftover placeholder
+ * and still left an empty residue — three passing checks over a released string
+ * that told the reader Bob's address was Alice's. Equality is what makes the
+ * correspondence between placeholder and value, not just their presence, part of
+ * the guarantee.
  *
- * (b) **Every restored value is the vault's own.** Each placeholder the policy
- *     restored must appear in the output as the exact string the mapping holds.
- *     This is what a forged or corrupted substitution fails: a rehydrator that
- *     wrote some other value would still produce a placeholder-free string that
- *     passes (a).
+ * Two of the old properties are kept ahead of it as cheaper preambles, purely so
+ * a failure names *what* went wrong instead of only that the strings differ:
  *
- * (c) **Nothing else that looks like PII appeared.** The deterministic attester
- *     is re-run over the released text with the intentionally restored values
- *     removed. Whatever it finds after that subtraction was not something this
- *     request restored on purpose — it is text that materialized during
- *     rehydration, which is precisely the failure mode nothing else here would
- *     catch.
+ * (a) **Exactly the withheld tokens survive.** A leftover the policy did not ask
+ *     for is a substitution that silently failed; a *missing* withheld token is
+ *     worse, since the only way a token the policy said to keep can vanish is
+ *     that something replaced it — a disclosure the policy forbade.
  *
- * Why (c) subtracts the restored values rather than skipping the scan: the whole
- * point of a successful rehydration is that real identifiers are now in the
- * string, so scanning it raw would flag every release. Subtracting exactly what
- * was restored on purpose leaves the residue, and the residue must be empty.
+ * (b) **Every restored value is the vault's own**, checked per token so a forged
+ *     substitution is reported by name.
  *
- * Why deterministic and post-hoc rather than trusting `rehydrateWithPolicy`:
- * that function is the thing being checked. A verification that shares its
- * implementation only proves the implementation agrees with itself, which is the
- * same reason `pgw_verify` transcribes the scanner instead of importing it.
+ * The old residue scan (re-running the attester over the released text minus the
+ * restored values) is dropped: it existed to catch text that materialized during
+ * rehydration, and equality with an independently rebuilt string catches that
+ * strictly more precisely — any inserted character fails, whether or not it
+ * happens to look like PII to the scanner.
  *
- * @returns the defect, or `null` when all three properties hold.
+ * @returns the defect, or `null` when the released string is exactly the one the
+ *   policy describes.
  */
 export function verifyRehydration(input: {
+  /** The tokenized answer the rehydration started from. */
+  readonly coreAnswer: string;
   readonly released: string;
   readonly restored: readonly string[];
   readonly withheldTokens: readonly string[];
   readonly mapping: Readonly<Record<string, string>>;
 }): RehydrationDefect | null {
-  const { released, restored, withheldTokens, mapping } = input;
+  const { coreAnswer, released, restored, withheldTokens, mapping } = input;
 
   // (a) The leftover set must equal the withheld set, in both directions.
   const leftover = new Set(findTokens(released));
@@ -506,7 +524,8 @@ export function verifyRehydration(input: {
   const vanished = [...expected].filter((token) => !leftover.has(token)).sort();
   if (vanished.length > 0) return { kind: 'missing_withheld', tokens: vanished };
 
-  // (b) Each restored placeholder's value must be literally present.
+  // (b) Each restored placeholder's value must be literally present. Cheaper
+  // than the rebuild and names the offending token, which equality cannot.
   const forged = restored
     .filter((token) => {
       const value = mapping[token];
@@ -521,23 +540,35 @@ export function verifyRehydration(input: {
     .sort();
   if (forged.length > 0) return { kind: 'substitution_mismatch', tokens: forged };
 
-  // (c) The attester's residue after removing what was restored on purpose.
-  let residue = released;
-  // Longest first: a short value that is a substring of a longer one must not
-  // punch a hole through the middle of it and leave a fragment the scan then
-  // reads as something else.
-  const restoredValues = restored
-    .map((token) => mapping[token])
-    .filter((value): value is string => value !== undefined && value !== '')
-    .sort((a, b) => b.length - a.length);
-  for (const value of restoredValues) {
-    // A space, not the empty string, so two adjacent values cannot be welded
-    // into one spurious identifier by their own removal.
-    residue = residue.split(value).join(' ');
-  }
+  // (c) The rebuild. One pass over `coreAnswer`, substituting nothing the policy
+  // did not name: a withheld token is copied through, a restored token becomes
+  // its vault value, and every character between placeholders is copied
+  // verbatim.
+  const withheldSet = new Set(withheldTokens);
+  const restoredSet = new Set(restored);
+  let rebuilt = '';
+  let cursor = 0;
+  VERIFY_TOKEN_RE.lastIndex = 0;
+  for (const match of coreAnswer.matchAll(VERIFY_TOKEN_RE)) {
+    const token = match[0];
+    rebuilt += coreAnswer.slice(cursor, match.index);
+    cursor = match.index + token.length;
 
-  const planted = filterPiiCategories(scanForLeaks(residue)).categories;
-  if (planted.length > 0) return { kind: 'unrestored_pii', categories: planted };
+    if (withheldSet.has(token)) {
+      rebuilt += token;
+      continue;
+    }
+    const value = restoredSet.has(token) ? mapping[token] : undefined;
+    if (value === undefined) {
+      // Neither withheld nor restored: an earlier gate should have refused it.
+      // Reporting it here rather than guessing keeps the check total.
+      return { kind: 'substitution_mismatch', tokens: [token] };
+    }
+    rebuilt += value;
+  }
+  rebuilt += coreAnswer.slice(cursor);
+
+  if (rebuilt !== released) return { kind: 'rebuild_mismatch', tokens: [] };
 
   return null;
 }
@@ -892,6 +923,7 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   );
 
   const defect = verifyRehydration({
+    coreAnswer,
     released: released.text,
     restored: restoredTokens,
     withheldTokens,
@@ -905,10 +937,11 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       {
         refusal: 'rehydration_incomplete',
         error_code: defect.kind,
-        // Token *names* and closed-enum categories only, exactly as every other
-        // refusal reports: never a value, never the released text.
-        ...('tokens' in defect ? { unresolved_tokens: [...defect.tokens] } : {}),
-        ...('categories' in defect ? { categories: [...defect.categories] } : {}),
+        // Token *names* only, exactly as every other refusal reports: never a
+        // value, never the released text. `rebuild_mismatch` carries an empty
+        // list because the difference is between two whole strings and neither
+        // may be quoted, not because the defect is any less specific.
+        unresolved_tokens: [...defect.tokens],
       },
       'ERROR',
     );
@@ -918,7 +951,9 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       attestation,
       consistency,
       verdictFindings,
-      'categories' in defect ? defect.categories : [],
+      // No category: the check decides by string comparison, not by scanning, so
+      // it has no honest category to attribute the defect to.
+      [],
     );
   }
 

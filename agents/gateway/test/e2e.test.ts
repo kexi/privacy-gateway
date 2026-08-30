@@ -90,7 +90,7 @@ function testConfig(overrides: Record<string, string> = {}): Config {
       VAULT_BACKEND: 'memory',
       CORE_BASE_URL,
       GEMINI_MODEL: 'gemini-3.5-flash',
-      GEMMA_MODEL: 'gemma3:12b',
+      GEMMA_MODEL: 'gemma4:12b',
       // The limiter is off by default in tests: every case here is a legitimate
       // request, and a shared window would make them order-dependent.
       RATE_LIMIT_PER_MINUTE: '0',

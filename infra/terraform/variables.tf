@@ -27,8 +27,8 @@ variable "gemini_model" {
 
 variable "gemma_model" {
   description = <<-EOT
-    Ollama tag served by gemma-serving. The L4 has 24GB of VRAM, so gemma3:12b
-    (~8.1GB) fits; drop to gemma3:4b if only a smaller GPU is available.
+    Ollama tag served by gemma-serving. The L4 has 24GB of VRAM, so gemma4:12b
+    (~8.1GB) fits; drop to gemma4:e4b if only a smaller GPU is available.
 
     This must match the tag baked into the image by `just build gemma`.
   EOT

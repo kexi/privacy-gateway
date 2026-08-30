@@ -19,6 +19,10 @@ import {
   type GemmaAuthMode,
   type Logger,
 } from '@privacy-gateway/common';
+// From the `config` subpath, not the index: the index deliberately does not
+// re-export it, and a local literal here is what let the judge fall back to a
+// model a major version behind the env default.
+import { DEFAULT_GEMMA_MODEL } from '@privacy-gateway/common/config';
 import type { LeakJudgeContext } from './pipeline.ts';
 
 export const SYNTHESIS_AGENT_NAME = 'synthesis_agent';
@@ -61,7 +65,7 @@ export function buildSynthesisAgent(model?: string): LlmAgent {
  * How much of the masked prompt travels with the answer as context.
  *
  * The prompt is PII-free by construction, so the cap is about tokens rather than
- * safety: 2000 characters is far inside gemma3:12b's window even alongside the
+ * safety: 2000 characters is far inside the served Gemma's window even alongside the
  * answer and this instruction, and the opening of a request carries the task
  * description that makes the answer legible. A truncated prompt is marked so the
  * model does not read the cut as the request ending there.
@@ -208,7 +212,7 @@ export function createLeakJudge(
     process.env['GEMMA_BASE_URL'] ??
     'http://localhost:11434/v1'
   ).replace(/\/+$/u, '');
-  const model = options.model ?? process.env['GEMMA_MODEL'] ?? 'gemma3:12b';
+  const model = options.model ?? process.env['GEMMA_MODEL'] ?? DEFAULT_GEMMA_MODEL;
   const apiKey = options.apiKey ?? process.env['GEMMA_API_KEY'] ?? 'ollama';
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   // Cloud Run's Gemma service is IAM-protected, so the static key is not a

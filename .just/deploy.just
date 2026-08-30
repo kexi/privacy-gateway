@@ -244,7 +244,7 @@ deploy *vars: build (tf-apply vars)
 
 # --- demo / filming windows --------------------------------------------------
 # gemma-serving scales to zero, and a scale-from-zero costs ~90 s while Ollama
-# loads gemma3:12b onto the GPU. That is fine for a smoke test (the gateway's
+# loads gemma4:12b onto the GPU. That is fine for a smoke test (the gateway's
 # REQUEST_DEADLINE_SECONDS is 150) but ruinous on camera. These two recipes pin
 # an instance up for the length of a demo and then give the billing back.
 #

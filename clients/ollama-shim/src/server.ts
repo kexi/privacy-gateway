@@ -32,15 +32,18 @@ import {
 import { GatewayClient, refusalText, type GatewayResult } from './gateway.ts';
 import { createLogger, errorFields, type Logger } from './logging.ts';
 import {
+  chatCarriesImages,
   chatNdjsonFrames,
   chatResponse,
   flattenGenerateRequest,
   flattenOllamaMessages,
+  generateCarriesImages,
   generateNdjsonFrames,
   generateResponse,
   ollamaError,
   OllamaChatRequestSchema,
   OllamaGenerateRequestSchema,
+  OLLAMA_MULTIMODAL_REFUSAL,
   resultToOllamaText,
   showResponse,
   tagsResponse,
@@ -307,6 +310,14 @@ async function handleOllamaChat(
     return;
   }
 
+  // Checked before flattening, so an image is refused rather than quietly
+  // discarded by a flattener that only knows how to read text. Nothing has been
+  // sent upstream at this point.
+  if (chatCarriesImages(parsed.data)) {
+    json(res, 400, ollamaError(OLLAMA_MULTIMODAL_REFUSAL));
+    return;
+  }
+
   const text = flattenOllamaMessages(parsed.data);
   if (text.length === 0) {
     json(res, 400, ollamaError('messages contained no system or user content to send'));
@@ -359,6 +370,12 @@ async function handleOllamaGenerate(
 
   if (!parsed.success) {
     json(res, 400, ollamaError('prompt is required'));
+    return;
+  }
+
+  // Same rule as `/api/chat`: refuse before the gateway is called at all.
+  if (generateCarriesImages(parsed.data)) {
+    json(res, 400, ollamaError(OLLAMA_MULTIMODAL_REFUSAL));
     return;
   }
 

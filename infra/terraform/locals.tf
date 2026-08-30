@@ -94,7 +94,7 @@ locals {
         # Why 150 and not the 60 s compiled-in default: on a cold fleet the
         # first /v1/ask blew the deadline and returned 504 before Gemma had
         # answered. The GPU instance itself starts in ~5 s; what dominates is
-        # Ollama loading gemma3:12b (~8 GB) into the RTX PRO 6000 after the
+        # Ollama loading gemma4:12b (~8 GB) into the RTX PRO 6000 after the
         # container is up, and the request that triggers the scale-from-zero
         # waits for all of it. Measured worst case was ~90 s from cold, so 150 s
         # covers it with margin without letting a genuinely hung request hang

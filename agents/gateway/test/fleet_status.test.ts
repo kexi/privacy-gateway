@@ -47,7 +47,7 @@ function testConfig(overrides: Record<string, string> = {}): Config {
       VAULT_BACKEND: 'memory',
       CORE_BASE_URL,
       GEMINI_MODEL: 'gemini-3.5-flash',
-      GEMMA_MODEL: 'gemma3:12b',
+      GEMMA_MODEL: 'gemma4:12b',
       RATE_LIMIT_PER_MINUTE: '0',
       ...overrides,
     },

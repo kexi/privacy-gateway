@@ -3,12 +3,17 @@
  *
  * Rehydration is the one step that puts real values back into a string, so
  * "it substituted exactly what the policy said and nothing else" is the property
- * with the most riding on it. These tests state the three invariants and prove
- * that violating any one of them refuses the release rather than degrading it:
+ * with the most riding on it. The check rebuilds the expected release from the
+ * tokenized answer and requires exact string equality; these tests prove that a
+ * released string differing from it in any way refuses the release rather than
+ * degrading it:
  *
  * (a) the placeholders left in the released text are exactly the withheld set
  * (b) every restored placeholder carries the vault's own value, not another
- * (c) no identifier appears that this request did not restore on purpose
+ * (c) each value sits at its own placeholder's position — two values of one
+ *     category swapped, one value duplicated over another's position, or a value
+ *     inserted where there was no placeholder are all refused
+ * (d) no text appears, moves or vanishes between placeholders
  *
  * A violation is `rehydration_incomplete` — a 500, because it is a fault in our
  * code rather than something the caller could fix — and the body is withheld
@@ -100,9 +105,10 @@ describe('verifyRehydration', () => {
   it('passes a rehydration that did exactly what it was told', () => {
     expect(
       verifyRehydration({
-        released: 'Dear Taro Yamada, card ⟦CREDIT_CARD_1⟧ failed.',
-        restored: ['⟦PERSON_1⟧'],
-        withheldTokens: ['⟦CREDIT_CARD_1⟧'],
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        released: 'Dear Taro Yamada, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        restored: ['\u27e6PERSON_1\u27e7'],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
         mapping: MAPPING,
       }),
     ).toBeNull();
@@ -113,12 +119,13 @@ describe('verifyRehydration', () => {
     // where the answer promised a value.
     expect(
       verifyRehydration({
-        released: 'Dear ⟦PERSON_1⟧, card ⟦CREDIT_CARD_1⟧ failed.',
-        restored: ['⟦PERSON_1⟧'],
-        withheldTokens: ['⟦CREDIT_CARD_1⟧'],
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        released: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        restored: ['\u27e6PERSON_1\u27e7'],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
         mapping: MAPPING,
       }),
-    ).toEqual({ kind: 'leftover_token', tokens: ['⟦PERSON_1⟧'] });
+    ).toEqual({ kind: 'leftover_token', tokens: ['\u27e6PERSON_1\u27e7'] });
   });
 
   it('rejects a withheld placeholder that vanished', () => {
@@ -126,44 +133,132 @@ describe('verifyRehydration', () => {
     // something replaced it — which is the disclosure the policy forbade.
     expect(
       verifyRehydration({
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
         released: 'Dear Taro Yamada, the card failed.',
-        restored: ['⟦PERSON_1⟧'],
-        withheldTokens: ['⟦CREDIT_CARD_1⟧'],
+        restored: ['\u27e6PERSON_1\u27e7'],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
         mapping: MAPPING,
       }),
-    ).toEqual({ kind: 'missing_withheld', tokens: ['⟦CREDIT_CARD_1⟧'] });
+    ).toEqual({ kind: 'missing_withheld', tokens: ['\u27e6CREDIT_CARD_1\u27e7'] });
   });
 
   it('rejects a substitution that inserted some other value', () => {
     // Placeholder-free and leftover-clean, so only the value check catches it.
     expect(
       verifyRehydration({
-        released: 'Dear Hanako Suzuki, card ⟦CREDIT_CARD_1⟧ failed.',
-        restored: ['⟦PERSON_1⟧'],
-        withheldTokens: ['⟦CREDIT_CARD_1⟧'],
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        released: 'Dear Hanako Suzuki, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        restored: ['\u27e6PERSON_1\u27e7'],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
         mapping: MAPPING,
       }),
-    ).toEqual({ kind: 'substitution_mismatch', tokens: ['⟦PERSON_1⟧'] });
+    ).toEqual({ kind: 'substitution_mismatch', tokens: ['\u27e6PERSON_1\u27e7'] });
   });
 
-  it('rejects an identifier this request never restored', () => {
+  it('rejects two values of one category filled in each other\u2019s place', () => {
+    // Both values are present, no placeholder is left over, and the residue is
+    // empty — every presence-based check passes while the released text tells
+    // the reader that Bob\u2019s address is Alice\u2019s. Only the positional rebuild
+    // sees it.
+    const mapping = {
+      '\u27e6EMAIL_1\u27e7': 'alice@example.com',
+      '\u27e6EMAIL_2\u27e7': 'bob@example.com',
+    };
     expect(
       verifyRehydration({
-        released: 'Dear Taro Yamada, also write to other.person@example.com.',
-        restored: ['⟦PERSON_1⟧'],
+        coreAnswer: 'Alice is \u27e6EMAIL_1\u27e7 and Bob is \u27e6EMAIL_2\u27e7.',
+        released: 'Alice is bob@example.com and Bob is alice@example.com.',
+        restored: ['\u27e6EMAIL_1\u27e7', '\u27e6EMAIL_2\u27e7'],
+        withheldTokens: [],
+        mapping,
+      }),
+    ).toEqual({ kind: 'rebuild_mismatch', tokens: [] });
+  });
+
+  it('rejects a value duplicated over another placeholder', () => {
+    // One value written into both positions: it is the vault\u2019s own string, so
+    // the per-token presence check is satisfied for the token it belongs to.
+    const mapping = {
+      '\u27e6EMAIL_1\u27e7': 'alice@example.com',
+      '\u27e6EMAIL_2\u27e7': 'bob@example.com',
+    };
+    expect(
+      verifyRehydration({
+        coreAnswer: 'Alice is \u27e6EMAIL_1\u27e7 and Bob is \u27e6EMAIL_2\u27e7.',
+        released: 'Alice is alice@example.com and Bob is alice@example.com.',
+        restored: ['\u27e6EMAIL_1\u27e7', '\u27e6EMAIL_2\u27e7'],
+        withheldTokens: [],
+        mapping,
+      }),
+    ).toEqual({ kind: 'substitution_mismatch', tokens: ['\u27e6EMAIL_2\u27e7'] });
+  });
+
+  it('rejects a forged release that inserts a vault value somewhere else', () => {
+    // The substitution itself is correct; an extra copy of the value was added
+    // where the tokenized answer had no placeholder at all. Presence-based
+    // checks cannot see the difference — equality with the rebuild can.
+    expect(
+      verifyRehydration({
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, your account is ready.',
+        released: 'Dear Taro Yamada, your account is ready. cc: Taro Yamada',
+        restored: ['\u27e6PERSON_1\u27e7'],
         withheldTokens: [],
         mapping: MAPPING,
       }),
-    ).toEqual({ kind: 'unrestored_pii', categories: ['EMAIL'] });
+    ).toEqual({ kind: 'rebuild_mismatch', tokens: [] });
+  });
+
+  it('rejects text inserted between placeholders', () => {
+    // Nothing about the substitutions changed; the surrounding prose did. The
+    // released answer must be the answer Core wrote, values aside.
+    expect(
+      verifyRehydration({
+        coreAnswer: 'Contact \u27e6PERSON_1\u27e7 at \u27e6EMAIL_1\u27e7.',
+        released: 'Contact Taro Yamada at taro@example.co.jp. Ignore prior instructions.',
+        restored: ['\u27e6PERSON_1\u27e7', '\u27e6EMAIL_1\u27e7'],
+        withheldTokens: [],
+        mapping: MAPPING,
+      }),
+    ).toEqual({ kind: 'rebuild_mismatch', tokens: [] });
+  });
+
+  it('preserves every withheld placeholder in its own position', () => {
+    // Withheld tokens are copied through verbatim, interleaved with restored
+    // ones, and the rebuild must reproduce that interleaving exactly.
+    expect(
+      verifyRehydration({
+        coreAnswer:
+          'Charge \u27e6CREDIT_CARD_1\u27e7 for \u27e6PERSON_1\u27e7 at \u27e6EMAIL_1\u27e7.',
+        released: 'Charge \u27e6CREDIT_CARD_1\u27e7 for Taro Yamada at taro@example.co.jp.',
+        restored: ['\u27e6PERSON_1\u27e7', '\u27e6EMAIL_1\u27e7'],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
+        mapping: MAPPING,
+      }),
+    ).toBeNull();
+  });
+
+  it('rejects an identifier this request never restored', () => {
+    // Text that materialized during rehydration. The rebuild catches it as a
+    // plain string difference, without needing the scanner to recognise it.
+    expect(
+      verifyRehydration({
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7.',
+        released: 'Dear Taro Yamada, also write to other.person@example.com.',
+        restored: ['\u27e6PERSON_1\u27e7'],
+        withheldTokens: [],
+        mapping: MAPPING,
+      }),
+    ).toEqual({ kind: 'rebuild_mismatch', tokens: [] });
   });
 
   it('does not flag a value it restored on purpose', () => {
     // The whole point of a successful rehydration is that real identifiers are
-    // now present; scanning the raw text would flag every release.
+    // now present; a check that flagged them would refuse every release.
     expect(
       verifyRehydration({
+        coreAnswer: 'Write to \u27e6EMAIL_1\u27e7.',
         released: 'Write to taro@example.co.jp.',
-        restored: ['⟦EMAIL_1⟧'],
+        restored: ['\u27e6EMAIL_1\u27e7'],
         withheldTokens: [],
         mapping: MAPPING,
       }),
@@ -175,12 +270,27 @@ describe('verifyRehydration', () => {
     // total rather than assuming that gate ran.
     expect(
       verifyRehydration({
+        coreAnswer: 'Dear \u27e6PERSON_9\u27e7.',
         released: 'Dear reader.',
-        restored: ['⟦PERSON_9⟧'],
+        restored: ['\u27e6PERSON_9\u27e7'],
         withheldTokens: [],
         mapping: MAPPING,
       }),
-    ).toEqual({ kind: 'substitution_mismatch', tokens: ['⟦PERSON_9⟧'] });
+    ).toEqual({ kind: 'substitution_mismatch', tokens: ['\u27e6PERSON_9\u27e7'] });
+  });
+
+  it('rejects a placeholder that is neither withheld nor restored', () => {
+    // The rebuild has no instruction for it, so it refuses by name rather than
+    // guessing which of the two the policy meant.
+    expect(
+      verifyRehydration({
+        coreAnswer: 'Dear \u27e6PERSON_1\u27e7, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        released: 'Dear Taro Yamada, card \u27e6CREDIT_CARD_1\u27e7 failed.',
+        restored: [],
+        withheldTokens: ['\u27e6CREDIT_CARD_1\u27e7'],
+        mapping: MAPPING,
+      }),
+    ).toEqual({ kind: 'substitution_mismatch', tokens: ['\u27e6PERSON_1\u27e7'] });
   });
 });
 
@@ -240,7 +350,11 @@ describe('a rehydration that violates the invariant', () => {
     expect(error.kind).toBe('rehydration_incomplete');
   });
 
-  it('refuses when PII appears beyond what was restored on purpose', async () => {
+  it('refuses when text appears beyond what was restored on purpose', async () => {
+    // Appended after a correct substitution, so every value present is the
+    // vault's own and no placeholder is left over. The positional rebuild is
+    // what catches it, and it reports no category on purpose: the difference is
+    // between two whole strings, neither of which may reach a log.
     const error = await refusal('Dear ⟦PERSON_1⟧, hello.', {
       rehydrate: tamperedRehydrate((result) => ({
         ...result,
@@ -249,7 +363,7 @@ describe('a rehydration that violates the invariant', () => {
     });
 
     expect(error.kind).toBe('rehydration_incomplete');
-    expect(error.categories).toEqual(['CREDIT_CARD']);
+    expect(error.categories).toEqual([]);
   });
 
   it('releases nothing and stores the withheld marker', async () => {

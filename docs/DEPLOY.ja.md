@@ -758,7 +758,7 @@ L4 preference `34528bab-4b5b-47f1-82da-cec57b21a95d` の最終状態: **却下**
 | 段階 | 対応                                                                                  |
 | ---- | ------------------------------------------------------------------------------------- |
 | 0    | **残り 33 リソースを今すぐ入れる**: `just tf-apply gpu_enabled=false`（§3.5）         |
-| 1    | `just tf-apply gemma_model=gemma4:e4b` に落とす（3.3GB。それでも L4 は必要）           |
+| 1    | `just tf-apply gemma_model=gemma4:e4b` に落とす（3.3GB。それでも L4 は必要）          |
 | 2    | 別リージョンで申請: `just tf-apply region=us-east4` / `europe-west1` / `europe-west4` |
 | 3    | GPU を諦めて Vertex AI 経由にする（下記）                                             |
 

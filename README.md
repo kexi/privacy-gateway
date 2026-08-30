@@ -25,6 +25,11 @@ User ──HTTP──▶ Gateway (Gemma)
                User  (OKF answer document + audit trail)
 ```
 
+![Architecture: the trust boundary, the three agents, the six consumption surfaces and the cost kill switch](docs/diagram/architecture.drawio.png)
+
+The PNG embeds its own draw.io source — open it in draw.io to edit
+([`docs/diagram/architecture.drawio`](docs/diagram/architecture.drawio) is the same diagram).
+
 Gateway → Core is the only A2A hop. Gateway → Synthesis is plain authenticated HTTP,
 deliberately: the OKF document is an audit artifact and must be retrieved without an LLM
 rephrasing it. See [A2A, precisely](#a2a-precisely) below.
@@ -276,11 +281,14 @@ check re-runs the same patterns that decided the masking, so it can only catch a
 bug over shapes it already knows; a literal comparison catches a failed substitution
 outright. It is the one category where the fleet can _prove_ the masking worked.
 
-The terms are never persisted. They travel Gateway → Synthesis (both inside the boundary)
-and the audit record keeps only `attestation.custom_terms: {count: N}` — not a digest,
-because a codename comes from a small guessable space and a hash of one is a confirmation
-oracle rather than a redaction. Logs carry `term_count` and `surviving_term_count`; the
-logging allowlist has no field a term could travel in.
+The term list is never persisted to evidence or logs; matched values are stored only in the
+TTL'd Token Vault for rehydration, like every masked value. The list itself travels Gateway
+→ Synthesis (both inside the boundary) and is written nowhere; a term that matched becomes
+a vault mapping entry keyed by request id, expiring with it, because rehydration has no
+other way to restore it. The audit record keeps only `attestation.custom_terms: {count: N}`
+— not a digest, because a codename comes from a small guessable space and a hash of one is
+a confirmation oracle rather than a redaction. Logs carry `term_count` and
+`surviving_term_count`; the logging allowlist has no field a term could travel in.
 
 ## Text only, by design
 

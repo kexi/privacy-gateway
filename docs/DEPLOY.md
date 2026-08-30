@@ -773,7 +773,7 @@ preference is history rather than a gate.
 | Step | Action                                                                                       |
 | ---- | -------------------------------------------------------------------------------------------- |
 | 0    | **Deploy the other 33 resources now**: `just tf-apply gpu_enabled=false` (see 3.5)           |
-| 1    | Drop to `just tf-apply gemma_model=gemma4:e4b` (3.3GB, but still needs an L4)                 |
+| 1    | Drop to `just tf-apply gemma_model=gemma4:e4b` (3.3GB, but still needs an L4)                |
 | 2    | Request in another region: `just tf-apply region=us-east4` / `europe-west1` / `europe-west4` |
 | 3    | Give up on GPU and go through Vertex AI (below)                                              |
 

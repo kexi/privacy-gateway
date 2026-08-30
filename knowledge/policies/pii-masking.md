@@ -4,7 +4,7 @@ title: PII masking policy
 description: What the gateway must mask before any text crosses the trust boundary, and what a response must satisfy before it is presented to a user.
 tags: [pii, security, policy]
 status: stable
-generated: { by: claude_fleet_agent/opus-4, at: 2026-08-30T16:42:59Z }
+generated: { by: claude_fleet_agent/opus-4, at: 2026-08-31T17:00:00Z }
 verified:
   - { by: human:kei, at: 2026-08-24T00:00:00Z }
 ---
@@ -103,11 +103,15 @@ the same patterns that decided the masking and can therefore only catch a fault 
 shapes it already knows, whereas a literal comparison catches a failed substitution
 outright.
 
-Requester-named terms are never persisted. They exist in the request, in the token vault
-alongside every other masked value, and in the two scans above. The audit record carries
-`attestation.custom_terms: {count: N}` — a count, never a term and never a digest of one,
-because a codename is drawn from a small guessable space and a hash of it would be a
-confirmation oracle rather than a redaction.
+The term list is never persisted to evidence or logs; matched values are stored only in the
+TTL'd Token Vault for rehydration, like every masked value. The distinction is exact and
+worth stating plainly: the phrases a requester supplies in `mask_terms` are held in memory
+for the life of the request and are written nowhere, while a term that actually matched
+becomes a vault mapping entry — keyed by request id, expiring with it — because rehydration
+has no other way to restore it. The audit record carries `attestation.custom_terms:
+{count: N}` — a count, never a term and never a digest of one, because a codename is drawn
+from a small guessable space and a hash of it would be a confirmation oracle rather than a
+redaction.
 
 # Response requirements
 
