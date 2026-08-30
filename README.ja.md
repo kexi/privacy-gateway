@@ -20,7 +20,8 @@ User ──HTTP──▶ Gateway (Gemma)
                  │ マスク済み回答
                  ▼ HTTP
                Synthesis (Gemma)
-                 │ 3. leak check  4. 復元  5. 整合性検証
+                 │ 3. leak check  4. 整合性/解決可能性  5. 1 回だけ復元
+                 │ 6. 位置的検証  7. リリース
                  ▼
                User  (OKF 回答ドキュメント + 監査証跡)
 ```
@@ -239,13 +240,20 @@ UI ではチェックボックス群として提供し、既定はすべてオ�
 `attestation.withheld` がそれでも渡されなかった内容——であり、保存される OKF の本文はどちらの
 場合もマスクされたままだ。
 
-**リハイドレートは検証される。** 単一のリハイドレートの後、Synthesis は決定的に、残存する
-プレースホルダが抑制集合とちょうど一致すること、復元された各プレースホルダが金庫の値その
-ものを持つこと、それ以外の識別子が出現していないこと（意図的に復元した値を差し引いた
-リリーステキストに対するアテスタ再実行）を検証する。違反は `500 rehydration_incomplete` —
-呼び出し元ではなく我々のバグなので唯一の 5xx 拒否である — となり、本文は他の拒否と同様に
-withheld される。リリース時には `attestation.rehydration: {substituted, withheld_remaining,
-verdict}` が付く。
+**リハイドレートは位置的に検証される。** 単一のリハイドレートの後、Synthesis はリリース
+するはずだった回答を再構築する。Core のトークン化済み回答を、インポートせず書き写した
+プレースホルダ用正規表現 — トークナイザと同じパターンを共有した検証ではトークナイザ自身の
+バグが見えないため、意図的に独立した 2 つ目のコピー — で 1 回走査し、各プレースホルダを
+金庫の値に置換し、抑制対象はそのまま書き写し、その間の文字はすべて無変更でコピーする。
+再構築した文字列は、リリース文字列と**完全一致**しなければならない。これは集合と部分文字列
+による検査では捕まえられないものを捕まえる。同一カテゴリの 2 値を逆順に埋めた回答は「各値が
+どこかに存在する」を通過しつつ、Bob のアドレスを Alice のものとして読者に伝えてしまう。
+残存/欠落プレースホルダの検査とトークン単位の置換検査も引き続き先に走るが、それは何が
+壊れたかを名指しするための診断用の前段でしかない。再構築の失敗は `rebuild_mismatch` であり、
+値も抜粋もカテゴリも持たない（token list は空）。比較している 2 つの文字列が回答そのもの
+だからである。いずれの違反も `500 rehydration_incomplete` — 呼び出し元ではなく我々のバグ
+なので唯一の 5xx 拒否である — となり、本文は他の拒否と同様に withheld される。リリース時には
+`attestation.rehydration: {substituted, withheld_remaining, verdict}` が付く。
 
 ## ユーザー定義の秘匿語句
 
@@ -402,7 +410,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-vitest は 43 ファイル・801 テスト。ルートの `vitest.config.ts` が `test.projects` を使うので
+ルートの `vitest.config.ts` が `test.projects` を使うので
 `just test` はリポジトリルートから全部を走らせられる一方、各パッケージも自前の `test` script
 を保持しており `pnpm --filter X test` も従来どおり動く。`just test-coverage` は
 `@vitest/coverage-v8` を使い、パッケージごとの下限を強制する。`packages/common` は行 90%
@@ -419,7 +427,7 @@ just web-e2e        # Playwright、chromium のみ
 just setup-browsers # Nix の外では 1 度だけ
 ```
 
-`web/e2e/` の 50 本の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
+`web/e2e/` の Playwright スペックは、Core（A2A 経由）と Gemma（OpenAI 互換 API 経由）
 だけをモックした上で実物の Gateway と Synthesis を起動する。つまりブラウザが叩くのはスタブ
 API ではなく本番のリクエスト経路そのもの。chromium のみとしているのは、これらが検証するのは
 アプリケーションの挙動であってレンダリング差ではなく、2 つ目のエンジンは追加のシグナルなしに
@@ -437,13 +445,15 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 direnv allow                # または: nix develop
 just setup                  # pnpm install
 just check                  # fmt・recipe doc・lint・tf-validate・typecheck・pinact・gitleaks・テスト
-just web-e2e                # Playwright 50 本（Nix の外では先に `just setup-browsers`）
+just web-e2e                # ブラウザテスト（Nix の外では先に `just setup-browsers`）
 ```
 
 `just check` は CI が実行するものと同一のレシピ・同一の順序なので、ローカルが green である
-ことと CI が green であることは同じ意味を持つ。**vitest 43 ファイル・801 テスト**と
-**Playwright 50 本**が期待値である。実行結果がこの数と食い違う場合は、自分の実行結果のほうを
-信じてこの記述を古いものとして扱ってほしい。
+ことと CI が green であることは同じ意味を持つ。ゲート全体（ユニット + ブラウザ E2E）は
+push のたびに CI で走る。何が通っているか、そしてある時点のコミットでテストが何件あるかの
+正典は workflow の実行結果そのものである:
+<https://github.com/kexi/privacy-gateway/actions/workflows/ci.yml>。件数はコミットごとに
+動くので、この README では引用しない。自分の実行結果が出す数字を信じてほしい。
 
 壊れていると判断する前に知っておくとよい注意が 2 点ある。
 

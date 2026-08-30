@@ -382,15 +382,41 @@ Rehydration is the one step that turns placeholders back into real values, so af
 single rehydration Synthesis verifies deterministically — no model, no second vault
 read — that it did exactly what the policy said:
 
-1. **The leftover set equals the withheld set.** A `⟦…⟧` surviving that the policy did
-   not withhold is a substitution that silently failed; a withheld placeholder that
-   _vanished_ means something replaced it, which is the disclosure the policy forbade.
-2. **Every restored placeholder carries the vault's own value.** A rehydrator that
-   wrote some other value would still produce a placeholder-free string that passes (1).
-3. **Nothing else that looks like PII appeared.** The deterministic attester is re-run
-   over the released text with the intentionally restored values subtracted out; the
-   residue must be empty. Scanning it raw would flag every successful release, since the
-   point of one is that real identifiers are now present.
+The decisive check is a **positional rebuild**. Core's tokenized answer is walked once
+with a placeholder regex **transcribed rather than imported** — a second copy on purpose,
+since a check that shares the tokenizer's pattern cannot see a tokenizer bug. Each
+placeholder is replaced by its vault value, or copied through verbatim when the policy
+withheld it, and every character between placeholders is copied unchanged. The rebuilt
+string must then equal the released string **exactly**. Nothing else can hold if that
+does: a rehydrator that swapped two values of the same category, wrote a value the vault
+does not hold, restored a withheld token, or inserted text anywhere fails a byte
+comparison.
+
+Why equality rather than the set-and-substring properties it replaced: those asked only
+whether each value appeared _somewhere_. Given `⟦EMAIL_1⟧ → alice@…` and
+`⟦EMAIL_2⟧ → bob@…`, an answer that filled them in the wrong order still contained both
+values, still had no leftover placeholder, and still left an empty residue — three
+passing checks over a released string that told the reader Bob's address was Alice's.
+Equality makes the _correspondence_ between placeholder and value part of the guarantee,
+not just their presence. It also subsumes the old residue scan (re-running the attester
+over the released text minus the restored values): any character that materialized during
+rehydration fails equality, whether or not it happens to look like PII to a scanner.
+
+Two cheaper checks run ahead of the rebuild purely as **diagnostic preambles**, so a
+failure names _what_ went wrong instead of only that the strings differ:
+
+1. **The leftover set equals the withheld set** (`leftover_token` / `missing_withheld`).
+   A `⟦…⟧` surviving that the policy did not withhold is a substitution that silently
+   failed; a withheld placeholder that _vanished_ means something replaced it, which is
+   the disclosure the policy forbade.
+2. **Every restored placeholder carries the vault's own value** (`substitution_mismatch`),
+   checked per token so a forged substitution is reported by name — which equality alone
+   cannot do.
+
+A rebuild failure is `rebuild_mismatch`, and it deliberately carries **no token list, no
+excerpt and no category**: the difference is not attributable to any single token, and
+the two strings under comparison are the answer itself, so there is nothing that could be
+quoted without quoting the answer. Its token list is empty.
 
 Any violation is `500 rehydration_incomplete` — alone among the refusals in being 5xx,
 because it is a fault in our code rather than something the caller could fix — and the

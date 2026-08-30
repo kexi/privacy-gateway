@@ -68,9 +68,10 @@ the Gateway→Core hop; Ollama serving Gemma 4 12B on Cloud Run's NVIDIA RTX PRO
 for the vault and masked evidence; the whole platform declared in Terraform
 (50+ resources, least-privilege service accounts, Direct VPC egress with
 Private Google Access, internal ingress). zod validates every boundary.
-545 vitest tests + 23 Playwright browser tests; CI runs lint (oxlint/oxfmt),
-typecheck, tests, Terraform validation, secret scanning, and SHA-pinned
-actions. Two adversarial design reviews by an external AI reviewer are in
+800+ unit tests and 70+ browser E2E specs; the full gate runs in CI on every
+push — lint (oxlint/oxfmt), typecheck, tests, Terraform validation, secret
+scanning, and SHA-pinned actions — with the runs themselves as the canonical
+evidence: https://github.com/kexi/privacy-gateway/actions/workflows/ci.yml Two adversarial design reviews by an external AI reviewer are in
 `docs/reviews/`, with our responses and the diffs they produced.
 
 ## Challenges we ran into

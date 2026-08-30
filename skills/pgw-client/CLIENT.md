@@ -60,9 +60,16 @@ Both boundary scans cover the terms literally: the egress guard checks the
 outbound prompt (`422 outbound_guard_refused`) and the attester checks Core's
 answer (`422 leak_check_failed`), each reporting category `CUSTOM`. This is the
 only check that can _prove_ the masking worked, rather than re-running the
-detector that decided it. The terms are never persisted — the OKF document
-records `attestation.custom_terms: {count: N}` and nothing else, and no log field
-can carry a term.
+detector that decided it.
+
+**What is kept, precisely.** The term list you send is never persisted to
+evidence or to logs — the OKF document records
+`attestation.custom_terms: {count: N}` and nothing else, and no log field can
+carry a term. A term that _matched_ has its value stored like any other masked
+value: in the request-scoped, TTL'd Token Vault mapping, keyed by that request's
+`request_id`, because rehydrating `⟦CUSTOM_n⟧` back into your answer requires it.
+A term that matched nothing exists only in that request's memory and is gone when
+the response is written.
 
 **Per-request disclosure opt-in.** `API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD` and
 `MY_NUMBER` are never restored into an answer by default. A caller may allow

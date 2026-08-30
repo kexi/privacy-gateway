@@ -20,7 +20,8 @@ User ──HTTP──▶ Gateway (Gemma)
                  │ masked answer
                  ▼ HTTP
                Synthesis (Gemma)
-                 │ 3. leak check  4. rehydrate  5. consistency verify
+                 │ 3. leak check  4. consistency/resolvability  5. rehydrate once
+                 │ 6. positional verification  7. release
                  ▼
                User  (OKF answer document + audit trail)
 ```
@@ -239,13 +240,22 @@ keeps the two apart — `attestation.disclosure_requested` is what was asked for
 `attestation.withheld` is what was still not given — and the stored OKF body stays masked
 either way.
 
-**Rehydration is verified.** After the single rehydration, Synthesis checks
-deterministically that the surviving placeholders are exactly the withheld set, that
-every restored placeholder holds the vault's own value, and that no other identifier
-appeared (the attester re-run over the released text minus the values restored on
-purpose). A violation is `500 rehydration_incomplete` — the only 5xx refusal, because it
-is our bug rather than the caller's — and the body is withheld like any other refusal.
-Releases carry `attestation.rehydration: {substituted, withheld_remaining, verdict}`.
+**Rehydration is verified positionally.** After the single rehydration, Synthesis rebuilds
+the answer it expected to release: it walks Core's tokenized answer once with a
+placeholder regex transcribed rather than imported — a deliberately independent second
+copy, since a check sharing the tokenizer's pattern cannot see a tokenizer bug —
+substituting each placeholder's vault value, copying withheld placeholders through
+verbatim, and copying everything between them unchanged. The rebuilt string must equal
+the released string **exactly**. That catches what set-and-substring checks could not: two
+values of the same category filled in the wrong order pass "every value is present
+somewhere" while telling the reader Bob's address was Alice's. Leftover/missing
+placeholders and per-token substitution checks still run first, but only as diagnostic
+preambles that name what broke. A rebuild failure is `rebuild_mismatch` and carries no
+values, no excerpt and no categories — an empty token list — because the strings being
+compared are the answer itself. Any violation is `500 rehydration_incomplete` — the only
+5xx refusal, because it is our bug rather than the caller's — and the body is withheld
+like any other refusal. Releases carry
+`attestation.rehydration: {substituted, withheld_remaining, verdict}`.
 
 ## User-defined secret terms
 
@@ -399,7 +409,7 @@ just lint-ts        # oxlint
 just fmt-ts         # oxfmt
 ```
 
-801 vitest tests across 43 files. The root `vitest.config.ts` uses `test.projects`, so
+The root `vitest.config.ts` uses `test.projects`, so
 `just test` runs everything from the repository root while each package keeps its own `test`
 script for `pnpm --filter X test`. `just test-coverage` uses `@vitest/coverage-v8` and
 enforces per-package floors: `packages/common` at 90% lines (it holds the masking, vault and
@@ -416,7 +426,7 @@ just web-e2e        # Playwright, chromium only
 just setup-browsers # once, outside Nix
 ```
 
-50 Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
+The Playwright specs in `web/e2e/` drive the real Gateway and Synthesis with only Core (over
 A2A) and Gemma (over the OpenAI-compatible API) mocked, so what the browser exercises is the
 production request path rather than a stubbed API. Chromium only: these assert application
 behaviour, not rendering differences, and a second engine would double the runtime for no
@@ -434,13 +444,15 @@ This section is the shortest path from a clean checkout to having verified them 
 direnv allow                # or: nix develop
 just setup                  # pnpm install
 just check                  # fmt, recipe docs, lint, tf-validate, typecheck, pinact, gitleaks, tests
-just web-e2e                # 50 Playwright specs (needs `just setup-browsers` outside Nix)
+just web-e2e                # browser specs (needs `just setup-browsers` outside Nix)
 ```
 
 `just check` is exactly what CI runs — same recipe, same order — so a green local run and a
-green CI run mean the same thing. Expect **801 vitest tests across 43 files** and **50
-Playwright specs**. If those counts have drifted from what you see, trust the numbers your
-run prints and treat this line as stale.
+green CI run mean the same thing. The full gate (unit + browser E2E) runs in CI on every
+push; the canonical evidence of what passes, and of how many tests there are on any given
+commit, is the workflow run itself:
+<https://github.com/kexi/privacy-gateway/actions/workflows/ci.yml>. Counts move with every
+commit, so this README does not quote them — trust the numbers your own run prints.
 
 Two caveats worth knowing before you conclude something is broken:
 
