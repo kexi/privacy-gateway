@@ -14,6 +14,8 @@ resource "google_project_service" "required" {
     # Terraform reads project/service state through Resource Manager; with
     # user_project_override those reads bill this project, so it must be on.
     "cloudresourcemanager.googleapis.com",
+    # Cloud DNS hosts the delegated privacy-gateway.kexi.dev zone (domain.tf).
+    "dns.googleapis.com",
     "compute.googleapis.com",
     "run.googleapis.com",
     "artifactregistry.googleapis.com",
