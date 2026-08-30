@@ -260,7 +260,7 @@ warm:
     set -euo pipefail
     echo "!! An idle Cloud Run GPU instance bills continuously while warm."
     echo "!! Nvidia RTX PRO 6000 + 20 vCPU / 80 GiB in {{ region }} is roughly"
-    echo "!! USD 0.70-0.80 per hour, about USD 17-19 per day, whether or not a"
+    echo "!! about USD 3.19 per hour, roughly USD 77 per day, whether or not a"
     echo "!! single request arrives."
     echo "!! Run 'just chill' the moment filming is done."
     echo
@@ -334,8 +334,10 @@ kill-switch-test mode="local":
     #   publish sends a real message through the real topic, which means the
     #           real push subscription, the real OIDC token and the real
     #           service. It therefore REALLY TRIPS THE KILL SWITCH: the gateway
-    #           loses its public invoker binding and gemma-serving is capped at
-    #           zero. This is state-changing and needs maintainer approval.
+    #           loses its public invoker binding, gemma-serving is switched to
+    #           manual scaling with manual_instance_count = 0, and the gateway's
+    #           and synthesis's invoker rights on gemma-serving are stripped.
+    #           This is state-changing and needs maintainer approval.
     #           Recover with `just restore-after-kill`.
     case "{{ mode }}" in
       local)
@@ -380,19 +382,30 @@ logs-kill-switch-dlq:
       | jq -r '.[] | {published: .message.publishTime, data: (.message.data | @base64d)}' \
       || echo "(none, or the dead-letter subscription is not deployed)"
 
-# Undo a kill-switch trip: restore public access and the GPU max instances
+# Undo a kill-switch trip: restore public access, the fleet's invoker rights and automatic scaling
 restore-after-kill *vars:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Terraform is the restore path, not a pair of gcloud commands, because
-    # Terraform already holds the desired state the switch deviated from: the
-    # allUsers invoker binding (iam.tf) and max_instance_count = 1 (cloudrun.tf).
-    # An apply re-asserts both and, unlike a hand-written gcloud, cannot restore
-    # one and forget the other.
+    # Terraform is the restore path, not a handful of gcloud commands, because
+    # Terraform already holds the desired state the switch deviated from, and it
+    # holds all three pieces:
+    #
+    #   1. the allUsers invoker binding on gateway-agent           (iam.tf)
+    #   2. the gateway/synthesis invoker bindings on gemma-serving (iam.tf,
+    #      local.invoker_edges) — the switch strips these as belt and braces
+    #   3. gemma-serving's service-level `scaling { scaling_mode = "AUTOMATIC" }`
+    #      (cloudrun.tf) — the switch sets MANUAL with manual_instance_count = 0,
+    #      which is the documented way to hold a Cloud Run service at zero
+    #
+    # An apply re-asserts all three and, unlike hand-written gcloud, cannot
+    # restore two and forget the third. Item 3 is why cloudrun.tf declares the
+    # service-level scaling block explicitly: without it Terraform would own no
+    # opinion about scaling mode, see no diff, and leave the GPU pinned off.
     #
     # Deliberately not run by agents: it puts a public endpoint and a GPU back
     # online, so a human reads the plan. Review it, then approve interactively.
-    echo "This re-opens the public gateway and restores gemma-serving's max instances."
+    echo "This re-opens the public gateway, restores the fleet's access to Gemma"
+    echo "and returns gemma-serving to automatic scaling (min 0 / max 1)."
     echo "Fix the underlying spend first, or the switch will trip again."
     just tf-apply {{ vars }}
 
@@ -401,15 +414,41 @@ restore-after-kill *vars:
     # removing it before the fleet is actually restored would leave a window in
     # which the switch is armed against a fleet that is still down.
     #
-    # Why gcloud rather than Terraform: the annotation is runtime state written
-    # by the switch, not desired state. Declaring it in Terraform would mean the
-    # committed configuration has an opinion about whether the fleet is tripped.
+    # Why not Terraform: the annotation is runtime state written by the switch,
+    # not desired state. Declaring it in Terraform would mean the committed
+    # configuration has an opinion about whether the fleet is tripped.
+    #
+    # Why the Admin API directly rather than `gcloud run services update`: that
+    # command has no `--remove-annotations` flag (it was never added; `gcloud`
+    # rejects it as unrecognised). The previous version of this recipe used it
+    # behind a `|| echo "(no marker was set)"`, so the failure printed a message
+    # saying the opposite of what happened and left the marker in place — which
+    # leaves the switch permanently disarmed, because a set marker makes every
+    # subsequent trip a no-op. Read-modify-write on the v2 Service is the
+    # supported way to delete one annotation. Verified live on 2026-08-30.
     echo "==> clearing the kill-switch/tripped marker"
-    gcloud run services update gateway-agent \
-      --project "{{ project_id }}" --region "{{ region }}" \
-      --remove-annotations "kill-switch/tripped" --quiet >/dev/null \
-      || echo "    (no marker was set)"
+    service_url="https://run.googleapis.com/v2/projects/{{ project_id }}/locations/{{ region }}/services/gateway-agent"
+    token="$(gcloud auth print-access-token)"
+    curl -fsS -H "Authorization: Bearer ${token}" "${service_url}" \
+      | jq 'del(.annotations["kill-switch/tripped"])
+            | del(.createTime, .updateTime, .creator, .lastModifier, .uid,
+                  .generation, .latestReadyRevision, .latestCreatedRevision,
+                  .observedGeneration, .terminalCondition, .conditions,
+                  .trafficStatuses, .etag, .reconciling, .urls, .uri,
+                  .satisfiesPzs)' \
+      | curl -fsS -X PATCH -H "Authorization: Bearer ${token}" \
+          -H "Content-Type: application/json" "${service_url}" -d @- >/dev/null
     echo "==> the kill switch is armed again"
+
+    # Read back rather than trust the write: an un-cleared marker is a silently
+    # disarmed switch, which is the failure mode this whole recipe exists to
+    # avoid. It is the same principle the switch itself now follows.
+    if curl -fsS -H "Authorization: Bearer ${token}" "${service_url}" \
+         | jq -e '.annotations["kill-switch/tripped"]' >/dev/null 2>&1; then
+      echo "!! the marker is STILL set: the switch will not fire again" >&2
+      exit 1
+    fi
+    echo "    verified: no tripped marker on gateway-agent"
 
 # Roll a new revision of already-deployed services from the latest images.
 # Why not tf-apply: the image tag is `latest`, so Terraform sees no diff after

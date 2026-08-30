@@ -28,7 +28,7 @@ Synthesis の HTTP ルート側にある。
 | **Core Agent**      | Gemini 3.5（Vertex AI） | Cloud Run        | マスク済み入力に対する純粋な推論 / プランニング / コード生成。ADK TypeScript（`@google/adk`）を `toA2a` で提供し、Agent Card は `/.well-known/agent-card.json`、RPC は `/jsonrpc` と `/rest`。モデル ID は `GEMINI_MODEL`（既定 `gemini-3.5-flash`、Vertex AI で疎通確認済み）。デプロイ時は `GOOGLE_CLOUD_LOCATION=global`: `gemini-3.5-flash` は global の Vertex エンドポイントにのみ公開されており、`us-central1` のリージョナルエンドポイントは 404 を返す。受信ガードが生の PII を含むペイロードを拒否する。Vault への依存を**持たない** — ただし Core のパッケージは `@privacy-gateway/common` パッケージ全体をインストールしているため、実際にこれを保証しているのは依存グラフではなく IAM（Core のサービスアカウントは Firestore ロールを持たない）である。 |
 | **Synthesis Agent** | Gemma 3（自前ホスト）   | Cloud Run        | ADK TypeScript。`toA2a`（確認のみ）と HTTP（実際のパイプライン）の両方で公開。Core の出力を受け取る。(a) **リークチェック**: マスク済み応答に対する決定的な正規表現の再スキャンと、助言的な Gemma ジャッジ。(b) **整合性チェック**: プロンプトに無いプレースホルダを Core が捏造していないかを決定的に検証。(c) **リハイドレート**: Vault からトークンを復元し、開示ポリシーを適用する。OKF ドキュメントを組み立てる。永続化されるのは常にマスク済みアーティファクトのみ。                                                                                                                                                                                                                                                                                           |
 | **Gemma Serving**   | Ollama 上の gemma3      | Cloud Run（GPU） | Gateway / Synthesis が `OllamaLlm`（`ollama/*` モデル名に登録した ADK `BaseLlm` アダプタ）経由で利用する OpenAI 互換エンドポイント。アクセラレータは **NVIDIA RTX PRO 6000**（`var.gpu_type`） — L4 のクォータ申請は 2026-08 に却下された。Ingress は internal のみ。                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| **kill-switch**     | なし（LLM を使わない）  | Cloud Run        | フリートの一員でもエージェントでもない: プロンプトも回答も vault エントリも一切見ない。Cloud Billing budget がしきい値超過のたびに Pub/Sub topic へ publish し、その push サブスクリプションが OIDC トークン付きでこのサービスを呼ぶ。100% では `gateway-agent` の `allUsers` invoker バインディングを外し、`gemma-serving` の max instances を 0 に落とす。どちらも冪等なので Pub/Sub の再配信は無害。実体は `services/kill-switch`。                                                                                                                                                                                                                                                                                                                               |
+| **kill-switch**     | なし（LLM を使わない）  | Cloud Run        | フリートの一員でもエージェントでもない: プロンプトも回答も vault エントリも一切見ない。Cloud Billing budget がしきい値超過のたびに Pub/Sub topic へ publish し、その push サブスクリプションが OIDC トークン付きでこのサービスを呼ぶ。100% では `gateway-agent` の `allUsers` invoker バインディングを外し、Cloud Run の manual scaling で `gemma-serving` をインスタンス数 0 に固定し、さらに `gemma-serving` に対するフリートの invoker 権限を剥奪する。3 つとも冪等なので Pub/Sub の再配信は無害。実体は `services/kill-switch`。                                                                                                                                                                                                                                 |
 
 信頼境界: `Gateway` / `Synthesis` / `Gemma Serving` / `Firestore` が**内側**。
 `Core` へ渡るのはマスク済みテキストのみ（したがって Gemini へ渡るのもマスク済みのみ）。
@@ -127,17 +127,25 @@ Synthesis の Gemma ジャッジは一方向にのみ助言的である: `leak: 
 カテゴリはプレースホルダにも OKF ドキュメントにも既に現れている公開情報で、
 マッピングの値は一切読まない。以前の「削除」方式を採らない理由: 歯抜けの文を見せると
 モデルは穴の中身を推測してしまい、これこそが根拠カテゴリを挙げないまま
-ほぼすべてのマスク済み回答を flag していた原因だった。上記の再確認方式は、
-入力を改善してもなお残る分に対するバックストップとして維持する。
+ほぼすべてのマスク済み回答を flag していた原因だった。この入力設計の見直しこそが
+偽陽性率に対する唯一の対策であり、その背後に判定をやり直す機会はもう存在しない。
+1 回目で正しく判定する必要がある。
 
-「flag ならブロック」には狭い例外が 1 つだけある。決定的 attester が既に合格させた
-ボディに対し、ジャッジが根拠カテゴリを**挙げずに** leak を主張した場合に限り、
-ちょうど 1 回だけ再実行する。2 回目が clear ならリリースし、OKF ドキュメントに
-`attestation.judge_retries: 1` を記録して `judge.retry` ログイベントを出す。
-根拠カテゴリ付きの flag は具体的な疑いであり再実行しない。ジャッジ利用不能時も
-再実行しない。回数を 1 回に打ち切るのは、3 回以上になると「1 回目はノイズだった」と
-「通るまで振り直す」を区別できなくなるからである。非対称性は不変で、再実行で
-clear になってもそれが信頼を加算することはない。
+「flag ならブロック」に例外はもう存在しない。ジャッジの**最初の**判定が確定であり、
+`leak: true` は常に拒否する（`judge_flagged`、422）。2 回目の呼び出しが flag を
+release に変えることは決してない。最初の判定が根拠カテゴリを**挙げずに** leak を
+主張し、かつ決定的 attester が既に合格させたボディである場合に限り、ジャッジを
+もう 1 回呼ぶが、これは拒否記録に載せるカテゴリを補うためだけである。2 回目の
+呼び出しの `leak` 値は無条件に捨て、名指しされたカテゴリ（あれば）だけを採用する。
+結果は依然として拒否であり、`attestation.judge_retries: 1` と `judge.retry`
+ログイベントで記録される。既に根拠カテゴリを挙げている flag は補う必要がなく
+再実行しない。ジャッジ利用不能時も再実行しない。2 回目で clear になったら
+リリースする案を採らなかった理由: 決定的 attester はそもそも氏名や郵便先住所を
+検出しない。根拠のない flag が attester 済みのクリーンな本文に立つのは、まさに
+他に手段のないカテゴリをジャッジだけがカバーしている場面であり、確率的な拒否権を
+flag が止むまで振り直すのは検証ではなく茶番になる。非対称性は不変で、ジャッジは
+これまでもリリースを保証したことがなく、今や自分自身の flag を取り消すことすら
+できない。
 
 ### 匿名化ではなく仮名化
 

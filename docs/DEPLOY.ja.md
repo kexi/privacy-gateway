@@ -84,7 +84,7 @@ just build                        # Gemma で約 25 分（まっさらなプロ�
                                   #   初回だけは §3.3 の注記を参照）
 just tf-plan gpu_enabled=false    # 確認: 33 リソース追加
 just tf-apply gpu_enabled=false   # gemma-serving 以外すべて
-   ... L4 quota の承認を待つ（§6）...
+   ...（`all-thinkgs` では待ち不要: RTX PRO 6000 の milliGPU は自動付与、§6）...
 just tf-apply                     # gemma-serving を追加、計 36
 just urls && just health          # 検証（§8）
 just tf-destroy                   # 終わったら（§10）
@@ -205,9 +205,10 @@ TTL の注意点:
 ### 3.5 GPU quota 待ちのあいだのデプロイ
 
 `gpu_enabled=false` は `gemma-serving` サービスと、それを指す 2 本の `run.invoker` バインディングを
-スキップする。残る 33 リソースは GPU quota を一切必要としない。**まっさらなプロジェクトでは
-これが推奨経路**で、L4 quota の申請（§6）は数分〜数日かかる一方、その間に他は全部立てて
-検証まで済ませられる。
+スキップする。残る 33 リソースは GPU quota を一切必要としない。**アクセラレータが自動付与
+されないまっさらなプロジェクトでは、これが推奨経路**で、quota 申請（§6）は数分〜数日かかる
+一方、その間に他は全部立てて検証まで済ませられる。`all-thinkgs` では RTX PRO 6000 の
+milliGPU が自動付与されるため、この分割は必須のゲートではなく任意の選択肢になる。
 
 ```bash
 just tf-plan gpu_enabled=false     # 追加 33
@@ -466,28 +467,35 @@ def a2a_headers(target_url: str) -> dict[str, str]:
 
 単価は Cloud Billing API から取得した `us-central1` の実 SKU（2026-08 時点、USD）。
 
-| SKU                              | 単価                                 |
-| -------------------------------- | ------------------------------------ |
-| NVIDIA L4, ゾーン冗長**なし**    | `0.0001867` / GPU-sec = **$0.672/h** |
-| NVIDIA L4, ゾーン冗長あり        | `0.0002909` / GPU-sec = $1.047/h     |
-| Services CPU (instance-based)    | `0.000018` / vCPU-sec                |
-| Services Memory (instance-based) | `0.000002` / GiB-sec                 |
+| SKU                                     | 単価                                  |
+| --------------------------------------- | ------------------------------------- |
+| NVIDIA RTX PRO 6000, ゾーン冗長**なし** | `0.00036522` / GPU-sec = **$1.315/h** |
+| NVIDIA RTX PRO 6000, ゾーン冗長あり     | `0.00056913` / GPU-sec = $2.049/h     |
+| Services CPU (instance-based)           | `0.000018` / vCPU-sec                 |
+| Services Memory (instance-based)        | `0.000002` / GiB-sec                  |
+
+GPU は L4 ではなく RTX PRO 6000 である。2026-08 に L4 の quota 申請が Google に却下され
+（リージョン枯渇）、代わりに RTX PRO 6000 を案内された。こちらはリージョンごとに
+1000 milliGPU が自動付与されるので quota 待ちが発生しない。時間単価は高く、かつ後述の
+とおり大きなインスタンスを強制される。
 
 ### インスタンスが起きている間の時間単価
 
-`gemma-serving`（GPU 1 + 8 vCPU + 32GiB、`cpu_idle = false`）:
+`gemma-serving`（GPU 1 + 20 vCPU + 80 GiB、`cpu_idle = false`）。20 vCPU / 80 GiB は
+**選択の余地がない**: Cloud Run が `nvidia-rtx-pro-6000` に対してこの下限を要求するため、
+CPU とメモリの行も GPU の行と同じく回避不能である。
 
-| 内訳                     | $/h            |
-| ------------------------ | -------------- |
-| L4 GPU（ゾーン冗長なし） | 0.672          |
-| CPU 8 vCPU               | 0.518          |
-| Memory 32 GiB            | 0.230          |
-| **小計**                 | **$1.421 / h** |
+| 内訳                               | $/h            |
+| ---------------------------------- | -------------- |
+| RTX PRO 6000 GPU（ゾーン冗長なし） | 1.315          |
+| CPU 20 vCPU                        | 1.296          |
+| Memory 80 GiB                      | 0.576          |
+| **小計**                           | **$3.187 / h** |
 
 エージェント 3 サービス（各 1 vCPU + 1GiB）: 1 つあたり $0.072/h → 3 つで **$0.216/h**
 
-> **全部起きている状態の合計: 約 $1.64 / 時間**
-> （ゾーン冗長ありにすると $2.01/h。約 23% 増）
+> **全部起きている状態の合計: 約 $3.40 / 時間**
+> （ゾーン冗長ありにすると $4.14/h。約 22% 増）
 
 ### 実際にかかる額
 
@@ -498,9 +506,9 @@ def a2a_headers(target_url: str) -> dict[str, str]:
 
 | シナリオ                                       | 概算                     |
 | ---------------------------------------------- | ------------------------ |
-| デモ動画の撮影（3 時間、GPU 常時起動）         | **約 $4.9**              |
-| 開発中の散発的な利用（1 日 1 時間相当）        | 約 $1.6 / 日             |
-| **消し忘れて 24h 起動しっぱなし**              | **約 $39 / 日** ← 要注意 |
+| デモ動画の撮影（3 時間、GPU 常時起動）         | **約 $10**               |
+| 開発中の散発的な利用（1 日 1 時間相当）        | 約 $3.4 / 日             |
+| **消し忘れて 24h 起動しっぱなし**              | **約 $82 / 日** ← 要注意 |
 | Cloud Build（Gemma、e2-highcpu-32 × 25 分）    | 約 $0.5 / 回             |
 | Firestore / Artifact Registry / state バケット | 無料枠内〜数十セント     |
 
@@ -514,7 +522,7 @@ Gemini（Vertex AI）はトークン課金で、デモ規模なら数十セン�
 **通知ではなくアクション**を駆動する:
 
 ```
-Cloud Billing budget (¥8,000 (~$50))
+Cloud Billing budget (¥15,000 (~$95))
         │  しきい値超過のたび（50% / 80% / 100%）
         ▼
 Pub/Sub topic  billing-kill-switch
@@ -524,7 +532,8 @@ Cloud Run service  kill-switch
         │  costAmount >= budgetAmount ?
         ├── no  → killswitch.under_budget をログに出すだけ
         └── yes → gateway-agent から allUsers run.invoker を削除
-                  gemma-serving の max_instance_count を 0 にする
+                  manual scaling で gemma-serving をインスタンス数 0 に固定
+                  gemma-serving に対する gateway/synthesis の run.invoker を剥奪
 ```
 
 宣言は `infra/terraform/killswitch.tf`、ハンドラは `services/kill-switch/`。
@@ -547,11 +556,11 @@ ERROR でログに残し HTTP 400 を返して**何も変更しない**。不正
 たびにその数秒後に gateway の公開バインディングを再び剥がした。
 
 **1 通の通知につき 1 回のトリップ。** Pub/Sub は再配信するので、トリップは `gateway-agent` の
-`kill-switch/tripped` アノテーションとして記録し、**両方**の変更が確認できた後にのみ書く。
+`kill-switch/tripped` アノテーションとして記録し、**3 つすべて**の変更が確認できた後にのみ書く。
 再配信はマーカーを読んで何も触らずに `already_tripped` を返す。push エンドポイントは失敗した
 トリップでも **ACK (2xx)** する — 運用者への通知は ERROR ログであって、リトライの嵐ではない。
 
-両操作とも個別には冪等なのに、なぜマーカーが必要か: revoke してから restore する流れは、
+各操作は個別には冪等なのに、なぜマーカーが必要か: revoke してから restore する流れは、
 **運用者が並行して復旧している状況に対しては冪等ではない**。これが実発火で復旧を不可能にした
 原因である。マーカーは _fail open_ する — 読めないマーカーはトリップへ素通しする。本当の超過
 支出を止め損ねる方が、2 回動作するより悪いからだ。
@@ -561,9 +570,27 @@ ERROR でログに残し HTTP 400 を返して**何も変更しない**。不正
 プラットフォーム由来の 5xx など）。通常は空のままであるべきで、`just logs-kill-switch-dlq`
 で確認する。
 
-**2 つのスケーリング上限。** Cloud Run v2 には独立した上限が 2 つある —
-`service.scaling` と `service.template.scaling`（`gateway-agent` では 20 と 3 だった）。
-スイッチは両方を書く。片方だけでは GPU が起動できてしまう。さらに更新オペレーションを
+**なぜ max instances ではないか。** Cloud Run の GPU サービスを止める素朴な方法は
+`maxInstanceCount` を 0 に上限設定することに見える。これは誤り: Cloud Run の上限は 1 以上の
+整数で、`RevisionScaling.maxInstanceCount` は presence tracking のない普通の proto3 `int32`
+なので、`0` はシリアライズされない — サーバ側には「フィールドが無い」状態として届き、それは
+「上限なし」を意味する（上限が**外れる**のであって 0 になるのではない）。以前のこのスイッチは
+このフィールドに書き込み、同じ「フィールドが無い」状態を読み戻して上限がかかった証拠だと
+みなしていた。実際には GPU は止まっていないのに、止めたと報告していた。
+
+**上限設定ではなく manual scaling。** `scaleToZero` は代わりにサービスレベルの
+`scaling.scalingMode = MANUAL` と `scaling.manualInstanceCount = 0` を設定する —
+これが Cloud Run が公式にドキュメント化しているサービスをインスタンス数 0 に固定する方法。
+`ServiceScaling.manualInstanceCount` はこの中で唯一 `proto3_optional`（synthetic oneof）と
+宣言されているフィールドで、明示的な `0` が presence tracking され、往復後も残る —
+この presence があるからこそ 0 を表現できる。`template.scaling.maxInstanceCount` には
+一切触れない — そこに 0 を書くと上限が外れてしまうから。さらに belt and braces として、
+`revokeFleetInvokers` が `gateway-agent` と `synthesis-agent` の `roles/run.invoker`
+バインディングを `gemma-serving` から剥奪する。これにより、万が一 Cloud Run がリクエストを
+受け付けてしまっても、それを呼び出す権限を持つ者がいなくなる。成功判定は適用後の状態
+（scaling mode と manual count）を明示的に読み戻して確認する方式に変わり、フィールドが
+無いことからの推測はしない。空または欠落した scaling ブロックは成功ではなく
+`scale_to_zero_not_applied` として失敗になる。スイッチは更新オペレーションを
 **待ち、サーバのエコーを検証する**。`updateService` は long-running operation を返すため、
 その開始だけを待っていたことが最初の実発火で「半分だけ動く」原因になった。
 
@@ -607,21 +634,57 @@ just logs-kill-switch            # 直近 24h にスイッチが何を判断し�
 **発動後の復旧。**
 
 ```bash
-just restore-after-kill          # terraform apply: allUsers 再付与 + max instances 復元
+just restore-after-kill          # terraform apply、その後トリップマーカーを解除
 ```
 
-`gcloud` を 2 回叩くのではなく Terraform を復旧経路にしているのは、スイッチが逸脱させた
-「あるべき状態」を Terraform がすでに保持しているから — `allUsers` invoker バインディング
-（`iam.tf`）と `max_instance_count = 1`（`cloudrun.tf`）。apply は両方を再表明するので、
-手書きコマンドと違って片方だけ直して片方を忘れることがない。**先に支出の原因を潰すこと。**
+`gcloud` を何回か叩くのではなく Terraform を復旧経路にしているのは、スイッチが逸脱させた
+「あるべき状態」を Terraform がすでに保持しているから — `gateway-agent` の `allUsers`
+invoker バインディング、`gemma-serving` に対する gateway/synthesis の `run.invoker`
+バインディング（`iam.tf`）、そして `gemma-serving` のサービスレベル
+`scaling { scaling_mode = "AUTOMATIC" }`（`cloudrun.tf`。template scaling は
+min 0 / max 1 のまま変更なし）。apply はこの 3 つすべてを再表明するので、
+手書きコマンドと違って一部だけ直して残りを忘れることがない。**先に支出の原因を潰すこと。**
 さもないと次の通知でまた落ちる。このレシピはエージェントが実行してはいけない。
+
+その後レシピは `kill-switch/tripped` アノテーションを解除し、スイッチを再武装する。解除は
+apply が成功した**後**に最後に行う。マーカーが立っている間スイッチは発火しないので、先に
+外すとまだ落ちたままのフリートに対してスイッチを武装させることになるからである。この
+アノテーションはスイッチが書く実行時状態であって「あるべき状態」ではないため Terraform では
+宣言しない。解除は Cloud Run Admin API v2 の Service に対する read-modify-write で行い、
+**必ず読み戻して確認する**。`gcloud run services update` には `--remove-annotations`
+フラグが存在せず、それらしく見えるコマンドは黙ってマーカーを残す。そしてマーカーが残った
+スイッチは永久に武装解除された状態になる。
+
+**2026-08-30 のライブ発火で判明した運用上の注意が 2 点ある**
+（`docs/proof/kill-switch.md` 参照）:
+
+1. **apply を 2 回流す必要がある場合がある。** この環境の `gemma-serving` は startup probe を
+   通過できない状態にあり（キルスイッチの作業より前から存在する事象）、apply は
+   `Container failed to become healthy. Startup probes timed out after 11m` で終わる。
+   scaling の変更自体は反映されるが、このエラーが `gemma-serving` の `run.invoker`
+   バインディング再作成の**手前**で apply を中断させる。`just restore-after-kill` を
+   もう一度実行するか、`terraform apply -target=google_cloud_run_v2_service_iam_member.invoker`
+   を実行し、バインディングが戻っていることを確認すること。
+2. **マーカーが実際に消えたか確認すること。** レシピ自身が検証して失敗時は明示的にエラーに
+   するが、復旧を途中で中断した後は独立して確認しておく価値がある。
+
+IAM の伝播には約 40 秒かかる。apply が成功を報告した直後は `/v1/models` が数回 `403` を
+返すことがある。復旧失敗と結論づける前に待つこと。
 
 ---
 
 ## 6. GPU quota
 
-新規プロジェクトの Cloud Run GPU quota は **0** のことが多い。`gpu_enabled=true` で
-デプロイする前に確認する。
+> **`all-thinkgs` では解決済み。quota 申請は不要。** 2026-08-23 に出した L4 の申請は
+> （`us-central1` のリージョン枯渇により）**却下**され、Google からは
+> **NVIDIA RTX PRO 6000** を案内された。これは**プロジェクト・リージョンごとに
+> 1000 milliGPU が自動付与**され、`max_instance_count = 1` が許すインスタンス 1 台分には
+> 十分な量。そのため `var.gpu_type` の既定値は `nvidia-rtx-pro-6000` になっており、
+> `just tf-apply` は quota ゲート無しで実行できる。以下は L4 の申請手順で、別の
+> アクセラレータを使うまっさらなプロジェクトであれば今も必要になる内容として残してある。
+
+新規プロジェクトの Cloud Run GPU quota は **0** のことが多い（自動付与されないアクセラレータの
+場合）。`gpu_enabled=true` でデプロイする前に確認する。
 
 ### 確認
 
@@ -645,7 +708,8 @@ Console からの確認・申請:
 
 ### 申請手順 (gcloud)
 
-**`all-thinkgs` では 2026-08-23T23:06Z に申請済み。** 使用したコマンド:
+**`all-thinkgs` では 2026-08-23T23:06Z に申請済み、その後却下済み**（上のノート参照）。
+使用したコマンド:
 
 ```sh
 EMAIL=you@example.com \
@@ -674,8 +738,9 @@ just quota-status
 | `quotaConfig.grantedValue: '0'` | 未承認。`gpu_enabled=false` でデプロイすること |
 | `quotaConfig.grantedValue: '1'` | **承認済み。** `just tf-apply` を実行してよい  |
 
-現時点の状態: preference id `34528bab-4b5b-47f1-82da-cec57b21a95d`、
-`reconciling: true`、`grantedValue: 0` = **審査中**。デプロイ前に再確認すること。
+L4 preference `34528bab-4b5b-47f1-82da-cec57b21a95d` の最終状態: **却下**、
+`grantedValue: 0`。フリートは自動付与された RTX PRO 6000 の milliGPU で動いているため、
+この preference はゲートではなく履歴。
 
 ### 申請手順 (Console)
 
@@ -906,8 +971,9 @@ curl -sS -X POST "${GATEWAY_URL}/v1/ask" \
 
 1. **Cloud Run のサービス一覧** — 4 サービスが `us-central1` に並んでいる。
    URL と各サービスの SA 列が見えるようにする
-2. **`gemma-serving` の詳細 → Container(s) タブ** — **GPU: 1 × NVIDIA L4** の表示。
-   これが GPU デプロイの一番の証拠
+2. **`gemma-serving` の詳細 → Container(s) タブ** — **GPU: 1 × NVIDIA RTX PRO 6000** と
+   20 vCPU / 80 GiB の表示。これが GPU デプロイの一番の証拠。
+   （L4 ではなく RTX PRO 6000 である理由は §5 を参照）
 3. **`gemma-serving` の Networking タブ** — Ingress control = _Internal_
 4. **`core-agent` の Security タブ** — SA = `sa-core@...`、認証が Required
 5. **IAM ページで `sa-core` を検索** — ロールが `aiplatform.user` 等のみで
@@ -977,7 +1043,9 @@ just chill   # 解放: min-instances=0、課金停止
 
 **`just warm` は on の間ずっと実費が発生する。** 常駐した Nvidia RTX PRO 6000
 （20 vCPU / 80 GiB、`us-central1`）はリクエストの有無にかかわらず課金され、
-**概ね 1 時間あたり USD 0.70〜0.80、1 日あたり USD 17〜19**。レシピは毎回この警告を表示する。
+**1 時間あたり約 USD 3.19、1 日あたり約 USD 77**（内訳は §5。20 vCPU / 80 GiB は
+アクセラレータ側の要求で回避不能であり、合計すると GPU 本体と同程度のコストになる）。
+レシピは毎回この警告を表示する。
 撮影が終わったら直ちに `just chill` を実行すること。暖めたまま一晩放置するのが、コスト
 キルスイッチを踏み抜く最も可能性の高い経路である（§「コスト自動キルスイッチ」）。
 
@@ -990,8 +1058,10 @@ desired state ではない。Terraform に書くとリポジトリの構成が�
 主張することになり、後で誰かが `tf-apply` すると黙って再び暖まってしまう。`just chill` で
 戻せるし、`tf-apply` でも戻る（Terraform 構成は常に `min_instance_count = 0` を再表明する）。
 
-`min-instances` とキルスイッチの `max-instances` を混同しないこと。`just warm` は下限を
-上げる操作で、キルスイッチは**上限**をゼロに落とす操作である。スイッチが作動している状態で
+`min-instances` とキルスイッチの動作を混同しないこと。`just warm` は
+`template.scaling.minInstanceCount` で下限を上げる操作だが、キルスイッチは
+`gemma-serving` を **manual scaling でインスタンス数 0 に固定**し、さらにフリートの
+invoker 権限を剥奪する（§「自動コストキルスイッチ」参照）。スイッチが作動している状態で
 `just warm` しても Gemma は戻らない。先に `just restore-after-kill` で復旧すること。
 
 ### 9.5 審査員向けの監査ビュー
@@ -1015,10 +1085,15 @@ evidence ではないからである。
 
 - **未設定（既定）** — `/v1/audit` も `/audit` もそもそも登録されない。ルートが存在しない
   ので両方 404 を返す。
-- **設定済み** — `?key=<token>` か `X-Admin-Token` ヘッダーでトークンを渡す必要がある。
-  比較は定数時間で行い、トークンが違う場合は **401 ではなく 404** を返す。トークンを持たな
-  い相手にこのサーフェスの存在を広告しないためであり、2 つの状態は外部から意図的に区別でき
-  ないようにしてある。
+- **設定済み** — トークンは `X-Admin-Token` リクエストヘッダーでのみ渡せる。比較は定数時間
+  で行い、トークンが違う場合は **401 ではなく 404** を返す。トークンを持たない相手にこの
+  サーフェスの存在を広告しないためであり、2 つの状態は外部から意図的に区別できないように
+  してある。
+
+受け付けるのはヘッダー*だけ*である。`?key=` クエリパラメータは値が正しくても拒否する。
+Cloud Run は全リクエストのリクエストログを書き、`httpRequest.requestUrl` はクエリ文字列を
+そのまま含むため、クエリパラメータの capability は Logs Viewer 権限・ログシンク・エクス
+ポートされた URL を持つ全員に capability を配ることと同義だからである。
 
 これは意図的にデモ用の作りである。公開 Gateway は誰も認証していないため、トークンの背後に
 principal は存在せず、文字列を持っていること自体が主張のすべてである。とりわけ **OKF の
@@ -1040,7 +1115,7 @@ principal は存在せず、文字列を持っていること自体が主張の�
 # 生成して有効化
 token=$(openssl rand -hex 16)
 just tf-apply admin_token="$token"
-echo "$token"          # ページに貼り付けるか、/audit?key=$token を使う
+echo "$token"          # ページに貼り付けるか、/audit#key=$token を使う
 
 # ローテーション: 新しい値で apply する。古いトークンは即座に無効になる
 just tf-apply admin_token="$(openssl rand -hex 16)"
@@ -1050,9 +1125,16 @@ just tf-apply admin_token=""
 ```
 
 ローテーションと無効化は、apply が作る次のリビジョンから有効になる。ページはトークンを
-`sessionStorage` に保持するのでリロードしても残り、タブを閉じれば消える。URL の `?key=` は
-一度だけ読んだ後アドレスバーから取り除くので、共有したデモリンクがブラウザ履歴に capability
-を残すことはない。
+`sessionStorage` に保持するのでリロードしても残り、タブを閉じれば消える。
+
+共有用のデモリンクはトークンを URL の**フラグメント**（`/audit#key=<token>`）で運び、クエリ
+文字列では決して運ばない。ブラウザはフラグメントを送信しないので、トークンは Cloud Run の
+リクエストログに到達することなくページに届く。ページはそれを一度だけ読んで `sessionStorage`
+に移し、アドレスバーからフラグメントを取り除いて（ブラウザ履歴にも後続の referrer にも
+capability を残さない）、以降は `X-Admin-Token` ヘッダーとしてのみ送る。
+
+デプロイ済みリビジョンに対して一度でも `?key=` の URL で使われたトークンは、既にリクエスト
+ログに載っているため漏洩したものとして扱い、ローテーションすること。
 
 ---
 

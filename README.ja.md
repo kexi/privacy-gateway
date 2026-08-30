@@ -338,18 +338,18 @@ API ではなく本番のリクエスト経路そのもの。chromium のみと�
 
 ### API
 
-| メソッド | パス                                 | 用途                                                                                                                                                  |
-| -------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計                             |
-| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                                        |
-| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                                   |
-| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                                             |
-| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                                                |
-| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                                                          |
-| `GET`    | `/v1/status`                         | Gemma が `warm`/`warming`/`cold`/`unknown` のいずれか、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない                    |
-| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける                                 |
-| `GET`    | `/v1/audit`                          | 保存済み evidence のメタデータ一覧（読み取り専用・新しい順・最大 50 件）。`?key=` か `X-Admin-Token` が必要で、`ADMIN_TOKEN` 未設定時や不一致時は 404 |
-| `GET`    | `/healthz`                           | 死活監視                                                                                                                                              |
+| メソッド | パス                                 | 用途                                                                                                                                                                                                   |
+| -------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計                                                                              |
+| `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                                                                                         |
+| `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                                                                                    |
+| `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                                                                                              |
+| `POST`   | `/v1/chat/completions`               | 同一パイプライン上の OpenAI 互換ファサード（下記参照）                                                                                                                                                 |
+| `GET`    | `/v1/models`                         | OpenAI 互換のモデル一覧。ID は `privacy-gateway` の 1 つだけ                                                                                                                                           |
+| `GET`    | `/v1/status`                         | Gemma が `warm`/`warming`/`cold`/`unknown` のいずれか、およびコールドスタートの見積もり。軽量・約 5 秒キャッシュ・GPU を起こさない                                                                     |
+| `POST`   | `/v1/warmup`                         | GPU を起動する。**インスタンスが生きている間は課金される**（アイドル約 15 分）ため `/v1/ask` と同じレート制限をかける                                                                                  |
+| `GET`    | `/v1/audit`                          | 保存済み evidence のメタデータ一覧（読み取り専用・新しい順・最大 50 件）。`X-Admin-Token` ヘッダーが必要（`?key=` クエリは拒否。共有リンクは `/audit#key=`）で、`ADMIN_TOKEN` 未設定時や不一致時は 404 |
+| `GET`    | `/healthz`                           | 死活監視                                                                                                                                                                                               |
 
 `POST /v1/ask` は `Accept: text/event-stream` に対して進捗ストリームでも応答する。パイプ
 ラインの各段階（`masking`、`egress_guard`、`core_reasoning`、`leak_check`、`rehydrate`）
@@ -650,10 +650,11 @@ Core のサービスアカウントには意図的に Firestore ロールを **�
 テアダウンの忘れだけで、1 日放置すると **約 $39**。
 
 そこで、消し忘れは深夜 3 時に誰も読まないメールではなく自動処理で受け止める。
-**¥8,000 (~$50) の Cloud Billing budget** がしきい値超過（50% / 80% / 100%）のたびに Pub/Sub topic へ
+**¥15,000 (~$95) の Cloud Billing budget** がしきい値超過（50% / 80% / 100%）のたびに Pub/Sub topic へ
 publish し、その push subscription が小さな `kill-switch` Cloud Run サービスを呼ぶ。
 100% 到達時に `gateway-agent` から `allUsers` invoker バインディングを外し、
-`gemma-serving` の max instances を 0 にする。どちらも冪等なので Pub/Sub の再配信は無害。
+Cloud Run の manual scaling で `gemma-serving` をインスタンス数 0 に固定し、さらに
+`gemma-serving` に対するフリートの invoker 権限を剥奪する。3 つとも冪等なので Pub/Sub の再配信は無害。
 100% 未満ならログを残すだけ。支出の原因を潰したあと `just restore-after-kill` で復旧する。
 
 なお、コストゲートはこのフリートの開示ゲートとは違って意図的に **fail closed にしない**。

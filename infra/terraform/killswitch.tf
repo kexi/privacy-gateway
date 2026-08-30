@@ -314,6 +314,19 @@ resource "google_cloud_run_v2_service" "kill_switch" {
         name  = "KILL_SWITCH_GEMMA_SERVICE"
         value = "gemma-serving"
       }
+
+      # The fleet identities the switch strips from gemma-serving's invoker
+      # binding, belt-and-braces beside manual scaling at zero. Passed as
+      # explicit member strings rather than derived in the service from a naming
+      # convention: a convention that drifts leaves a binding alive through a
+      # trip, and Terraform already knows the real emails.
+      env {
+        name = "KILL_SWITCH_FLEET_MEMBERS"
+        value = join(",", [
+          "serviceAccount:${google_service_account.agents["sa-gateway"].email}",
+          "serviceAccount:${google_service_account.agents["sa-synthesis"].email}",
+        ])
+      }
     }
   }
 

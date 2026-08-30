@@ -299,18 +299,33 @@ describe('the judge is given safe context by the pipeline', () => {
   });
 });
 
-describe('the judge is re-asked once, and only for an unevidenced flag', () => {
-  it('releases when a categoryless flag clears on the second look', async () => {
+describe('a judge flag is terminal, and a second call may only add evidence', () => {
+  it('still refuses when a categoryless flag comes back clear on the second look', async () => {
+    // The veto is authoritative. A second answer of "actually it is fine" is
+    // exactly the re-roll that would launder a probabilistic veto into a pass,
+    // and the rehydrated name must never reach the caller because of it.
     const { judge, callCount } = scriptedJudge({ leak: true, categories: [] }, { leak: false });
 
-    const result = await run('Dear ⟦PERSON_1⟧.', { judge });
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
 
     expect(callCount()).toBe(2);
-    expect(result.answer).toContain('Taro Yamada');
-    // The audit record says the release needed a second look: a pass on retry is
-    // a materially weaker claim than a pass outright, and hiding that would
-    // overstate what was checked.
-    expect(result.attestation.judge_retries).toBe(1);
+    expect(error.kind).toBe('judge_flagged');
+    expect(error.status).toBe(422);
+    expect(JSON.stringify(error)).not.toContain('Taro Yamada');
+  });
+
+  it('adopts the categories the second call names, for the refusal record', async () => {
+    const { judge } = scriptedJudge(
+      { leak: true, categories: [] },
+      { leak: true, categories: ['PERSON'] },
+    );
+
+    const error = await refusal('Dear ⟦PERSON_1⟧.', { judge });
+
+    expect(error.kind).toBe('judge_flagged');
+    expect(error.categories).toEqual(['PERSON']);
+    expect(error.evidence.attestation.judge?.categories).toEqual(['PERSON']);
+    expect(error.evidence.attestation.judge_retries).toBe(1);
   });
 
   it('refuses when the second look flags it too', async () => {
@@ -375,16 +390,16 @@ describe('the judge is re-asked once, and only for an unevidenced flag', () => {
     expect(result.attestation.judge_retries).toBeUndefined();
   });
 
-  it('still adds no trust when the retry clears it', async () => {
+  it('still adds no trust when the judge clears a body outright', async () => {
     // The asymmetry is unchanged: a judge may veto a release, never vouch for
     // one. The tier still comes from the deterministic attester alone.
-    const { judge } = scriptedJudge({ leak: true, categories: [] }, { leak: false });
-
-    const retried = await run('Dear ⟦PERSON_1⟧.', { judge });
+    const cleared = await run('Dear ⟦PERSON_1⟧.', {
+      judge: () => Promise.resolve({ leak: false }),
+    });
     const plain = await run('Dear ⟦PERSON_1⟧.');
 
-    expect(retried.trustTier).toBe(plain.trustTier);
-    expect(retried.dimensions.policy_verdict).toBe(plain.dimensions.policy_verdict);
+    expect(cleared.trustTier).toBe(plain.trustTier);
+    expect(cleared.dimensions.policy_verdict).toBe(plain.dimensions.policy_verdict);
   });
 });
 

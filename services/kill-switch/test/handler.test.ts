@@ -34,13 +34,15 @@ function captureLogger(): { logger: Logger; lines: Record<string, unknown>[] } {
 class FakeActions implements KillActions {
   public readonly invokerCalls: string[] = [];
   public readonly scaleCalls: string[] = [];
+  public readonly fleetInvokerCalls: string[] = [];
   public readonly markCalls: string[] = [];
-  public failOn: 'none' | 'invoker' | 'scale' | 'mark' | 'isTripped' = 'none';
+  public failOn: 'none' | 'invoker' | 'scale' | 'fleet' | 'mark' | 'isTripped' = 'none';
   /** The `kill-switch/tripped` annotation, as the real service would hold it. */
   public tripped = false;
 
   private invokerRevoked = false;
   private scaledToZero = false;
+  private fleetInvokersRevoked = false;
 
   isTripped(_service: string): Promise<boolean> {
     if (this.failOn === 'isTripped') return Promise.reject(new TypeError('boom'));
@@ -67,6 +69,14 @@ class FakeActions implements KillActions {
     if (this.failOn === 'scale') return Promise.reject(new TypeError('boom'));
     const alreadyApplied = this.scaledToZero;
     this.scaledToZero = true;
+    return Promise.resolve({ alreadyApplied });
+  }
+
+  revokeFleetInvokers(service: string): Promise<ActionOutcome> {
+    this.fleetInvokerCalls.push(service);
+    if (this.failOn === 'fleet') return Promise.reject(new TypeError('boom'));
+    const alreadyApplied = this.fleetInvokersRevoked;
+    this.fleetInvokersRevoked = true;
     return Promise.resolve({ alreadyApplied });
   }
 }
@@ -121,6 +131,7 @@ describe('handleNotification', () => {
       expect(outcome.kind).toBe('triggered');
       expect(actions.invokerCalls).toEqual(['gateway-agent']);
       expect(actions.scaleCalls).toEqual(['gemma-serving']);
+      expect(actions.fleetInvokerCalls).toEqual(['gemma-serving']);
     });
 
     it('fires when spend overshoots the budget', async () => {
@@ -183,6 +194,7 @@ describe('handleNotification', () => {
         kind: 'triggered',
         invokerAlreadyRevoked: false,
         gemmaAlreadyScaledToZero: false,
+        fleetInvokersAlreadyRevoked: false,
       });
       // Not "triggered, already applied": the redelivery must not re-run the
       // mutations at all. Re-revoking is what fought the operator's restore
@@ -190,6 +202,7 @@ describe('handleNotification', () => {
       expect(second).toEqual({ kind: 'already_tripped' });
       expect(actions.invokerCalls).toEqual(['gateway-agent']);
       expect(actions.scaleCalls).toEqual(['gemma-serving']);
+      expect(actions.fleetInvokerCalls).toEqual(['gemma-serving']);
     });
 
     it('never re-revokes across many redeliveries', async () => {

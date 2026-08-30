@@ -563,45 +563,49 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
         }
       });
 
-    let opinion = await consult();
+    const opinion = await consult();
     let judgeCategories = filterPiiCategories(opinion.categories ?? []).categories;
     let judgeRetries = 0;
 
     /**
-     * A flag with no categories, over a body the deterministic attester passed,
-     * is the one case worth asking twice.
+     * A flag with no categories buys one more call — to name the categories for
+     * the refusal record, never to lift the veto.
      *
-     * Why not retry unconditionally: a flag that names categories is a specific
-     * suspicion, and re-rolling until it goes away is exactly how a probabilistic
-     * veto gets laundered into a pass. Why not retry more than once: past two
-     * attempts there is no way to distinguish "the first answer was noise" from
-     * "keep rolling until it lets us through", which is the same failure with
-     * more steps.
+     * The request is already refused at this point: `leak: true` is terminal
+     * whether or not the judge managed to format a category list. The second
+     * call exists so the caller and the audit document learn *what* the judge
+     * suspected, because a refusal that says only "something" is much harder to
+     * act on than one that says "PERSON".
      *
-     * The attester gate above has already refused anything it could see, so the
-     * only thing being re-asked here is a model's unexplained hunch about a body
-     * deterministic code found clean.
+     * Why not let a clear second answer release: re-rolling a probabilistic veto
+     * until it goes away is how a veto becomes theatre. The deterministic
+     * attester does not detect names or postal addresses, so an unevidenced flag
+     * over an attester-clean body is precisely the case where the judge is
+     * adding coverage nothing else has — the case where a downgrade costs the
+     * most. Why not skip the second call entirely: it is free of consequence and
+     * it is the only chance to attach evidence to the refusal.
      */
     const isUnevidencedFlag = opinion.leak === true && judgeCategories.length === 0 && verdict.ok;
     if (isUnevidencedFlag) {
       const second = await consult();
       judgeRetries = 1;
+      const enriched = filterPiiCategories(second.categories ?? []).categories;
       logger?.event('judge.retry', {
         verdict: second.leak === true ? 'flagged' : second.leak === false ? 'clear' : 'unusable',
+        categories: enriched,
       });
 
-      // A second attempt that comes back unusable is not an improvement on an
-      // unevidenced flag, so the original verdict stands and the request is
-      // refused as `judge_flagged` rather than downgraded to `judge_unavailable`.
-      if (second.leak === false) {
-        opinion = second;
-        judgeCategories = filterPiiCategories(second.categories ?? []).categories;
-      }
+      // Only the category list is taken. `second.leak` is deliberately ignored:
+      // it cannot confirm the veto (it is already authoritative) and it cannot
+      // lift it.
+      if (enriched.length > 0) judgeCategories = enriched;
     }
 
+    // The first opinion is the verdict. Nothing after it may change `leak`.
     attestation.judge = { leak: opinion.leak ?? null, categories: judgeCategories };
-    // Recorded in the audit document so a release that only passed on the second
-    // look is distinguishable from one that passed outright.
+    // Recorded in the audit document so a refusal whose categories were
+    // recovered on a second look is distinguishable from one that named them
+    // outright. It counts category-enrichment attempts, never verdict re-rolls.
     if (judgeRetries > 0) attestation.judge_retries = judgeRetries;
     logger?.event('judge.gemma', { leak: opinion.leak ?? null, categories: judgeCategories });
 

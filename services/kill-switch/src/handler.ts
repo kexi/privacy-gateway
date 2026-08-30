@@ -49,12 +49,13 @@ export type HandlerOutcome =
   | { readonly kind: 'under_budget'; readonly ratio: number }
   /** Well-formed, no cost data. Nothing to decide. */
   | { readonly kind: 'no_data' }
-  /** Over budget. Both mutations attempted. */
+  /** Over budget. All three mutations attempted. */
   | {
       readonly kind: 'triggered';
       readonly ratio: number;
       readonly invokerAlreadyRevoked: boolean;
       readonly gemmaAlreadyScaledToZero: boolean;
+      readonly fleetInvokersAlreadyRevoked: boolean;
     }
   /** Over budget, but a mutation failed. The switch did not fully engage. */
   | { readonly kind: 'failed'; readonly error: string }
@@ -158,6 +159,16 @@ export async function handleNotification(
       already_applied: scaled.alreadyApplied,
     });
 
+    // Belt and braces, after the scaling change rather than before it: manual
+    // scaling at zero is what actually stops the GPU billing, and stripping the
+    // fleet's invoker rights on top means that even a Cloud Run that somehow
+    // admitted a request would have nobody authorised to make it.
+    const fleet = await actions.revokeFleetInvokers(targets.gemmaService);
+    logger.event('killswitch.fleet_invokers_revoked', {
+      ...fields,
+      already_applied: fleet.alreadyApplied,
+    });
+
     // Written only once both mutations have been confirmed, so the marker never
     // claims a trip that did not fully engage. A marker that cannot be written
     // is logged and tolerated: the fleet is already stopped, and refusing here
@@ -174,7 +185,7 @@ export async function handleNotification(
 
     logger.event('killswitch.completed', {
       ...fields,
-      already_applied: invoker.alreadyApplied && scaled.alreadyApplied,
+      already_applied: invoker.alreadyApplied && scaled.alreadyApplied && fleet.alreadyApplied,
     });
 
     return {
@@ -182,6 +193,7 @@ export async function handleNotification(
       ratio: fields['budget_ratio'] ?? 0,
       invokerAlreadyRevoked: invoker.alreadyApplied,
       gemmaAlreadyScaledToZero: scaled.alreadyApplied,
+      fleetInvokersAlreadyRevoked: fleet.alreadyApplied,
     };
   } catch (error) {
     // Reported as a failure, but the transport answers 2xx anyway — see the

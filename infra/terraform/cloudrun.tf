@@ -28,11 +28,22 @@ resource "google_cloud_run_v2_service" "gemma" {
 
   deletion_protection = false
 
+  # Service-level scaling, declared explicitly so it is desired state rather
+  # than whatever the last write left behind. The kill switch trips this service
+  # by setting MANUAL / manual_instance_count = 0 — the documented way to hold a
+  # Cloud Run service at zero instances — so `just restore-after-kill` needs
+  # Terraform to own the field and put it back to AUTOMATIC. Without this block
+  # an apply would see no diff and leave the GPU pinned off after a restore.
+  scaling {
+    scaling_mode = "AUTOMATIC"
+  }
+
   template {
     service_account = google_service_account.agents["sa-gemma"].email
 
-    # The default L4 quota is 1. Raise max after a quota increase.
-    # min = 0 means an idle fleet costs nothing, which matters at ~$1.42/h.
+    # Max 1 because the auto-granted RTX PRO 6000 milliGPU quota covers one
+    # instance. min = 0 means an idle fleet costs nothing, which matters at
+    # roughly $1.6/h while an instance is up.
     scaling {
       min_instance_count = 0
       max_instance_count = 1

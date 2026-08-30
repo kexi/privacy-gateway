@@ -53,6 +53,20 @@ function resolveTargets(env: NodeJS.ProcessEnv): KillTargets {
   };
 }
 
+/**
+ * The fleet identities whose invoker rights on Gemma the switch strips.
+ *
+ * Supplied by Terraform as a comma-separated list of IAM member strings, so the
+ * switch never has to derive service-account emails from a naming convention —
+ * a guess that is wrong is a binding that survives the trip.
+ */
+function resolveFleetMembers(env: NodeJS.ProcessEnv): readonly string[] {
+  return (env['KILL_SWITCH_FLEET_MEMBERS'] ?? '')
+    .split(',')
+    .map((member) => member.trim())
+    .filter((member) => member !== '');
+}
+
 /** Builds the Express app. Importing this module must not start a listener. */
 export function createApp(options: CreateAppOptions): express.Application {
   const { config, logger } = options;
@@ -62,6 +76,7 @@ export function createApp(options: CreateAppOptions): express.Application {
     cloudRunActions({
       project: config.GOOGLE_CLOUD_PROJECT ?? '',
       region: config.GOOGLE_CLOUD_LOCATION ?? 'us-central1',
+      fleetMembers: resolveFleetMembers(process.env),
     });
 
   const app = express();

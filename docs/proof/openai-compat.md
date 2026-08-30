@@ -1,13 +1,38 @@
 # OpenAI-compatible endpoint against production
 
-Captured **2026-08-27** against the deployed Gateway
-(`https://gateway-agent-turszib42q-uc.a.run.app`), project `all-thinkgs`.
+Captured **2026-08-30** against the deployed Gateway at
+`https://privacy-gateway.kexi.dev`, project `all-thinkgs`.
 
 The sample PII is synthetic and allow-listed in `.gitleaks.toml`. Nothing here is real.
 
-## Run 1 — a request with no PII succeeds
+## `GET /v1/models`
 
-This is the run that proves the compatibility surface works end to end.
+```http
+GET /v1/models
+```
+
+**Response — HTTP 200**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "privacy-gateway",
+      "object": "model",
+      "created": 1788099083,
+      "owned_by": "privacy-gateway"
+    }
+  ]
+}
+```
+
+One model is advertised, `privacy-gateway`, because the endpoint is a policy boundary
+rather than a model marketplace: whatever `model` a client names, the request takes the
+same masked path through Core. An OpenAI client that lists models before calling gets a
+valid, well-formed catalogue.
+
+## `POST /v1/chat/completions` — a PII request succeeds and is rehydrated
 
 **Request**
 
@@ -15,46 +40,57 @@ This is the run that proves the compatibility surface works end to end.
 POST /v1/chat/completions
 Content-Type: application/json
 
-{"model":"gemma3:12b","messages":[{"role":"user",
-  "content":"Reply with JSON only: {\"leak\": true|false}. Does this text contain personal data? Text: Hello world, the weather is nice."}]}
+{"model":"privacy-gateway","messages":[{"role":"user",
+  "content":"Email Hanako Suzuki at hanako.suzuki@example.co.jp about invoice 12345."}]}
 ```
 
 **Response — HTTP 200**
 
 ```json
 {
-  "id": "chatcmpl-01a04587-c5e1-78e3-bb58-0f1eb7a93965",
+  "id": "chatcmpl-01a05302-bc61-7edb-a4c7-b3a140744772",
   "object": "chat.completion",
-  "created": 1787872923,
+  "created": 1788099087,
   "model": "privacy-gateway",
   "choices": [
     {
       "index": 0,
-      "message": { "role": "assistant", "content": "{\"leak\": false}" },
+      "message": {
+        "role": "assistant",
+        "content": "Subject: Invoice 12345\n\nDear Hanako Suzuki,\n\nI hope this email finds you well. \n\nThis is a friendly reminder regarding invoice 12345, which is currently registered under your account. Please let me know if you have received this invoice and if there are any questions or outstanding details we need to discuss to facilitate its payment.\n\nYou can reach me directly by replying to this email. Thank you for your time and cooperation.\n\nBest regards,\n\n[Your Name/Company]"
+      },
       "finish_reason": "stop"
     }
   ],
   "x_privacy_gateway": {
-    "request_id": "01a04587-c5e1-78e3-bb58-0f1eb7a93965",
-    "trace_id": "003b8bcb93f7cc2da218f61af43bab8e",
+    "request_id": "01a05302-bc61-7edb-a4c7-b3a140744772",
+    "trace_id": "ebe3c14c7d7863b8ea33e25402fccd54",
     "trust_tier": "machine-confirmed",
     "status": "stable",
-    "masked_prompt": "Reply with JSON only: ...",
+    "masked_prompt": "Email ⟦PERSON_1⟧ at ⟦EMAIL_1⟧ about invoice 12345.",
     "withheld": []
   }
 }
 ```
 
-The shape is OpenAI's (`object`, `choices[].message`, `finish_reason`), so an existing
-OpenAI client works unchanged, and the `x_privacy_gateway` extension carries the
-`request_id`, `trace_id` and `trust_tier` an auditor needs.
+Three things are visible at once:
 
-`GET /v1/models` also answers `200`.
+- **The shape is OpenAI's** (`object`, `choices[].message`, `finish_reason`), so an
+  existing OpenAI client works unchanged against this URL.
+- **`masked_prompt` shows the boundary held.** Gemini saw `⟦PERSON_1⟧` and `⟦EMAIL_1⟧`,
+  never the name or the address. The invoice number is not PII and was passed through.
+- **The answer came back rehydrated.** "Dear Hanako Suzuki" is in the released content
+  because `PERSON` is not a withheld category; `withheld` is empty for this request.
 
-## Run 2 — the detector-safe PII sample is refused
+The `x_privacy_gateway` extension carries the `request_id`, `trace_id` and `trust_tier` an
+auditor needs. A client that ignores unknown fields sees a perfectly ordinary completion;
+a client that reads them gets the whole provenance chain.
 
-The sample the task specified (email + phone, no bare name) reaches every gate and is
-then refused by the advisory judge.
+## Historical run (2026-08-27) — the detector-safe PII sample was refused
+
+Kept as history. At the time of this capture the sample (email + phone, no bare name)
+reached every gate and was then refused by the advisory judge, because of the
+placeholder-veto defect fixed in the addendum below.
 
 **Request**
 
@@ -114,11 +150,14 @@ Read in order this establishes:
 This is the documented asymmetry working exactly as `agents/synthesis/src/pipeline.ts`
 describes it: _"A probabilistic model may veto; it may not vouch."_
 
-## Open issue: the judge vetoes its own placeholders
+## Historical defect (fixed): the judge vetoed its own placeholders
 
-Run 2 is not specific to that sample. The advisory judge returns `leak: true` for
+**Resolved** — see the addendum below for the fix. The text in this section describes the
+state on 2026-08-27 and is kept as the record of what was actually observed.
+
+The refusal above was not specific to that sample. The advisory judge returned `leak: true` for
 essentially every answer that contains `⟦TYPE_N⟧` placeholders, which is most answers
-that had any PII to mask — so `just smoke` currently fails with `judge_flagged`.
+that had any PII to mask — so `just smoke` failed with `judge_flagged` at the time.
 
 Evidence from one 10-minute window, same deployment, same model:
 
@@ -189,6 +228,13 @@ Three properties keep the fix from weakening the gate:
 - **The asymmetric veto is unchanged.** `leak: true` or an unusable answer blocks;
   `leak: false` adds no trust. The attester remains the only thing that can _pass_ an
   answer. `judge_unavailable` still refuses.
+
+The flag is also **terminal**. `leak: true` always refuses with `judge_flagged` (422); a
+second judge call may run only to name categories for the refusal record, and its `leak`
+value is discarded outright, so no re-roll can turn a flag into a release.
+`attestation.judge_retries` counts those category-enrichment attempts, not verdict
+re-rolls. See `docs/ARCHITECTURE.md` and
+[README.md](./README.md#resolved-postmortems).
 
 Covered by `agents/synthesis/test/judge.test.ts` (which asserts the bytes that reach the
 wire, not just the verdict) and `packages/common/test/tokenizer.test.ts`.

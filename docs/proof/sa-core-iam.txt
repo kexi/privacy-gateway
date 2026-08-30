@@ -1,4 +1,4 @@
-# sa-core project IAM roles (all-thinkgs), captured 2026-08-28
+# sa-core project IAM roles (all-thinkgs), captured 2026-08-30
 # gcloud projects get-iam-policy all-thinkgs --flatten='bindings[].members' \
 #   --filter='bindings.members:sa-core@all-thinkgs.iam.gserviceaccount.com' --format='value(bindings.role)'
 
@@ -7,3 +7,11 @@ roles/cloudtrace.agent
 roles/logging.logWriter
 
 # No roles/datastore.* entry: Core structurally cannot read the Token Vault.
+#
+# This is the guarantee that makes the masking meaningful. Core is the agent that talks to
+# Gemini, and it is the only hop where cleartext PII could be reconstructed — if it could
+# read the vault. It cannot: the mapping from placeholder to real value lives in Firestore,
+# and Core's service account holds no Firestore role at all.
+#
+# The absence of a line is the proof. It is enforced by IAM, not by the package graph, so
+# it cannot be undone by an import, a dependency bump, or a code change alone.

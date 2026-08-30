@@ -91,7 +91,7 @@ just build                        # ~25 min for Gemma (see the note in 3.3
                                   #   for the very first run on a fresh project)
 just tf-plan gpu_enabled=false    # review: 33 resources to add
 just tf-apply gpu_enabled=false   # everything except gemma-serving
-   ... wait for the L4 quota to be granted (section 6) ...
+   ... (no wait on `all-thinkgs`: the RTX PRO 6000 milliGPU is auto-granted, section 6) ...
 just tf-apply                     # adds gemma-serving, 36 total
 just urls && just health          # verify (section 8)
 just tf-destroy                   # when finished (section 10)
@@ -213,8 +213,10 @@ TTL caveats:
 
 `gpu_enabled=false` skips the `gemma-serving` service and the two `run.invoker` bindings
 that point at it, leaving 33 resources that need no GPU quota at all. **This is the
-recommended path on a fresh project**, because the L4 quota request (section 6) takes
-minutes to days and everything else can be up and verified in the meantime:
+recommended path on a fresh project whose accelerator is not auto-granted**, because a quota
+request (section 6) takes minutes to days and everything else can be up and verified in the
+meantime. On `all-thinkgs` the RTX PRO 6000 milliGPU is auto-granted, so this split is
+optional rather than a gate:
 
 ```bash
 just tf-plan gpu_enabled=false     # 33 to add
@@ -477,28 +479,35 @@ Implementation notes:
 
 Rates are the real `us-central1` SKUs from the Cloud Billing API (as of 2026-08, USD).
 
-| SKU                                | Rate                                 |
-| ---------------------------------- | ------------------------------------ |
-| NVIDIA L4, **no** zonal redundancy | `0.0001867` / GPU-sec = **$0.672/h** |
-| NVIDIA L4, with zonal redundancy   | `0.0002909` / GPU-sec = $1.047/h     |
-| Services CPU (instance-based)      | `0.000018` / vCPU-sec                |
-| Services Memory (instance-based)   | `0.000002` / GiB-sec                 |
+| SKU                                          | Rate                                  |
+| -------------------------------------------- | ------------------------------------- |
+| NVIDIA RTX PRO 6000, **no** zonal redundancy | `0.00036522` / GPU-sec = **$1.315/h** |
+| NVIDIA RTX PRO 6000, with zonal redundancy   | `0.00056913` / GPU-sec = $2.049/h     |
+| Services CPU (instance-based)                | `0.000018` / vCPU-sec                 |
+| Services Memory (instance-based)             | `0.000002` / GiB-sec                  |
+
+The GPU is an RTX PRO 6000, not an L4: Google declined the L4 quota request in 2026-08
+(regional exhaustion) and pointed at RTX PRO 6000, which ships with 1000 milliGPU
+auto-granted per region and so needs no quota wait. It is the more expensive part per hour
+and it mandates a much larger instance — see below.
 
 ### Hourly rate while instances are up
 
-`gemma-serving` (1 GPU + 8 vCPU + 32GiB, `cpu_idle = false`):
+`gemma-serving` (1 GPU + 20 vCPU + 80 GiB, `cpu_idle = false`). The 20 vCPU / 80 GiB are
+**not a choice**: Cloud Run mandates at least that much per `nvidia-rtx-pro-6000`, so the
+CPU and memory lines are as unavoidable as the GPU line.
 
-| Component                    | $/h            |
-| ---------------------------- | -------------- |
-| L4 GPU (no zonal redundancy) | 0.672          |
-| CPU, 8 vCPU                  | 0.518          |
-| Memory, 32 GiB               | 0.230          |
-| **Subtotal**                 | **$1.421 / h** |
+| Component                              | $/h            |
+| -------------------------------------- | -------------- |
+| RTX PRO 6000 GPU (no zonal redundancy) | 1.315          |
+| CPU, 20 vCPU                           | 1.296          |
+| Memory, 80 GiB                         | 0.576          |
+| **Subtotal**                           | **$3.187 / h** |
 
 The three agent services (1 vCPU + 1GiB each): $0.072/h each, so **$0.216/h** together.
 
-> **Total with everything warm: about $1.64 / hour**
-> (About $2.01/h with zonal redundancy, roughly 23% more.)
+> **Total with everything warm: about $3.40 / hour**
+> (About $4.14/h with zonal redundancy, roughly 22% more.)
 
 ### What it actually costs
 
@@ -509,9 +518,9 @@ is another reason to prefer that path.
 
 | Scenario                                                  | Approx.                          |
 | --------------------------------------------------------- | -------------------------------- |
-| Recording the demo video (3 hours, GPU up the whole time) | **~$4.9**                        |
-| Sporadic development use (about 1 hour/day)               | ~$1.6 / day                      |
-| **Left running for 24h by mistake**                       | **~$39 / day** <- watch out      |
+| Recording the demo video (3 hours, GPU up the whole time) | **~$10**                         |
+| Sporadic development use (about 1 hour/day)               | ~$3.4 / day                      |
+| **Left running for 24h by mistake**                       | **~$82 / day** <- watch out      |
 | Cloud Build (Gemma, e2-highcpu-32 for ~25 min)            | ~$0.5 / build                    |
 | Firestore / Artifact Registry / state bucket              | free tier to a few tens of cents |
 
@@ -526,7 +535,7 @@ Forgetting the teardown is a human failure, and an email alert at 3am does not f
 budget drives an **action**, not a notification:
 
 ```
-Cloud Billing budget (¥8,000 (~$50))
+Cloud Billing budget (¥15,000 (~$95))
         │  every threshold crossing (50% / 80% / 100%)
         ▼
 Pub/Sub topic  billing-kill-switch
@@ -536,7 +545,8 @@ Cloud Run service  kill-switch
         │  costAmount >= budgetAmount ?
         ├── no  → log killswitch.under_budget, change nothing
         └── yes → remove allUsers run.invoker from gateway-agent
-                  set gemma-serving max_instance_count = 0
+                  hold gemma-serving at 0 instances (manual scaling)
+                  revoke gateway/synthesis run.invoker on gemma-serving
 ```
 
 Declared in `infra/terraform/killswitch.tf`; the handler is `services/kill-switch/`.
@@ -559,12 +569,12 @@ failed `scaleToZero` returned 500, and Pub/Sub redelivered every ~30 s for 11 mi
 re-revoking the gateway's public binding seconds after each operator restore.
 
 **One trip per notification.** Pub/Sub redelivers, so the trip is recorded as a
-`kill-switch/tripped` annotation on `gateway-agent`, written only after **both** mutations
-are confirmed. A redelivery reads the marker and returns `already_tripped` without touching
-anything. The push endpoint **acknowledges** (2xx) even a failed trip: the ERROR log is the
-operator's signal, not a retry storm.
+`kill-switch/tripped` annotation on `gateway-agent`, written only after **all three**
+mutations are confirmed. A redelivery reads the marker and returns `already_tripped` without
+touching anything. The push endpoint **acknowledges** (2xx) even a failed trip: the ERROR log
+is the operator's signal, not a retry storm.
 
-Why a marker at all, when both mutations are individually idempotent: revoke-then-restore
+Why a marker at all, when each mutation is individually idempotent: revoke-then-restore
 is **not** idempotent against an operator restoring in parallel, which is what made recovery
 impossible during the live fire. The marker fails _open_ — an unreadable marker falls
 through to the trip, because failing to stop a real overspend is worse than acting twice.
@@ -574,11 +584,29 @@ any transport-level retry loop the handler cannot answer its way out of (a servi
 not start, a 5xx from the platform). It should stay empty; read it with
 `just logs-kill-switch-dlq`.
 
-**Both scaling caps.** Cloud Run v2 has two independent maximums — `service.scaling` and
-`service.template.scaling` (observed as 20 and 3 on `gateway-agent`). The switch writes
-both; capping only one would leave the GPU able to start. It then **awaits the update
-operation and verifies the server's echo**, because `updateService` returns a long-running
-operation and awaiting only its start is what made the first live fire silently half-work.
+**Why not max instances.** The obvious way to stop a Cloud Run GPU service is to cap
+`maxInstanceCount` at 0. That is wrong: Cloud Run's maximum is an integer from 1 upward, and
+`RevisionScaling.maxInstanceCount` is a plain proto3 `int32` with no presence tracking, so a
+`0` is never serialised — the server sees an absent field, which means "no maximum" (the
+limit is **removed**, not set to zero). An earlier version of this switch wrote that field
+and read the same absent field back as proof of a capped GPU; it reported a stopped GPU while
+nothing had actually stopped.
+
+**Manual scaling, not a cap.** `scaleToZero` instead sets the service-level
+`scaling.scalingMode = MANUAL` with `scaling.manualInstanceCount = 0` — Cloud Run's
+documented mechanism for holding a service at zero instances. `ServiceScaling
+.manualInstanceCount` is declared `proto3_optional` (a synthetic oneof), so an explicit `0`
+_is_ presence-tracked and survives the round trip; that presence is what makes zero
+expressible at all. `template.scaling.maxInstanceCount` is left untouched — writing 0 there
+would remove the limit instead of setting it. As belt and braces, `revokeFleetInvokers`
+additionally strips `gateway-agent`'s and `synthesis-agent`'s `roles/run.invoker` bindings on
+`gemma-serving`, so even a Cloud Run that somehow admitted a request would have nobody
+authorised to make it. Success is verified by reading the applied state back explicitly —
+scaling mode plus manual count — never inferred from an absent field; an empty or absent
+scaling block fails (`scale_to_zero_not_applied`) instead of being called success. The switch
+**awaits the update operation and verifies the server's echo**, because `updateService`
+returns a long-running operation and awaiting only its start is what made the first live fire
+silently half-work.
 
 **Required role — on the billing account, not the project.**
 
@@ -624,17 +652,36 @@ just restore-after-kill          # terraform apply, then clear the tripped marke
 just logs-kill-switch-dlq        # anything dead-lettered? (should be empty)
 ```
 
-Terraform is the restore path rather than a pair of `gcloud` commands because it already
-holds the desired state the switch deviated from — the `allUsers` invoker binding (`iam.tf`)
-and `max_instance_count = 1` (`cloudrun.tf`). An apply re-asserts both and, unlike a
-hand-written command, cannot restore one and forget the other. **Fix the underlying spend
-first**, or the next notification trips the switch again. This recipe is never run by agents.
+Terraform is the restore path rather than a handful of `gcloud` commands because it already
+holds the desired state the switch deviated from: the `allUsers` invoker binding on
+`gateway-agent`, the gateway's and synthesis's `run.invoker` bindings on `gemma-serving`
+(`iam.tf`), and `gemma-serving`'s service-level `scaling { scaling_mode = "AUTOMATIC" }`
+(`cloudrun.tf` — template scaling stays min 0 / max 1, unchanged). An apply re-asserts all
+three and, unlike hand-written commands, cannot restore some and forget the rest. **Fix the
+underlying spend first**, or the next notification trips the switch again. This recipe is
+never run by agents.
 
 The recipe then clears the `kill-switch/tripped` annotation, which re-arms the switch. It is
 cleared **last**, only after the apply succeeded: while the marker is set the switch will not
 fire, so removing it earlier would arm the switch against a fleet that is still down. The
-annotation is runtime state written by the switch, not desired state, which is why it is
-cleared with `gcloud` rather than declared in Terraform.
+annotation is runtime state written by the switch, not desired state, which is why it is not
+declared in Terraform. It is cleared by read-modify-write on the v2 Service through the Cloud
+Run Admin API, and then **read back to confirm** — `gcloud run services update` has no
+`--remove-annotations` flag, so the obvious-looking command silently leaves the marker in
+place, and a marker left set is a switch that is permanently disarmed.
+
+**Two operational caveats, both seen in the 2026-08-30 live fire** (see
+`docs/proof/kill-switch.md`):
+
+1. **The apply may need running twice.** On this deployment `gemma-serving` cannot pass its
+   startup probe — a condition pre-dating the kill-switch work — so the apply ends with
+   `Container failed to become healthy. Startup probes timed out after 11m`. The scaling
+   change still lands, but the error aborts the apply **before** the `run.invoker` bindings
+   on `gemma-serving` are recreated. Run `just restore-after-kill` again, or
+   `terraform apply -target=google_cloud_run_v2_service_iam_member.invoker`, and verify the
+   bindings are back.
+2. **Check the marker really cleared.** The recipe now verifies this itself and fails loudly
+   if it did not, but it is worth confirming independently after an interrupted restore.
 
 IAM propagation takes ~40 s: `/v1/models` may answer `403` for a few probes after the apply
 reports success. Wait before concluding the restore failed.
@@ -643,8 +690,16 @@ reports success. Wait before concluding the restore failed.
 
 ## 6. GPU quota
 
-A new project usually has a Cloud Run GPU quota of **0**. Check before deploying with
-`gpu_enabled=true`.
+> **Resolved for `all-thinkgs`; no quota request is needed.** The L4 request filed on
+> 2026-08-23 was **declined** (regional exhaustion in `us-central1`), and Google pointed at
+> **NVIDIA RTX PRO 6000**, which ships with **1000 milliGPU auto-granted per project per
+> region** — enough for the one instance `max_instance_count = 1` allows. `var.gpu_type`
+> therefore defaults to `nvidia-rtx-pro-6000` and `just tf-apply` runs with no quota gate at
+> all. The rest of this section is the L4 procedure, kept because it is what a fresh project
+> on a different accelerator would still have to do.
+
+A new project usually has a Cloud Run GPU quota of **0** for an accelerator that is not
+auto-granted. Check before deploying with `gpu_enabled=true`.
 
 ### Check
 
@@ -667,7 +722,8 @@ filter for `nvidia`.
 
 ### How to request (gcloud)
 
-**Already submitted for `all-thinkgs`** on 2026-08-23T23:06Z. The command used:
+**Submitted for `all-thinkgs`** on 2026-08-23T23:06Z and **declined** — see the note at the
+top of this section. The command used:
 
 ```sh
 EMAIL=you@example.com \
@@ -696,8 +752,9 @@ Read the result as follows:
 | `quotaConfig.grantedValue: '0'` | Not granted yet -- deploy with `gpu_enabled=false` |
 | `quotaConfig.grantedValue: '1'` | **Approved.** `just tf-apply` can now run          |
 
-Current state (as of writing): preference id `34528bab-4b5b-47f1-82da-cec57b21a95d`,
-`reconciling: true`, `grantedValue: 0` -- i.e. **pending**. Re-check before deploying.
+Final state for the L4 preference `34528bab-4b5b-47f1-82da-cec57b21a95d`: **denied**,
+`grantedValue: 0`. The fleet runs on the auto-granted RTX PRO 6000 milliGPU instead, so this
+preference is history rather than a gate.
 
 ### How to request (Console)
 
@@ -927,8 +984,9 @@ Capture the following.
 
 1. **The Cloud Run service list** - four services in `us-central1`. Make sure the URL and
    the per-service SA column are legible
-2. **`gemma-serving` details -> Container(s) tab** - showing **GPU: 1 x NVIDIA L4**. This is
-   the single best piece of evidence for the GPU deployment
+2. **`gemma-serving` details -> Container(s) tab** - showing **GPU: 1 x NVIDIA RTX PRO 6000**
+   alongside 20 vCPU / 80 GiB. This is the single best piece of evidence for the GPU
+   deployment. (It is an RTX PRO 6000, not an L4: see § 5 for why.)
 3. **`gemma-serving` Networking tab** - Ingress control = _Internal_
 4. **`core-agent` Security tab** - SA = `sa-core@...`, authentication Required
 5. **Search for `sa-core` on the IAM page** - show that its roles are only `aiplatform.user`
@@ -997,7 +1055,9 @@ Between them, `just smoke` and the UI answer in seconds instead of a minute and 
 
 **`just warm` costs real money for as long as it is on.** A pinned Nvidia RTX PRO 6000
 instance (20 vCPU / 80 GiB) in `us-central1` bills continuously whether or not a request
-arrives — roughly **USD 0.70-0.80 per hour, about USD 17-19 per day**. The recipe prints
+arrives — **about USD 3.19 per hour, roughly USD 77 per day** (§ 5 has the breakdown; the
+20 vCPU / 80 GiB are mandated by the accelerator, so they are as unavoidable as the GPU
+line and together they cost about as much as it does). The recipe prints
 this warning every time. Run `just chill` the moment you stop filming; a warm instance
 left overnight is the single most likely way to trip the cost kill switch (§ _Automatic
 cost kill switch_).
@@ -1012,9 +1072,11 @@ configuration claim a GPU should always be running, and a later `tf-apply` by so
 would silently re-warm it. `just chill` puts it back, and so does any `tf-apply` — the
 Terraform config always re-asserts `min_instance_count = 0`.
 
-Do not confuse `min-instances` with the kill switch's `max-instances`. `just warm` raises
-the floor; the kill switch drops the **ceiling** to zero. If the switch has tripped,
-`just warm` will not bring Gemma back — restore with `just restore-after-kill` first.
+Do not confuse `min-instances` with what the kill switch does. `just warm` raises the floor
+via `template.scaling.minInstanceCount`; the kill switch instead pins `gemma-serving` to
+**manual scaling at 0 instances** and revokes the fleet's invoker rights on it (see
+§ _Automatic cost kill switch_). If the switch has tripped, `just warm` will not bring Gemma
+back — restore with `just restore-after-kill` first.
 
 ### 9.5 The audit view for judges
 
@@ -1037,10 +1099,15 @@ Access is gated on `ADMIN_TOKEN`, a single shared string:
 
 - **Unset (the default)** — neither `/v1/audit` nor `/audit` is registered at all. Both
   answer 404 because the routes do not exist.
-- **Set** — the token must arrive as `?key=<token>` or an `X-Admin-Token` header. It is
-  compared in constant time, and a wrong token answers **404, not 401**, so the surface is
-  never advertised to someone who does not already hold it. The two states are
+- **Set** — the token must arrive as an `X-Admin-Token` request header, and nothing else.
+  It is compared in constant time, and a wrong token answers **404, not 401**, so the
+  surface is never advertised to someone who does not already hold it. The two states are
   deliberately indistinguishable from outside.
+
+The header is the _only_ accepted channel. A `?key=` query parameter is refused even when
+the value is correct, because Cloud Run writes a request log for every request and
+`httpRequest.requestUrl` carries the query string verbatim — a query-parameter capability
+is a capability handed to everyone with Logs Viewer, a log sink or an exported URL.
 
 This is demo-grade on purpose. The public gateway authenticates nobody, so there is no
 principal behind the token — holding the string is the whole claim. In particular **it
@@ -1062,7 +1129,7 @@ committed; pass it per apply:
 # generate and enable
 token=$(openssl rand -hex 16)
 just tf-apply admin_token="$token"
-echo "$token"          # paste this into the page, or use /audit?key=$token
+echo "$token"          # paste this into the page, or use /audit#key=$token
 
 # rotate: apply a new value; the old token stops working immediately
 just tf-apply admin_token="$(openssl rand -hex 16)"
@@ -1073,8 +1140,17 @@ just tf-apply admin_token=""
 
 Rotating or disabling takes effect on the next revision, which the apply creates. The page
 keeps the token in `sessionStorage`, so it survives a reload and is gone when the tab
-closes; a `?key=` in the URL is consumed once and stripped from the address bar, so a
-shared demo link does not leave the capability in browser history.
+closes.
+
+A shareable demo link carries the token in the URL **fragment** — `/audit#key=<token>` —
+and never in the query string. Browsers do not transmit the fragment, so the token reaches
+the page without ever reaching Cloud Run's request log. The page consumes it once, moves
+it into `sessionStorage`, strips the fragment from the address bar so the capability does
+not survive in browser history or in a later referrer, and thereafter sends it only as the
+`X-Admin-Token` header.
+
+A token that was ever used in a `?key=` URL against a deployed revision must be treated as
+disclosed and rotated, because it is already in the request log.
 
 ---
 

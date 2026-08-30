@@ -1,13 +1,82 @@
-# Deployed fleet, project all-thinkgs / us-central1, captured 2026-08-28
+# Deployed fleet, project all-thinkgs / us-central1, captured 2026-08-30
+# Public entry point: https://privacy-gateway.kexi.dev  (custom domain -> gateway-agent)
 
-NAME             INGRESS   MIN  MAX  SERVICE_ACCOUNT
-gateway-agent all 0 3 sa-gateway@all-thinkgs.iam.gserviceaccount.com
-core-agent internal 0 3 sa-core@all-thinkgs.iam.gserviceaccount.com
-synthesis-agent internal 0 3 sa-synthesis@all-thinkgs.iam.gserviceaccount.com
-gemma-serving internal 0 1 sa-gemma@all-thinkgs.iam.gserviceaccount.com
+# gcloud run services list --project all-thinkgs --region us-central1 \
+#   --format="table(metadata.name,status.url,spec.template.spec.serviceAccountName,status.latestReadyRevisionName)"
 
-# gemma-serving GPU
-cpu=20;memory=80Gi;nvidia.com/gpu=1
+NAME             URL                                              SERVICE_ACCOUNT_NAME                                LATEST_READY_REVISION_NAME
+core-agent       https://core-agent-turszib42q-uc.a.run.app       sa-core@all-thinkgs.iam.gserviceaccount.com         core-agent-00004-xsz
+gateway-agent    https://gateway-agent-turszib42q-uc.a.run.app    sa-gateway@all-thinkgs.iam.gserviceaccount.com      gateway-agent-00017-6mb
+gemma-serving    https://gemma-serving-turszib42q-uc.a.run.app    sa-gemma@all-thinkgs.iam.gserviceaccount.com        gemma-serving-00011-c9t
+kill-switch      https://kill-switch-turszib42q-uc.a.run.app      sa-kill-switch@all-thinkgs.iam.gserviceaccount.com  kill-switch-00008-6rw
+synthesis-agent  https://synthesis-agent-turszib42q-uc.a.run.app  sa-synthesis@all-thinkgs.iam.gserviceaccount.com    synthesis-agent-00008-pgf
 
+# Ingress and autoscaling
+# gcloud run services describe <svc> --format="value(
+#   metadata.annotations['run.googleapis.com/ingress'],
+#   spec.template.metadata.annotations['autoscaling.knative.dev/minScale'],
+#   spec.template.metadata.annotations['autoscaling.knative.dev/maxScale'])"
+
+SERVICE          INGRESS   MIN  MAX
+gateway-agent    all       0    3
+core-agent       internal  0    3
+synthesis-agent  internal  0    3
+gemma-serving    internal  -    1
+
+# Only gateway-agent takes public ingress. Everything behind it is internal-only, so the
+# masked path is not reachable from outside the VPC even with a valid token.
 # min_instances=0 on every service: the fleet costs nothing while idle.
 # Cloud Run job 'verify-auth' is idle (bills only per execution).
+
+# gemma-serving GPU and scaling
+# gcloud does not surface the Cloud Run v2 `scaling` block, so it is read from the
+# Admin API directly:
+# curl -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+#   https://run.googleapis.com/v2/projects/all-thinkgs/locations/us-central1/services/gemma-serving
+
+resources.limits           cpu=20; memory=80Gi; nvidia.com/gpu=1
+template.nodeSelector      accelerator=nvidia-rtx-pro-6000
+gpuZonalRedundancyDisabled true
+service.scaling            {"scalingMode": "AUTOMATIC", "maxInstanceCount": 1}
+template.scaling           {"maxInstanceCount": 1}
+
+# scalingMode AUTOMATIC is the normal, armed state. The kill switch pins this service to
+# zero by setting scaling.scalingMode = MANUAL with scaling.manualInstanceCount = 0 and
+# reading both fields back to confirm; see docs/proof/kill-switch.md.
+
+# run.invoker bindings (who may call what)
+# gcloud run services get-iam-policy <svc> --format="value(bindings.role,bindings.members)"
+
+gateway-agent    roles/run.invoker  allUsers
+                 roles/run.admin    sa-kill-switch@all-thinkgs.iam.gserviceaccount.com
+core-agent       roles/run.invoker  sa-gateway@all-thinkgs.iam.gserviceaccount.com
+synthesis-agent  roles/run.invoker  sa-gateway@all-thinkgs.iam.gserviceaccount.com
+gemma-serving    roles/run.invoker  sa-gateway@all-thinkgs.iam.gserviceaccount.com
+                                    sa-synthesis@all-thinkgs.iam.gserviceaccount.com
+                 roles/run.admin    sa-kill-switch@all-thinkgs.iam.gserviceaccount.com
+kill-switch      roles/run.invoker  sa-kill-switch-push@all-thinkgs.iam.gserviceaccount.com
+
+# allUsers holds run.invoker on gateway-agent only: the public entry point is public, and
+# nothing else is. The kill-switch push endpoint has no allUsers binding — only the
+# Pub/Sub push service account may reach it.
+
+# Kill switch: armed
+# gcloud run services describe gateway-agent \
+#   --format="value(metadata.annotations['kill-switch/tripped'])"
+kill-switch/tripped   (absent)
+
+# The annotation is absent, so the switch is armed rather than tripped. This state was
+# read after the 2026-08-30 live fire and restore.
+
+# Pre-existing condition on gemma-serving (NOT related to the kill switch)
+# gcloud run services describe gemma-serving --format="value(status.conditions...)"
+#
+#   Ready=False: "Container failed to become healthy. Startup probes timed out after 11m
+#   (60 attempts with a period of 10s each). There was an initial delay of 1m."
+#
+# latestReadyRevision   gemma-serving-00011-c9t   <- serving
+# latestCreatedRevision gemma-serving-00014-57t   <- failed startup probe
+#
+# This dates to 2026-08-28 and predates the kill-switch work: a newer GPU revision failed
+# its startup probe, so traffic stayed on revision 00011, which serves normally. Recorded
+# here rather than omitted, but it is not a consequence of the kill-switch fire.

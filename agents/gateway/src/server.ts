@@ -278,7 +278,7 @@ export function createApp(options: CreateAppOptions): express.Application {
      * must not reach a log line, and the allowlist would drop it anyway.
      */
     const authorized = (req: Request, res: Response, context: RequestContext): boolean => {
-      const presented = presentedToken(req.query, req.headers['x-admin-token']);
+      const presented = presentedToken(req.headers['x-admin-token']);
       if (presented !== null && tokenMatches(presented, adminToken)) return true;
 
       context.logger.event('audit.denied', {}, 'WARNING');

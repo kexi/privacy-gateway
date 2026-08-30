@@ -433,15 +433,20 @@ closeDetail.addEventListener('click', () => {
 /**
  * Open straight away when the token is already known.
  *
- * A `?key=` in the URL is accepted once and then removed from the address bar:
- * a pasted demo link should work, but leaving the capability in the history and
- * in every subsequent referrer would turn one shared link into a permanent one.
+ * A `#key=` fragment is accepted once, moved into session storage and then
+ * stripped from the address bar. The fragment — not a `?key=` query — is what
+ * carries a shareable demo link, because browsers never transmit the fragment:
+ * a query parameter would land verbatim in Cloud Run's request log
+ * (`httpRequest.requestUrl`), publishing the capability to every reader of the
+ * logs. Clearing it immediately keeps it out of the history and out of every
+ * subsequent referrer as well.
  */
 function boot(): void {
-  const fromUrl = new URLSearchParams(window.location.search).get('key');
+  const fragment = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : '';
+  const fromUrl = new URLSearchParams(fragment).get('key');
   if (fromUrl !== null && fromUrl !== '') {
     storeToken(fromUrl);
-    window.history.replaceState({}, '', window.location.pathname);
+    window.history.replaceState({}, '', window.location.pathname + window.location.search);
   }
 
   if (storedToken() === '') return;

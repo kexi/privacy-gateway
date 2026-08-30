@@ -131,11 +131,11 @@ the deadline), carrying the category findings. A refusal is never laundered into
 a 200 completion whose content happens to be an apology.
 
 A `judge_flagged` refusal (422) may have cost two judge calls rather than one: an
-unevidenced flag over an attester-clean body is re-asked exactly once, and a
-clear second answer releases the request with `attestation.judge_retries: 1` in
-the evidence document. Callers see no new status — a request that is refused was
-refused twice, and one that passes on the retry is an ordinary success whose
-audit record says it needed a second look.
+unevidenced flag over an attester-clean body is re-asked exactly once, but only to
+name categories for the refusal record — the second call's verdict is never
+consulted, so a flag never becomes a pass. `attestation.judge_retries: 1` in the
+evidence document means the categories were recovered on that second look, not
+that the release was in doubt and then cleared.
 
 **Streaming** (`stream: true`) emits one content chunk and then `[DONE]`. This is
 not a stub to be improved later: every gate here is fail-closed and the leak
@@ -206,10 +206,14 @@ The only client that can check all four digests, because it can hash the bundle
 files in the checkout it lives in.
 
 **Audit view.** `GET /v1/audit` lists stored evidence metadata newest-first (max 50,
-no document bodies) and `/audit` is its read-only page; both need `?key=` or an
+no document bodies) and `/audit` is its read-only page; both need an
 `X-Admin-Token` header and answer **404 — not 401** when `ADMIN_TOKEN` is unset or
-wrong, so a client cannot tell "disabled" from "wrong token". The token is a
-capability, not an identity: it never makes a document `human-reviewed`.
+wrong, so a client cannot tell "disabled" from "wrong token". The header is the
+only accepted channel — a `?key=` query is refused even with the right value,
+because Cloud Run logs the query string verbatim — so a shareable link carries the
+token in the fragment (`/audit#key=…`), which browsers never transmit, and the page
+turns it into the header. The token is a capability, not an identity: it never
+makes a document `human-reviewed`.
 
 ## 6. What to say about the guarantee
 

@@ -8,12 +8,12 @@
  * double. The interface is the seam; `cloudRunActions()` is the one
  * implementation that touches Google Cloud.
  *
- * Both operations are *idempotent by construction*, not by remembering that
- * they ran. Removing a member that is already absent and setting a maximum that
- * is already 0 are both no-ops, so a redelivered message costs one API read and
- * changes nothing. There is deliberately no dedupe store: a cache that says
- * "already handled" is one more thing that can be wrong at the moment the fleet
- * is burning money.
+ * Every operation is *idempotent by construction*, not by remembering that it
+ * ran. Removing a member that is already absent, and setting a scaling mode and
+ * count that already hold, are both no-ops, so a redelivered message costs one
+ * API read and changes nothing. There is deliberately no dedupe store: a cache
+ * that says "already handled" is one more thing that can be wrong at the moment
+ * the fleet is burning money.
  */
 
 import { ServicesClient } from '@google-cloud/run';
@@ -34,8 +34,16 @@ export interface ActionOutcome {
 export interface KillActions {
   /** Remove the `allUsers` run.invoker binding, closing the public door. */
   revokePublicInvoker(service: string): Promise<ActionOutcome>;
-  /** Force the service's maximum instance count to zero. */
+  /** Hold the service at zero instances via Cloud Run manual scaling. */
   scaleToZero(service: string): Promise<ActionOutcome>;
+  /**
+   * Remove the fleet's own run.invoker bindings on a service.
+   *
+   * Belt and braces beside `scaleToZero`: manual scaling is what actually stops
+   * the GPU, and this makes sure that even if a request somehow reaches Cloud
+   * Run, no member of the fleet is allowed to be the one making it.
+   */
+  revokeFleetInvokers(service: string): Promise<ActionOutcome>;
   /** True when this service already carries the tripped marker. */
   isTripped(service: string): Promise<boolean>;
   /** Record that the switch has fired, so a redelivery becomes a no-op. */
@@ -56,6 +64,12 @@ export const TRIPPED_ANNOTATION = 'kill-switch/tripped';
 export interface CloudRunActionsOptions {
   readonly project: string;
   readonly region: string;
+  /**
+   * The fleet identities `revokeFleetInvokers` strips, as IAM member strings
+   * (`serviceAccount:...`). Configured rather than derived so the switch never
+   * has to guess which principals belong to the fleet.
+   */
+  readonly fleetMembers?: readonly string[] | undefined;
   /** Injected by tests. Real callers let the client build itself from ADC. */
   readonly client?: ServicesClient | undefined;
 }
@@ -64,6 +78,20 @@ export interface CloudRunActionsOptions {
 const INVOKER_ROLE = 'roles/run.invoker';
 /** The member that makes a Cloud Run service unauthenticated. */
 const PUBLIC_MEMBER = 'allUsers';
+
+/**
+ * `ServiceScaling.ScalingMode.MANUAL`, written as the string form.
+ *
+ * Why the string and not the numeric enum member: the client accepts either,
+ * and the string is what `getService` returns, so writing and reading the same
+ * representation keeps the success check from comparing 2 against 'MANUAL'.
+ */
+const MANUAL_SCALING_MODE = 'MANUAL' as const;
+
+/** True for either representation the client may hand back for MANUAL. */
+function isManualMode(mode: unknown): boolean {
+  return mode === MANUAL_SCALING_MODE || mode === 2;
+}
 
 /** Fully-qualified Cloud Run service resource name. */
 function serviceName(project: string, region: string, service: string): string {
@@ -81,6 +109,7 @@ function serviceName(project: string, region: string, service: string): string {
  */
 export function cloudRunActions(options: CloudRunActionsOptions): KillActions {
   const { project, region } = options;
+  const fleetMembers = options.fleetMembers ?? [];
   const client = options.client ?? new ServicesClient();
 
   return {
@@ -120,35 +149,40 @@ export function cloudRunActions(options: CloudRunActionsOptions): KillActions {
       const name = serviceName(project, region, service);
       const [current] = await client.getService({ name });
 
-      // `template.scaling` is the cap that governs autoscaling, and the one
-      // this switch exists to force to zero: it is what Cloud Run surfaces as
-      // the `autoscaling.knative.dev/maxScale` annotation, and what the live
-      // fire measured as "still 1" when the switch failed.
+      // Manual scaling is the documented way to hold a Cloud Run service at
+      // zero instances: `scaling.scalingMode = MANUAL` with
+      // `scaling.manualInstanceCount = 0`.
       //
-      // The top-level `scaling` is a *different*, newer field — the service's
-      // manual instance count, inert unless `scalingMode` selects manual
-      // scaling. It is set alongside for completeness, but it is deliberately
-      // NOT part of the success condition: proto3 cannot distinguish an
-      // explicit 0 from an unset field, so the server drops that write and the
-      // value read back stays 1 forever. Requiring it to be 0 would make the
-      // action throw on every trip even though the GPU is genuinely capped.
-      const revisionScaling = current.template?.scaling;
+      // Why not `template.scaling.maxInstanceCount = 0`, which the previous
+      // implementation wrote: Cloud Run's maximum is an integer from 1 upward,
+      // and `RevisionScaling.maxInstanceCount` is a plain proto3 int32 with no
+      // presence tracking, so a 0 is not serialised at all. The server sees an
+      // absent field, which means "no maximum" — the limit is *removed*, not set
+      // to zero — and the old success check then read that same absent field
+      // back and called it proof of a zero cap. The switch reported a capped GPU
+      // while nothing capped it.
+      //
+      // `ServiceScaling.manualInstanceCount` is the one field here declared
+      // `proto3_optional` (synthetic oneof `_manualInstanceCount`), so an
+      // explicit 0 is presence-tracked and survives the round trip. That is what
+      // makes zero expressible at all.
       const serviceScaling = current.scaling;
-      if (revisionScaling?.maxInstanceCount === 0) return { alreadyApplied: true };
+      const alreadyManualZero =
+        isManualMode(serviceScaling?.scalingMode) && serviceScaling?.manualInstanceCount === 0;
+      if (alreadyManualZero) return { alreadyApplied: true };
 
-      // The whole Service message is sent back with only the two scaling fields
-      // changed. Why not an update mask limited to them: Cloud Run v2's
+      // The whole Service message is sent back with only the scaling block
+      // changed. Why not an update mask limited to it: Cloud Run v2's
       // updateService treats an absent field under a mask as "clear it", and a
       // partial mask on a nested message has repeatedly proved easier to get
-      // wrong than a full-object write of a freshly-read object. A full write
-      // was verified against the real service (validateOnly) and is accepted.
+      // wrong than a full-object write of a freshly-read object.
       const [operation] = await client.updateService({
         service: {
           ...current,
-          scaling: { ...serviceScaling, maxInstanceCount: 0 },
-          template: {
-            ...current.template,
-            scaling: { ...revisionScaling, maxInstanceCount: 0 },
+          scaling: {
+            ...serviceScaling,
+            scalingMode: MANUAL_SCALING_MODE,
+            manualInstanceCount: 0,
           },
         },
       });
@@ -158,17 +192,14 @@ export function cloudRunActions(options: CloudRunActionsOptions): KillActions {
       // Awaiting at all is the fix for the original bug: updateService returns a
       // long-running operation, and the old code awaited only the call that
       // *starts* it, so the handler reported success while gemma-serving kept
-      // maxInstanceCount = 1. setIamPolicy returns the policy directly, with no
-      // operation to await — which is exactly why revokePublicInvoker worked and
-      // this did not.
+      // serving. setIamPolicy returns the policy directly, with no operation to
+      // await — which is exactly why revokePublicInvoker worked and this did not.
       //
       // Why the rejection is swallowed: on this GPU service the operation
-      // reports a failure while the scaling change still lands. Observed live on
-      // 2026-08-28 — the LRO rejected at 01:38:49.535, and Cloud Run logged
-      // "Ready condition status changed to True" for the new revision one second
-      // later, with the cap correctly at zero. The operation is really reporting
-      // on the revision coming up (a GPU service that cannot start an instance
-      // when its own maximum is zero), not on whether the cap was written.
+      // reports a failure while the scaling change still lands, because it is
+      // really reporting on a revision that is being told to run zero instances.
+      // The read-back below is what decides, so a misleading LRO error cannot
+      // make a stopped fleet look running.
       let operationError: unknown;
       try {
         await operation.promise();
@@ -177,15 +208,14 @@ export function cloudRunActions(options: CloudRunActionsOptions): KillActions {
       }
 
       // The service's own state is the verdict, because it is the thing that
-      // costs money. A cost gate that cries failure on a successful trip is as
-      // harmful as one that stays silent on a failed one: it re-arms the
-      // operator's alarm for a fleet that is already stopped.
-      //
-      // A zero comes back as an absent field, because proto3 omits zero values,
-      // so "0 or unset" is success and a surviving non-zero number is failure.
+      // costs money — and it is read *explicitly*, as a mode plus a count.
+      // Nothing is inferred from an absent field: the previous implementation's
+      // whole failure was treating "the server did not send this" as "the server
+      // agreed with me".
       const [confirmed] = await client.getService({ name });
-      const cap = confirmed.template?.scaling?.maxInstanceCount;
-      const applied = cap === 0 || cap === null || cap === undefined;
+      const mode = confirmed.scaling?.scalingMode;
+      const count = confirmed.scaling?.manualInstanceCount;
+      const applied = isManualMode(mode) && count === 0;
       if (!applied) {
         // Prefer the operation's error when there is one: it explains *why* the
         // write did not take, which a bare assertion cannot.
@@ -193,6 +223,30 @@ export function cloudRunActions(options: CloudRunActionsOptions): KillActions {
           ? operationError
           : new Error('scale_to_zero_not_applied');
       }
+
+      return { alreadyApplied: false };
+    },
+
+    async revokeFleetInvokers(service: string): Promise<ActionOutcome> {
+      const resource = serviceName(project, region, service);
+      const [policy] = await client.getIamPolicy({ resource });
+      const bindings = policy.bindings ?? [];
+
+      const invoker = bindings.find((binding) => binding.role === INVOKER_ROLE);
+      const present = (invoker?.members ?? []).filter((member) => fleetMembers.includes(member));
+      if (present.length === 0) return { alreadyApplied: true };
+
+      const next = bindings
+        .map((binding) => {
+          if (binding.role !== INVOKER_ROLE) return binding;
+          return {
+            ...binding,
+            members: (binding.members ?? []).filter((member) => !fleetMembers.includes(member)),
+          };
+        })
+        .filter((binding) => (binding.members ?? []).length > 0);
+
+      await client.setIamPolicy({ resource, policy: { ...policy, bindings: next } });
 
       return { alreadyApplied: false };
     },

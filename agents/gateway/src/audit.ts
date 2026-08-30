@@ -57,7 +57,7 @@ export interface AuditListEntry {
   /** Placeholder counts re-derived from the stored masked prompt. */
   readonly counts_by_category: Record<string, number>;
   readonly masked_count: number;
-  /** How many advisory-judge retries the release needed; absent means none. */
+  /** Category-enrichment attempts on a judge refusal; absent means none. */
   readonly judge_retries: number;
   /** Categories the rehydrator withheld by policy. */
   readonly withheld: readonly string[];
@@ -215,14 +215,14 @@ export function toEntry(data: Record<string, unknown>): AuditListEntry | null {
     attestation_verdict: attestation?.verdict ?? 'unknown',
     counts_by_category: countPlaceholders(maskedPrompt),
     masked_count: findTokens(maskedPrompt).length,
-    // `judge_retries` is written only when the advisory judge actually had to
-    // retry, so an absent key means zero rather than unknown.
+    // `judge_retries` is written only when the judge was re-asked to enrich a
+    // refusal's category list, so an absent key means zero rather than unknown.
     judge_retries: readRetries(attestation),
     withheld: attestation?.withheld ?? [],
   };
 }
 
-/** Reads the retry count out of the passthrough attestation block. */
+/** Reads the category-enrichment attempt count out of the passthrough attestation block. */
 function readRetries(attestation: Record<string, unknown> | undefined): number {
   const value = attestation?.['judge_retries'];
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
@@ -283,19 +283,17 @@ export function tokenMatches(presented: string, expected: string): boolean {
 }
 
 /**
- * The token a request presents, from the query string or the header.
+ * The token a request presents. The `X-Admin-Token` header, and nothing else.
  *
- * The query parameter exists because the audit view is opened from a pasted
- * link during a demo; the header is what a script would use. Neither is logged.
+ * Why not also accept `?key=`, which is friendlier for a pasted demo link:
+ * Cloud Run writes a request log for every request and `httpRequest.requestUrl`
+ * carries the query string verbatim, so a query-parameter capability is a
+ * capability published to anyone holding Logs Viewer, a log sink, or an
+ * exported URL. The shareable link survives as `/audit#key=…` — a fragment is
+ * never sent to the server — which the page turns into this header.
  */
-export function presentedToken(
-  query: unknown,
-  header: string | string[] | undefined,
-): string | null {
+export function presentedToken(header: string | string[] | undefined): string | null {
   const fromHeader = Array.isArray(header) ? header[0] : header;
   if (typeof fromHeader === 'string' && fromHeader !== '') return fromHeader;
-
-  const key = (query as Record<string, unknown> | undefined)?.['key'];
-  if (typeof key === 'string' && key !== '') return key;
   return null;
 }

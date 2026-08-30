@@ -1,136 +1,218 @@
 # キルスイッチ発火テスト
 
-**2026-08-27**、本番環境（プロジェクト `all-thinkgs`、リージョン `us-central1`）に対して
-コストキルスイッチを**実際に発火**させた記録。英語版は
+**現状: スイッチは正しく動作する。** **2026-08-30**、本番環境（プロジェクト `all-thinkgs`、
+リージョン `us-central1`）に対して**実際に発火**させ、全段階が engage した — 公開ドアの閉鎖、
+Cloud Run 自身によるインスタンス数ゼロでの GPU 停止、そして fleet のサービスアカウントから
+GPU 呼び出し権限の剥奪 — 1 回の配信で 2 秒以内、再配信ループなし。英語版は
 [kill-switch.md](./kill-switch.md)（詳細はそちら）。
 
-ユニットテストではない。`just kill-switch-test publish` は実際の
-`billing-kill-switch` トピックに実際の予算超過通知を送り、実際の push サブスクリプションと
-OIDC トークンを経由する。フリートは本当にオフラインになった。
+それを証明する 1 行が、Cloud Run 自身が出した `gemma-serving` のログである。
+
+```
+2026-08-30T14:12:51.128284Z  Shutting down user disabled instance
+```
+
+これはプラットフォーム自身が「ゼロ保持設定のためインスタンスを停止した」と報告している。
+本プロジェクトの過去の発火では一度も得られなかった証拠である。
+
+ユニットテストではない。`just kill-switch-test publish` は実際の `billing-kill-switch`
+トピックに実際の予算超過通知を送り、実際の push サブスクリプションと OIDC トークンを経由する。
+フリートは本当にオフラインになった。
+
+失敗に終わった 2026-08-27 の発火は、末尾に**解決済みポストモーテム**として残してある。
 
 ## 発火内容
 
 ```
-just kill-switch-test publish   # messageId 21095725789802462
-{"costAmount":60,"budgetAmount":50,"currencyCode":"USD","alertThresholdExceeded":1.0}
+just kill-switch-test publish
+# 2026-08-30T14:12:39Z 発行、messageId 21507257514954541
+{"budgetDisplayName":"agentic-fleet-kill-switch","costAmount":60,
+ "budgetAmount":50,"currencyCode":"USD","alertThresholdExceeded":1.0}
 ```
 
 ## 前後の状態
 
-| 項目                                  | 発火前 | 発火後         |
-| ------------------------------------- | ------ | -------------- |
-| `gateway-agent` の `allUsers` invoker | あり   | **削除された** |
-| 匿名 `GET /healthz`                   | `200`  | `404`          |
-| `gemma-serving` maxScale              | `1`    | **`1` のまま** |
+いずれも発火後に実環境から読み戻して確認した。
 
-つまり**半分だけ成功した**。公開エンドポイントを閉じる側は正しく約 1 秒で発火した。
-一方、本来止めたいコストである GPU の上限設定は効かなかった。
+| 項目                                  | 発火前                                               | 発火後                                                                            |
+| ------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `gemma-serving` サービス `scaling`    | `scalingMode: automatic`、`manualInstanceCount` なし | `{"scalingMode":"MANUAL","manualInstanceCount":0}`                                |
+| `gemma-serving` `template.scaling`    | `{"maxInstanceCount":1}`                             | `{"maxInstanceCount":1}`（意図的に不変）                                          |
+| `gemma-serving` の `run.invoker`      | `sa-gateway@…` と `sa-synthesis@…`                   | **バインディングごと消滅**（残るのは `sa-kill-switch` の `roles/run.admin` のみ） |
+| `gateway-agent` の `allUsers` invoker | あり                                                 | **削除された**                                                                    |
+| 匿名 `GET /healthz`                   | `404`                                                | `404`（下の注記参照。この probe は閉鎖の証拠にならない）                          |
+| `just smoke`                          | 成功（`core_actor: core_agent/gemini-3.5-flash`）    | —                                                                                 |
 
-## 所見 1: `scaleToZero` が GPU サービスに対して失敗する
+コンソールのアノテーションも一致している:
+`run.googleapis.com/scalingMode: manual`、`run.googleapis.com/manualInstanceCount: '0'`。
 
-`killswitch.triggered` → `killswitch.invoker_revoked` の後、毎回 `killswitch.failed` が続き、
-`gemma-serving` の `maxInstanceCount` は `1` のまま。原因はログに出ない — 本プロジェクトの
-ログ方針は例外メッセージを記録せず `error_class` のみとするため、`{"error_class":"Error"}`
-としてしか現れない。
+API の読み戻しは**設定が反映されたこと**を示すが、上掲の
+`Shutting down user disabled instance` は**プラットフォームが実際に GPU を落としたこと**を
+示す。ここが決定的な違いである。
 
-疑わしいのは `services/kill-switch/src/actions.ts` の `scaleToZero` で、Service 全体を読んで
-`template.scaling` だけ変えて書き戻している。GPU 固有フィールド
-（`nodeSelector: nvidia-rtx-pro-6000` など）をそのまま送り返すため v2 API に拒否された可能性がある。
-**根本原因は未確定**（直接 `updateService` を呼ぶ検証は本セッションの権限外だった）。
+> **`/healthz` probe は証拠にならない。2026-08-27 の proof はこれを証拠として扱った点が
+> 誤りだった。** `privacy-gateway.kexi.dev` の `GET /healthz` は、公開ドアが開いていても
+> 閉じていても `404` を返す。ルート自体は Gateway に登録されているが、このパスへの
+> リクエストはコンテナまで届かず、Google のフロントエンドが応答してしまう。2026-08-30 に
+> フリートを完全復旧し `allUsers` バインディングを戻した状態で再計測しても `404` のまま
+> だった。両方の状態で同じ値を返す probe は何も区別しない。
+>
+> 閉鎖を示すのは上表の IAM の読み戻し（`allUsers` バインディングが実行前は存在し実行後は
+> 消えている）であり、これがプラットフォームが実際に強制している状態である。今後の
+> ライブ発火では `GET /` か `GET /v1/models` を使うべきである。どちらもドアが開いている
+> 間は `200` を返すことを 2026-08-30 の復旧後に確認済みである。
 
-## 所見 2: 失敗が無限の revoke ループになる
+## スイッチの動作
 
-こちらの方が深刻で、復旧を困難にした。
+3 つの変更を順に実行する。いずれも冪等で、1 回の配信から約 2 秒以内に完了した。
 
-push エンドポイントは失敗時に `500` を返して Pub/Sub に再配信させる設計だが、`scaleToZero`
-が成功しないため永久に `500` を返し続け、**再配信のたびに `revokePublicInvoker` が再実行される**。
+```
+2026-08-30T14:12:42.225Z  WARNING  killswitch.triggered               budget_ratio 1.2, cost 60, budget 50
+2026-08-30T14:12:42.702Z  INFO     killswitch.invoker_revoked         already_applied false
+2026-08-30T14:12:43.228Z  INFO     killswitch.scaled_to_zero          already_applied false
+2026-08-30T14:12:43.677Z  INFO     killswitch.fleet_invokers_revoked  already_applied false
+2026-08-30T14:12:44.137Z  WARNING  killswitch.mark_failed             error_class "Error"
+2026-08-30T14:12:44.137Z  INFO     killswitch.completed               already_applied false
+```
 
-実測: 約 30 秒ごとに約 11 分間、サブスクリプションの `messageRetentionDuration`（600 秒）が
-切れる 23:34 頃まで継続した。途中 23:25:55 の `already_applied: false` は、運用者が
-`just tf-apply` で復旧した直後にスイッチが再び剥奪したことを示す。
+1. **`revokePublicInvoker('gateway-agent')`** — `allUsers` の `roles/run.invoker` を剥奪する。
+2. **`scaleToZero('gemma-serving')`** — **サービスレベル**の `scaling.scalingMode = MANUAL` と
+   `scaling.manualInstanceCount = 0` を設定する。Cloud Run が文書化している「サービスをゼロ
+   インスタンスに固定する」機構である。`template.scaling.maxInstanceCount` は意図的に `1` のまま
+   触らない。
+3. **`revokeFleetInvokers('gemma-serving')`** — 新規。gateway と synthesis の `roles/run.invoker`
+   を GPU サービスから剥奪する。仮に Cloud Run がリクエストを通したとしても、呼び出す権限を持つ
+   者がいない状態にする（二重防御）。メンバー一覧は Terraform が設定する
+   `KILL_SWITCH_FLEET_MEMBERS` 環境変数から取る。
 
-個々の操作は冪等でも、**revoke と運用者による restore が並行すると冪等ではない**。
-`billing-kill-switch-push` に dead-letter policy が無いため、保持期間が切れるまで復旧できない。
+**なぜ `template.scaling.maxInstanceCount = 0` にしないのか** — 2026-08-27 の発火が失敗した
+理由そのものだから。Cloud Run の最大インスタンス数は 1 以上の整数であり、
+`RevisionScaling.maxInstanceCount` は presence tracking を持たない素の proto3 `int32` なので、
+`0` はそもそも送信されない。サーバは**フィールド不在**を受け取り、それは「上限なし」を意味する
+— 上限は設定されるのではなく**外される**。一方 `ServiceScaling.manualInstanceCount` はこの領域で
+唯一 `proto3_optional`（synthetic oneof `_manualInstanceCount`）で宣言されており、明示的な `0` が
+presence tracking され往復を生き延びる。ゼロを表現できるのはこのフィールドだけである。
+
+**なぜ書き込み結果を信用しないのか** — 成功判定は適用後の状態を**明示的に**読み戻して行う
+（scaling mode と manual count の両方）。フィールド不在から推測することは二度としない。scaling
+ブロックが空・不在なら `scale_to_zero_not_applied` で失敗する。
+
+## 既知の粗さ 2 点
+
+いずれも隠さず記録する。保証には影響しない。
+
+**1. `killswitch.mark_failed`** — `gateway-agent` への `kill-switch/tripped` アノテーション書き込みが
+失敗を報告した。しかし**書き込み自体は成功していた**（後から `2026-08-30T14:12:43.767Z` として
+読み戻せた）。書き込みは着地し、確認だけが失敗を報告した — scaling 側が読み戻しで既に対処して
+いる「誤解を招く LRO」と同種の挙動である。設計上許容している: WARNING でログするだけでトリップは
+ロールバックしない。**なぜここで失敗させないのか** — 3 つの変更がすべて成功した後に拒否すると、
+成功したトリップを再配信ループに変えてしまう。マーカーは実際に存在するので再配信は no-op になる。
+保証への影響はない。
+
+**2. 復旧に 2 回目の `terraform apply` が要る** — 下記「復旧」を参照。
 
 ## 復旧
 
-再配信が止まった後の `just tf-apply` で復旧した（ループ中の apply は約 30 秒で無効化された）。
+| 項目                               | 結果                                                    |
+| ---------------------------------- | ------------------------------------------------------- |
+| `gateway-agent` の `allUsers`      | 再設定された                                            |
+| `gemma-serving` サービス `scaling` | `{"scalingMode":"AUTOMATIC","maxInstanceCount":1}`      |
+| `gemma-serving` の `run.invoker`   | fleet 両方のバインディングを再作成                      |
+| `kill-switch/tripped` マーカー     | 削除し、**不在**を読み戻して確認 — スイッチは再武装済み |
+| `just smoke`                       | 成功（`core_actor: core_agent/gemini-3.5-flash`）       |
 
-```
-google_cloud_run_v2_service_iam_member.gateway_public: Creation complete after 8s
-Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
-```
-
-Terraform はスイッチが消した 1 つのバインディングだけを再作成した。復旧経路を Terraform に
-置く設計判断は妥当だったと言える。IAM 伝播に約 40 秒かかり、その間 `/v1/models` は `403` を
-返した（復旧失敗と早合点しないこと）。
-
-## 結論
-
-- 検知は正しい（`60 >= 50`、ratio 1.2）。
-- 公開ドアを閉じる動作は正しく速い。
-- **GPU の上限設定は効かない** — 本来止めたいコストが止まらない。
-- 部分失敗が **revoke ループ**に劣化し、保持期間中は運用者が復旧できない。
-
-いずれも未修正。推奨対応は英語版の «Suggested fixes» を参照。
+運用上の注意: `terraform apply` は `gemma-serving` で
+`Container failed to become healthy. Startup probes timed out after 11m` エラーになる。これは
+2026-08-28 から続く**既存の問題**でキルスイッチとは無関係（この deployment では GPU リビジョンが
+startup probe を通らない）。scaling の変更自体は反映されるが、このエラーが invoker バインディングの
+再作成**前に** apply を中断させるため、2 回目の `terraform apply`（または
+`-target=google_cloud_run_v2_service_iam_member.invoker`）が必要になる。
+`just restore-after-kill` はこの前提で実行すること。
 
 ---
 
-## 追記（2026-08-28）: 両方の所見を修正した
+## 解決済みポストモーテム: 2026-08-27 の発火
 
-両方の根本原因を特定し修正した。上に記した推測 — v2 API が出力専用フィールドや GPU 固有
-フィールドのせいで全体書き込みを拒否している — は **誤りだった**ので、そのまま残さずここで
-訂正する。
+診断内容に価値があるため残す。**この節の内容はすべて修正済みで、現在のコードはこの挙動をしない。**
 
-### 所見 1 の根本原因: 長時間実行オペレーションを待っていなかった
+当時の記録は正直に半分の失敗を示していた。`gateway-agent` の `allUsers` は削除された一方、
+`gemma-serving` の maxScale は `1` のままで `killswitch.failed` が出ていた。当時は匿名
+`GET /healthz` の `404` も閉鎖の証拠として記録していたが、これは結論を支えていなかった
+（上の注記参照）。閉鎖自体は 2026-08-27 にも本当に起きており、それを示していたのは
+IAM の読み戻しのほうである。
 
-Cloud Run Admin v2 の `updateService` は完了した書き込みではなく **long-running operation
-(LRO)** を返す。旧コードは次のようになっていた。
+### 根本原因: `maxInstanceCount = 0` は上限を「設定」せず「解除」する
 
-```ts
-await client.updateService({ service: { ... } });   // LRO の「開始」で解決する
-```
+旧 `scaleToZero` は `template.scaling.maxInstanceCount = 0`（および
+`scaling.maxInstanceCount = 0`）を書いていた。これは二重に誤りだった。
 
-これは Cloud Run がリクエストを _受理_ した時点で解決してしまう。実際の更新はまだ進行中で、
-拒否された場合もそれを捕捉するはずの `try` の外側で表面化する。結果としてハンドラは成功を
-報告しつつ `gemma-serving` は `maxInstanceCount = 1` のままだった。`revokePublicInvoker` が
-動いて `scaleToZero` が動かなかった理由もこれで説明がつく — `setIamPolicy` はポリシーを直接
-返し、待つべきオペレーションが存在しない。
+- `RevisionScaling.maxInstanceCount` は presence tracking を持たない proto3 `int32` なので `0` は
+  送信されない。サーバが受け取るのはフィールド不在で、それは「上限なし」を意味する。意図と逆に
+  上限が**外れる**。
+- 成功判定はその**同じ不在フィールド**を読み戻して「ゼロ上限が効いた」と解釈していた。0 と unset が
+  同一のワイヤ表現である以上、「0 または unset なら成功」という条件は反証不可能である。結果、
+  何も止まっていないのにスイッチは GPU 停止を報告していた。
 
-拒否仮説が誤りであった証拠: 同じ全体書き込みを `validateOnly: true` で実サービスに対して
-再生したところ、出力専用フィールドと `nodeSelector: nvidia-rtx-pro-6000` を含めて **受理された**。
+2026-08-28 の追記はこれを修正済みと主張したが、**修正されていなかった** — 壊れた機構はそのままに、
+不在フィールドを受け入れる誤った成功判定を足しただけだった。その主張はここで撤回する。
 
-修正中に独立した 2 つ目のバグも見つかった。Cloud Run v2 にはスケーリング上限が **2 つ** あり、
-コードは片方しか書いていなかった。
+本当の修正は、ゼロを表現できないフィールドでゼロを表現するのをやめることだった（上記「スイッチの動作」）。
 
-| フィールド                 | `gemma-serving` | `gateway-agent` |
-| -------------------------- | --------------- | --------------- |
-| `service.scaling`          | `1`             | `20`            |
-| `service.template.scaling` | `1`             | `3`             |
+### 2 つ目の所見: 失敗が無限の revoke ループになった
 
-両者は独立した値である。リビジョン側だけを 0 にしてもサービス側の上限が GPU の起動を許して
-しまうため、修正では両方を書く。
+push エンドポイントが失敗時に `500` を返して再配信させる設計だったが、`scaleToZero` が決して
+成功しないため永久に `500` を返し続け、再配信のたびに `revokePublicInvoker` が再実行された。
+実測で約 30 秒ごとに約 11 分間、保持期間（600 秒）が切れるまで継続。運用者の `just tf-apply` に
+よる復旧を次の再配信が打ち消した。個々の操作は冪等でも、**revoke と運用者の restore が並行すると
+冪等ではない**。
 
-したがって修正は 3 点: 両方の上限を書く、`operation.promise()` を待つ、そして呼び出しを信用
-せず **サーバのエコーを検証する**（上限が反映されずに完了したオペレーションは
-`scale_to_zero_not_applied` を投げる）。
+**修正済み。** 配信は終端的になった: 失敗したトリップでもエンドポイントは ACK し、
+`kill-switch/tripped` アノテーションが再配信を no-op にし、dead-letter policy がトランスポート層の
+リトライを打ち切る。2026-08-30 の発火では `killswitch.triggered` は**ちょうど 1 回**、
+dead-letter サブスクリプション `billing-kill-switch-dead-letter-hold` は**空**だった。
 
-### 所見 2 の根本原因: 500 による再配信を止めるものが無かった
+**なぜ 500 による再配信設計を維持しないのか** — 障害が一時的な場合にしか効かず、恒久的な場合は
+無制限になる。運用者への通知は ERROR ログであり、運用者の復旧と喧嘩するリトライの嵐ではない。
 
-ループは設計どおりの挙動だった。push エンドポイントは「失敗した半分をやり直す」ために `500`
-を返していたが、失敗する半分は決して成功しないため、再配信のたびに成功済みの半分が再実行され
-続けた。配信は **終端的 (terminal)** になった。
+### 今も有効な診断
 
-- トリップは `gateway-agent` の `kill-switch/tripped` アノテーションとして記録され、**両方**の
-  変更が確認できた後にのみ書かれる。再配信はこれを読んで何も触らず `already_tripped` を返す。
-- エンドポイントは失敗したトリップでも **ACK (2xx)** する。1 通の通知が引き起こすトリップ試行は
-  高々 1 回になった。運用者への通知は ERROR ログであり、リトライの嵐ではない。
-- **デッドレタートピック**（`billing-kill-switch-dead-letter`、`max_delivery_attempts = 5`）が、
-  アプリ側では応答しようのないトランスポート層のリトライループを打ち切る。`just logs-kill-switch-dlq`
-  で確認する。
-- `just restore-after-kill` は apply 成功後にマーカーを消してスイッチを再武装する。最後に消すのは
-  意図的で、マーカーがある間はスイッチが発火しないため、先に消すと復旧していない fleet に対して
-  スイッチを武装することになる。
+- `updateService` は LRO を返す。旧コードは LRO の「開始」で解決していたため、拒否が `try` の
+  外側で表面化した。`setIamPolicy` はポリシーを直接返すので待つべきオペレーションがない — invoker
+  剥奪だけが動いていた理由である。
+- **オペレーションの拒否は最終判定ではない。** この GPU サービスでは、変更が着地していても
+  オペレーションが失敗を報告しうる。1 回後の読み戻しで得たサービス自身の状態が判定に使われる。
+  上記 `killswitch.mark_failed` はアノテーション書き込みで起きた同じ現象である。
+- **Artifact Registry の読み取り権限が要る。** サービス更新はコンテナイメージを再検証するため、
+  scaling しか触らなくても `artifactregistry.repositories.downloadArtifacts` が必要。
+  `roles/run.admin` はこれを含まない（`roles/artifactregistry.reader` を付与）。
+- **ランタイム ID への `actAs` が要る。** サービス更新は実行サービスアカウントの割り当てを伴うため、
+  ID が不変でも act as できる必要がある。`sa-gemma` と（マーカー書き込み用に）`sa-gateway` に対して
+  `roles/iam.serviceAccountUser` を、プロジェクト全体ではなく当該アカウントに限定して付与している。
+  **なぜプロジェクト全体にしないのか** — invoker 剥奪は `setIamPolicy` で `actAs` を一切必要とせず、
+  広い付与は何も得ずに `sa-kill-switch` 侵害時の影響範囲だけを広げるため。
 
-マーカーの読み取り失敗時に _fail open_ する理由: 本当の超過支出を止め損ねる方が、2 回動作するより
-悪いため。
+いずれも `infra/terraform/killswitch.tf` に宣言済み。
+
+---
+
+## 解決済み所見: `restore-after-kill` がスイッチを恒久的に無効化していた
+
+2026-08-30 の復旧作業中に発見・修正した。復旧経路の**沈黙する失敗**であり、最も質が悪い場所での
+バグだったため記録する。
+
+`just restore-after-kill` は `kill-switch/tripped` マーカーを
+`gcloud run services update ... --remove-annotations ... || echo "(no marker was set)"` で消していた。
+`--remove-annotations` は**存在しないフラグ**で、gcloud は unrecognised として拒否する。`|| echo` が
+その拒否を握り潰し、実際に起きたことと**正反対**のメッセージ（「マーカーは設定されていなかった」）を
+表示していた。マーカーは設定されたままで、消去は一度も実行されていない。
+
+影響は誤記の割に深刻である。マーカーが設定されている間、以降のトリップはすべて no-op になる。
+つまり運用者は「復旧成功」と思ってその場を離れ、スイッチは**恒久的に無効化された**まま、次の
+本物の超過支出で初めてそれに気づくことになる。
+
+修正: レシピは Admin API 経由で v2 Service を read-modify-write してマーカーを消し、**不在を
+読み戻して確認する**。2026-08-30 に検証済み — マーカーは不在を読み戻し、スイッチは武装している。
+
+**なぜ `|| echo` のフォールバックを残さないのか** — 「やることがなかった」と「コマンドが動かない」を
+区別できない復旧ステップは、メッセージが無いより悪い。声の大きい失敗を、自信に満ちた誤った安心に
+変換してしまうため。以後、消去は必ず読み戻しで終わる。

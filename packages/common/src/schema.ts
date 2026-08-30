@@ -105,12 +105,12 @@ export const AttestationSchema = z
     /** Categories left masked on purpose by the disclosure policy. */
     withheld: z.array(PiiCategorySchema).optional(),
     /**
-     * How many times the advisory judge was re-asked before this verdict.
-     *
-     * Present only when a re-ask happened, and capped at one by the pipeline. It
-     * is recorded because a release that passed only on the second look is a
-     * materially weaker claim than one that passed outright, and an audit record
-     * that hid the difference would overstate what was checked.
+     * How many category-enrichment attempts the advisory judge made on a
+     * refusal — not verdict re-rolls. The judge's first `leak: true` is
+     * terminal and always refuses; a second call only asks for the category
+     * list when the first named none, and its `leak` value is never
+     * consulted, so this field never appears on a release. Present only when
+     * the enrichment call happened, and capped at one by the pipeline.
      */
     judge_retries: z.number().int().min(0).optional(),
   })

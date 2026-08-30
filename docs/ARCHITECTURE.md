@@ -25,7 +25,7 @@ actually gates a release runs on its HTTP routes.
 | **Core Agent**      | Gemini 3.5 (Vertex AI) | Cloud Run     | Pure reasoning / planning / code generation over masked input. ADK TypeScript (`@google/adk`), served via `toA2a`; Agent Card at `/.well-known/agent-card.json`, RPC at `/jsonrpc` and `/rest`. Model id from `GEMINI_MODEL` (default `gemini-3.5-flash`, verified on Vertex AI). Deployed with `GOOGLE_CLOUD_LOCATION=global`: `gemini-3.5-flash` is published only on the global Vertex endpoint and the `us-central1` regional one 404s for it. An inbound guard rejects any payload still containing raw PII. Has **no** vault dependency — its package installs the whole `@privacy-gateway/common` package, so it is IAM (Core's service account has no Firestore role), not the dependency graph, that is the actual structural guarantee. |
 | **Synthesis Agent** | Gemma 3 (self-hosted)  | Cloud Run     | ADK TypeScript, exposed via `toA2a` (acknowledgement only) and over HTTP (the real pipeline). Receives Core's output. (a) **Leak check**: a deterministic regex re-scan of the masked response, plus an advisory Gemma judge. (b) **Consistency check**: deterministically verifies Core invented no placeholder absent from the prompt. (c) **Rehydration**: restores tokens from the vault, applying the disclosure policy. Assembles the OKF document; only masked artifacts are ever persisted.                                                                                                                                                                                                                                               |
 | **Gemma Serving**   | gemma3 via Ollama      | Cloud Run GPU | OpenAI-compatible endpoint consumed by Gateway/Synthesis through `OllamaLlm`, an ADK `BaseLlm` adapter registered for `ollama/*` model names. Accelerator: **NVIDIA RTX PRO 6000** (`var.gpu_type`) — the L4 quota request was declined in 2026-08. Ingress: internal only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **kill-switch**     | none (no LLM)          | Cloud Run     | Not a fleet member and not an agent: it never sees a prompt, an answer or a vault entry. A Cloud Billing budget publishes each threshold crossing to a Pub/Sub topic whose push subscription calls this service with an OIDC token; at 100% it drops the `allUsers` invoker binding on `gateway-agent` and forces `gemma-serving` to zero max instances. Both actions are idempotent, so Pub/Sub redelivery is harmless. Lives in `services/kill-switch`.                                                                                                                                                                                                                                                                                         |
+| **kill-switch**     | none (no LLM)          | Cloud Run     | Not a fleet member and not an agent: it never sees a prompt, an answer or a vault entry. A Cloud Billing budget publishes each threshold crossing to a Pub/Sub topic whose push subscription calls this service with an OIDC token; at 100% it drops the `allUsers` invoker binding on `gateway-agent`, holds `gemma-serving` at zero instances via Cloud Run manual scaling, and strips the fleet's invoker rights on `gemma-serving`. All three actions are idempotent, so Pub/Sub redelivery is harmless. Lives in `services/kill-switch`.                                                                                                                                                                                                     |
 
 Trust boundary: `Gateway`, `Synthesis`, `Gemma Serving`, `Firestore` are **inside**.
 Only masked text crosses to `Core` (and therefore to Gemini). Core's service account
@@ -121,17 +121,24 @@ what was masked. All of it is PII-free by construction — the prompt is the str
 crossed the boundary, the categories are already public in the placeholders and the OKF
 document, and no mapping value is read. Why not the earlier deletion: a gap-riddled
 sentence made the model infer what the gaps held, which is exactly how it came to flag
-nearly every masked answer while naming no category. The retry above remains as a
-backstop for whatever survives the better input.
+nearly every masked answer while naming no category. This input redesign is the whole fix
+for that false-positive rate; there is no longer any second chance at the verdict behind
+it, so it has to be right on the first call.
 
-One narrow exception exists to the "a flag blocks" rule: when the judge flags a leak while
-naming **no** category, over a body the deterministic attester has already passed, it is
-re-asked exactly once, and a clear second answer releases the request with
-`attestation.judge_retries: 1` recorded in the OKF document and a `judge.retry` log event.
-A flag that names categories is a specific suspicion and is never retried; an unavailable
-judge is never retried either; and the retry is capped at one, because beyond two attempts
-"the first answer was noise" is indistinguishable from re-rolling until the gate lets the
-request through. The asymmetry is unchanged — a cleared retry still adds no trust.
+There is no exception to "a flag blocks": the judge's first verdict is authoritative, and
+`leak: true` always refuses (`judge_flagged`, 422) — no second call turns a flag into a
+release. When that first verdict flags a leak while naming **no** category, over a body the
+deterministic attester has already passed, the judge is asked one more time, but only to
+enrich the category list the refusal record carries; the second call's `leak` value is
+discarded outright, and only categories it names (if any) are adopted. The outcome is still
+a refusal, recorded with `attestation.judge_retries: 1` and a `judge.retry` log event. A flag
+that already names categories needs no enrichment and is never re-asked; an unavailable
+judge is never retried either. Why not let a clear second answer release: the deterministic
+attester does not detect names or postal addresses at all, so an unevidenced flag over an
+attester-clean body is exactly the case where the judge is the only coverage those categories
+get — re-asking a probabilistic veto until it stops flagging is how a veto becomes theatre,
+not verification. The asymmetry is unchanged — a judge has never been able to vouch for a
+release, and now it cannot even undo its own flag.
 
 ### Pseudonymization, not anonymization
 

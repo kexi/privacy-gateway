@@ -1,8 +1,8 @@
 {
-  "request_id": "01a043e6-afe3-7552-8c20-1f0b7f0a1831",
-  "trace_id": "8a3a4d14714ea9699a77fe46466b1e36",
-  "masked_prompt": "Draft a short polite status update for customer ⟦PERSON_1⟧ (⟦EMAIL_1⟧, ⟦PHONE_1⟧) telling him his order shipped.",
-  "okf": "---\ntype: Gateway Answer\ntitle: Gateway answer for request 01a043e6-afe3-7552-8c20-1f0b7f0a1831\ndescription: Masked evidence for one gateway exchange. The rehydrated answer is returned to the caller in the response body only and is not stored here.\ntags:\n  - gateway\n  - pii\n  - attested\nrequest_id: 01a043e6-afe3-7552-8c20-1f0b7f0a1831\nstatus: stable\ngenerated:\n  by: synthesis_agent/0.1.0\n  at: 2026-08-27T15:46:34Z\nstale_after: 2026-08-27T16:46:28Z\nsources:\n  - id: masked-prompt\n    resource: /v1/requests/01a043e6-afe3-7552-8c20-1f0b7f0a1831/masked-prompt.md\n    title: Masked prompt sent to the core agent\n    author: gateway_agent/tokenizer\n    last_modified: 2026-08-27T15:46:34Z\n  - id: core-response\n    resource: /v1/requests/01a043e6-afe3-7552-8c20-1f0b7f0a1831/core-response.md\n    title: Tokenized response returned by the core agent\n    author: core_agent/gemini-2.5-flash\n    last_modified: 2026-08-27T15:46:34Z\n  - id: pii-policy\n    resource: /policies/pii-masking.md\n    title: PII masking policy\n    author: human:kei\nattestation:\n  computation: /computations/leak-check.md\n  computation_sha256: efa7e03c46f5158efed2641a4988cb7f49a32792a67d563826be070946d6cdbc\n  attester_sha256: 8b427a667e6426be7061777d8c7952e57a816b8fbcd0410fdafea2e737529ce9\n  masked_prompt_sha256: ebb7229d566b1e6fcefeab0d7f3ab44cfe632d9c57af528fcaf9e282bb161ea9\n  core_response_sha256: 62845b6b985114823052ccb32550ad7e155e06d7eaabb08031260a7b647f380e\n  verdict: pass\n  checked_at: 2026-08-27T15:46:33Z\n  request_id: 01a043e6-afe3-7552-8c20-1f0b7f0a1831\n  trace_id: 8a3a4d14714ea9699a77fe46466b1e36\ntrace_id: 8a3a4d14714ea9699a77fe46466b1e36\nverified:\n  - by: process:leak-check@8b427a667e64\n    at: 2026-08-27T15:46:33Z\n---\n\n# Answer (masked)\n\nSubject: Your Order Has Shipped!\n\nDear ⟦PERSON_1⟧,\n\nWe're pleased to let you know that your recent order has shipped and is on its way! You will receive a separate email with tracking information shortly.\n\nThank you for your business.\n\nSincerely,\n[Your Company Name]\n\nCustomer details:\nEmail: ⟦EMAIL_1⟧\nPhone: ⟦PHONE_1⟧\n\nThe rehydrated form of this answer was returned to the caller in the API response and is\ndeliberately not stored. Only the masked text above, the hashes below, and the category\ncounts are retained.\n\n# Attestation\n\nLeak-policy check passed. It confirms only that the core agent's tokenized\nresponse carried no raw identifier of its own; it is not a factual validation of the\nanswer. The verdict was decided by the deterministic attester named in\n`attestation.attester_sha256`, following\n[the leak-check computation](/computations/leak-check.md), over the masked prompt and\ncore response whose digests are recorded in the `attestation` block.\n\nFindings:\n\n- (no findings)\n\nReplay it with `just verify-answer 01a043e6-afe3-7552-8c20-1f0b7f0a1831`.\n\nThe answer was produced from a masked prompt in which every detected identifier was\nreplaced by an opaque placeholder before it left the trust boundary.[^masked-prompt] The\ncore agent's tokenized response is the input the check ran over.[^core-response] Masking\nfollows the repository PII masking policy.[^pii-policy]\n\n[^masked-prompt]: Masked prompt sent to the core agent\n[^core-response]: Tokenized response returned by the core agent\n[^pii-policy]: PII masking policy\n",
+  "request_id": "01a05302-656b-735f-88ed-2e3dd5225497",
+  "trace_id": "c057cdb3782dd239bbb772aa0ee268e9",
+  "masked_prompt": "Draft a short reply to ⟦PERSON_1⟧ (⟦EMAIL_1⟧, ⟦PHONE_1⟧) confirming his order. His card ⟦CREDIT_CARD_1⟧ and API key ⟦API_KEY_1⟧ were on file, from ⟦IPV4_1⟧.",
+  "okf": "---\ntype: Gateway Answer\ntitle: Gateway answer for request 01a05302-656b-735f-88ed-2e3dd5225497\ndescription: Masked evidence for one gateway exchange. The rehydrated answer is returned to the caller in the response body only and is not stored here.\ntags:\n  - gateway\n  - pii\n  - attested\nrequest_id: 01a05302-656b-735f-88ed-2e3dd5225497\nstatus: stable\ngenerated:\n  by: synthesis_agent/0.1.0\n  at: 2026-08-30T14:11:06Z\nstale_after: 2026-08-30T15:11:01Z\nsources:\n  - id: masked-prompt\n    resource: /v1/requests/01a05302-656b-735f-88ed-2e3dd5225497/masked-prompt.md\n    title: Masked prompt sent to the core agent\n    author: gateway_agent/tokenizer\n    last_modified: 2026-08-30T14:11:06Z\n  - id: core-response\n    resource: /v1/requests/01a05302-656b-735f-88ed-2e3dd5225497/core-response.md\n    title: Tokenized response returned by the core agent\n    author: core_agent/gemini-3.5-flash\n    last_modified: 2026-08-30T14:11:06Z\n  - id: pii-policy\n    resource: /policies/pii-masking.md\n    title: PII masking policy\n    author: human:kei\nattestation:\n  computation: /computations/leak-check.md\n  computation_sha256: efa7e03c46f5158efed2641a4988cb7f49a32792a67d563826be070946d6cdbc\n  attester_sha256: 8b427a667e6426be7061777d8c7952e57a816b8fbcd0410fdafea2e737529ce9\n  masked_prompt_sha256: 588a0f386c5b3e52c5336bf4430bd33285a9ea2079990ca7df22d2f798e27d1f\n  core_response_sha256: 43047d13d883e6f006932866d6d02dab780215062734f5ddfb0252b096007522\n  verdict: pass\n  checked_at: 2026-08-30T14:11:06Z\n  request_id: 01a05302-656b-735f-88ed-2e3dd5225497\n  trace_id: c057cdb3782dd239bbb772aa0ee268e9\n  withheld:\n    - API_KEY\n    - CREDIT_CARD\ntrace_id: c057cdb3782dd239bbb772aa0ee268e9\nverified:\n  - by: process:leak-check@8b427a667e64\n    at: 2026-08-30T14:11:06Z\n---\n\n# Answer (masked)\n\nSubject: Order Confirmation\n\nHi ⟦PERSON_1⟧,\n\nThis is a quick note to confirm that your recent order has been successfully processed. \n\nWe have used your card on file (⟦CREDIT_CARD_1⟧) and applied your API key ⟦API_KEY_1⟧ for this transaction, authorized from IP address ⟦IPV4_1⟧.\n\nIf you have any questions or need further assistance, please feel free to reply directly to this email (⟦EMAIL_1⟧) or call us at ⟦PHONE_1⟧.\n\nBest regards,\n\n[Your Name/Company]\n\nThe rehydrated form of this answer was returned to the caller in the API response and is\ndeliberately not stored. Only the masked text above, the hashes below, and the category\ncounts are retained.\n\nThe disclosure policy kept these categories masked in the released answer: `API_KEY`, `CREDIT_CARD`.\n\n# Attestation\n\nLeak-policy check passed. It confirms only that the core agent's tokenized\nresponse carried no raw identifier of its own; it is not a factual validation of the\nanswer. The verdict was decided by the deterministic attester named in\n`attestation.attester_sha256`, following\n[the leak-check computation](/computations/leak-check.md), over the masked prompt and\ncore response whose digests are recorded in the `attestation` block.\n\nFindings:\n\n- (no findings)\n\nReplay it with `just verify-answer 01a05302-656b-735f-88ed-2e3dd5225497`.\n\nThe answer was produced from a masked prompt in which every detected identifier was\nreplaced by an opaque placeholder before it left the trust boundary.[^masked-prompt] The\ncore agent's tokenized response is the input the check ran over.[^core-response] Masking\nfollows the repository PII masking policy.[^pii-policy]\n\n[^masked-prompt]: Masked prompt sent to the core agent\n[^core-response]: Tokenized response returned by the core agent\n[^pii-policy]: PII masking policy\n",
   "trust_tier": "machine-confirmed",
   "status": "stable",
   "dimensions": {
@@ -16,33 +16,51 @@
     "reason": null,
     "findings": [],
     "details": {
-      "request_id": "01a043e6-afe3-7552-8c20-1f0b7f0a1831",
-      "response_hash": "62845b6b985114823052ccb32550ad7e155e06d7eaabb08031260a7b647f380e",
-      "masked_prompt_hash": "ebb7229d566b1e6fcefeab0d7f3ab44cfe632d9c57af528fcaf9e282bb161ea9",
+      "request_id": "01a05302-656b-735f-88ed-2e3dd5225497",
+      "response_hash": "43047d13d883e6f006932866d6d02dab780215062734f5ddfb0252b096007522",
+      "masked_prompt_hash": "588a0f386c5b3e52c5336bf4430bd33285a9ea2079990ca7df22d2f798e27d1f",
       "prompt_bound": true
     },
     "judge": {
       "leak": false,
       "categories": []
-    }
+    },
+    "withheld": ["API_KEY", "CREDIT_CARD"]
   },
   "consistency": {
     "ok": true,
     "invented_tokens": [],
-    "known_tokens": ["⟦EMAIL_1⟧", "⟦PERSON_1⟧", "⟦PHONE_1⟧"],
-    "used_tokens": ["⟦PERSON_1⟧", "⟦EMAIL_1⟧", "⟦PHONE_1⟧"],
+    "known_tokens": [
+      "⟦API_KEY_1⟧",
+      "⟦CREDIT_CARD_1⟧",
+      "⟦EMAIL_1⟧",
+      "⟦IPV4_1⟧",
+      "⟦PERSON_1⟧",
+      "⟦PHONE_1⟧"
+    ],
+    "used_tokens": [
+      "⟦PERSON_1⟧",
+      "⟦CREDIT_CARD_1⟧",
+      "⟦API_KEY_1⟧",
+      "⟦IPV4_1⟧",
+      "⟦EMAIL_1⟧",
+      "⟦PHONE_1⟧"
+    ],
     "reason": null
   },
   "stats": {
-    "masked_count": 3,
+    "masked_count": 6,
     "counts_by_category": {
       "PERSON": 1,
       "EMAIL": 1,
-      "PHONE": 1
+      "PHONE": 1,
+      "CREDIT_CARD": 1,
+      "API_KEY": 1,
+      "IPV4": 1
     },
     "unstructured_spans": 1,
-    "vault_expires_at": "2026-08-27T16:46:28Z",
+    "vault_expires_at": "2026-08-30T15:11:01Z",
     "vault_generation": 1,
-    "core_actor": "core_agent/gemini-2.5-flash"
+    "core_actor": "core_agent/gemini-3.5-flash"
   }
 }

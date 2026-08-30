@@ -33,6 +33,10 @@ class StubActions implements KillActions {
     return Promise.resolve({ alreadyApplied: false });
   }
 
+  revokeFleetInvokers(_service: string): Promise<ActionOutcome> {
+    return Promise.resolve({ alreadyApplied: false });
+  }
+
   isTripped(_service: string): Promise<boolean> {
     return Promise.resolve(this.tripped);
   }

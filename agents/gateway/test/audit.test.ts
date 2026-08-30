@@ -133,7 +133,7 @@ describe('audit token gate', () => {
     const app = appWith({}, storeWith(record(REQUEST_ID)));
 
     const withoutToken = await get(app, '/v1/audit');
-    const withToken = await get(app, `/v1/audit?key=${TOKEN}`);
+    const withToken = await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN });
 
     // Identical answers: with no token configured there is nothing a caller
     // could present that would make the route exist.
@@ -144,23 +144,27 @@ describe('audit token gate', () => {
   it('answers 404 — never 401 — for a wrong token, so the surface stays unadvertised', async () => {
     const app = appWith({ ADMIN_TOKEN: TOKEN }, storeWith(record(REQUEST_ID)));
 
-    for (const attempt of ['', '?key=', '?key=wrong', `?key=${TOKEN}x`, `?key=${TOKEN.slice(1)}`]) {
-      const response = await get(app, `/v1/audit${attempt}`);
-      expect(response.status, `for ${attempt || '(no query)'}`).toBe(404);
+    for (const attempt of ['', 'wrong', `${TOKEN}x`, TOKEN.slice(1)]) {
+      const response = await get(app, '/v1/audit', { 'X-Admin-Token': attempt });
+      expect(response.status, `for ${attempt || '(empty header)'}`).toBe(404);
     }
+    expect((await get(app, '/v1/audit')).status).toBe(404);
   });
 
   it('treats an empty ADMIN_TOKEN as the feature being off', async () => {
     const app = appWith({ ADMIN_TOKEN: '   ' }, storeWith(record(REQUEST_ID)));
 
-    expect((await get(app, '/v1/audit?key=%20%20%20')).status).toBe(404);
+    expect((await get(app, '/v1/audit', { 'X-Admin-Token': '   ' })).status).toBe(404);
   });
 
-  it('accepts the token from the query string and from the header alike', async () => {
+  it('accepts the token only from the header, never from the query string', async () => {
+    // A query-parameter capability lands verbatim in Cloud Run's request log
+    // (`httpRequest.requestUrl`), so the correct token in `?key=` must not open
+    // the route.
     const app = appWith({ ADMIN_TOKEN: TOKEN }, storeWith(record(REQUEST_ID)));
 
-    expect((await get(app, `/v1/audit?key=${TOKEN}`)).status).toBe(200);
     expect((await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN })).status).toBe(200);
+    expect((await get(app, `/v1/audit?key=${TOKEN}`)).status).toBe(404);
   });
 
   it('never logs the presented token, right or wrong', async () => {
@@ -176,8 +180,8 @@ describe('audit token gate', () => {
       auditStore: storeWith(record(REQUEST_ID)),
     });
 
-    await get(app, '/v1/audit?key=wrong-token-value');
-    await get(app, `/v1/audit?key=${TOKEN}`);
+    await get(app, '/v1/audit', { 'X-Admin-Token': 'wrong-token-value' });
+    await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN });
 
     const joined = lines.join('\n');
     expect(joined).toContain('audit.denied');
@@ -191,7 +195,7 @@ describe('audit list shape', () => {
   it('returns evidence metadata and no document bodies', async () => {
     const app = appWith({ ADMIN_TOKEN: TOKEN }, storeWith(record(REQUEST_ID)));
 
-    const response = await get(app, `/v1/audit?key=${TOKEN}`);
+    const response = await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN });
     expect(response.status).toBe(200);
 
     const body = response.body as { entries: Array<Record<string, unknown>>; limit: number };
@@ -225,7 +229,7 @@ describe('audit list shape', () => {
       storeWith(record(OLDER_REQUEST_ID), record(REQUEST_ID)),
     );
 
-    const body = (await get(app, `/v1/audit?key=${TOKEN}`)).body as {
+    const body = (await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN })).body as {
       entries: Array<{ request_id: string }>;
     };
     expect(body.entries.map((entry) => entry.request_id)).toEqual([REQUEST_ID, OLDER_REQUEST_ID]);
@@ -234,7 +238,7 @@ describe('audit list shape', () => {
   it('reports a failed attestation as draft and unverified rather than hiding it', async () => {
     const app = appWith({ ADMIN_TOKEN: TOKEN }, storeWith(record(REQUEST_ID, { pass: false })));
 
-    const body = (await get(app, `/v1/audit?key=${TOKEN}`)).body as {
+    const body = (await get(app, '/v1/audit', { 'X-Admin-Token': TOKEN })).body as {
       entries: Array<Record<string, unknown>>;
     };
     expect(body.entries[0]).toMatchObject({
@@ -307,10 +311,11 @@ describe('token comparison', () => {
     expect(tokenMatches(TOKEN, TOKEN)).toBe(true);
   });
 
-  it('prefers the header over the query string, and reports absence as null', () => {
-    expect(presentedToken({ key: 'from-query' }, 'from-header')).toBe('from-header');
-    expect(presentedToken({ key: 'from-query' }, undefined)).toBe('from-query');
-    expect(presentedToken({}, undefined)).toBeNull();
-    expect(presentedToken({ key: '' }, '')).toBeNull();
+  it('reads the header only, and reports absence as null', () => {
+    expect(presentedToken('from-header')).toBe('from-header');
+    // Express hands a repeated header through as an array; the first wins.
+    expect(presentedToken(['first', 'second'])).toBe('first');
+    expect(presentedToken(undefined)).toBeNull();
+    expect(presentedToken('')).toBeNull();
   });
 });

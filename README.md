@@ -334,18 +334,18 @@ extra signal. Under Nix the browser comes from `PLAYWRIGHT_BROWSERS_PATH`; outsi
 
 ### API
 
-| Method | Path                                 | Purpose                                                                                                                                          |
-| ------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats                      |
-| `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                                           |
-| `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                                                   |
-| `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                                                  |
-| `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                                      |
-| `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                                          |
-| `GET`  | `/v1/status`                         | is Gemma `warm`/`warming`/`cold`/`unknown`, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU                              |
-| `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                                     |
-| `GET`  | `/v1/audit`                          | read-only list of stored evidence metadata, newest first (max 50). Requires `?key=` or `X-Admin-Token`; 404 when `ADMIN_TOKEN` is unset or wrong |
-| `GET`  | `/healthz`                           | liveness                                                                                                                                         |
+| Method | Path                                 | Purpose                                                                                                                                                                                                           |
+| ------ | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats                                                                                       |
+| `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                                                                                                            |
+| `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                                                                                                                    |
+| `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                                                                                                                   |
+| `POST` | `/v1/chat/completions`               | OpenAI-compatible façade over the same pipeline (see below)                                                                                                                                                       |
+| `GET`  | `/v1/models`                         | OpenAI-compatible model list; one id, `privacy-gateway`                                                                                                                                                           |
+| `GET`  | `/v1/status`                         | is Gemma `warm`/`warming`/`cold`/`unknown`, and the cold-start estimate. Cheap, cached ~5s, and never wakes the GPU                                                                                               |
+| `POST` | `/v1/warmup`                         | starts the GPU. **Billed while the instance lives** (~15 idle minutes), so it is rate-limited like `/v1/ask`                                                                                                      |
+| `GET`  | `/v1/audit`                          | read-only list of stored evidence metadata, newest first (max 50). Requires an `X-Admin-Token` header (a `?key=` query is refused; the shareable link is `/audit#key=`); 404 when `ADMIN_TOKEN` is unset or wrong |
+| `GET`  | `/healthz`                           | liveness                                                                                                                                                                                                          |
 
 `POST /v1/ask` also answers `Accept: text/event-stream` with a progress stream: an
 `event: progress` frame per pipeline stage (`masking`, `egress_guard`, `core_reasoning`,
@@ -648,10 +648,11 @@ Idle costs **$0** — every service scales to zero. With everything warm the fle
 to lose money here is forgetting the teardown: left up for a day, that is **~$39**.
 
 So a forgotten teardown is handled automatically rather than by an email nobody reads at 3am.
-A **¥8,000 (~$50) Cloud Billing budget** publishes every threshold crossing (50% / 80% / 100%) to a
+A **¥15,000 (~$95) Cloud Billing budget** publishes every threshold crossing (50% / 80% / 100%) to a
 Pub/Sub topic, whose push subscription calls a small `kill-switch` Cloud Run service. At 100%
-it removes the `allUsers` invoker binding from `gateway-agent` and forces `gemma-serving` to
-zero max instances — both idempotent, so Pub/Sub redelivery is harmless. Below 100% it only
+it removes the `allUsers` invoker binding from `gateway-agent`, holds `gemma-serving` at zero
+instances via Cloud Run manual scaling, and strips the fleet's invoker rights on
+`gemma-serving` — all idempotent, so Pub/Sub redelivery is harmless. Below 100% it only
 logs. Restore with `just restore-after-kill` once the underlying spend is fixed.
 
 Note that a cost gate deliberately does **not** fail closed the way this fleet's disclosure

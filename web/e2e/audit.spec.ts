@@ -188,6 +188,35 @@ test.describe('audit view', () => {
     await expect(page.locator('#list-section')).toBeHidden();
   });
 
+  test('accepts a token from the URL fragment and clears it immediately', async ({ page }) => {
+    await mockAudit(page);
+    await page.goto('/audit.html');
+    await page.evaluate(() => {
+      sessionStorage.clear();
+    });
+
+    // A fragment is never sent to the server, which is why the shareable link
+    // uses `#key=` and not `?key=`: a query string is written verbatim into
+    // Cloud Run's request log. `goto` to a URL differing only in the fragment
+    // is a same-document navigation that would never re-run the page's boot, so
+    // the link is opened the way a recipient really opens it — on a fresh load.
+    await page.goto('about:blank');
+    await page.goto(`/audit.html#key=${TOKEN}`);
+
+    await expect(page.locator('#audit-rows tr')).toHaveCount(2);
+
+    // Stripped from the address bar, so the capability does not survive in the
+    // history or in any subsequent referrer.
+    expect(new URL(page.url()).hash).toBe('');
+
+    // The token itself never appeared in a request URL.
+    const requestedUrls: string[] = [];
+    page.on('request', (request) => requestedUrls.push(request.url()));
+    await page.click('#refresh');
+    await expect(page.locator('#audit-rows tr')).toHaveCount(2);
+    expect(requestedUrls.some((url) => url.includes(TOKEN))).toBe(false);
+  });
+
   test('opening a row shows the OKF frontmatter as labelled facts', async ({ page }) => {
     await openAudit(page);
 
