@@ -36,6 +36,10 @@ updates:
       # Pinned to the playwright-driver version provided by the Nix devShell;
       # bumping one side alone breaks browser resolution. Bump both by hand.
       - dependency-name: '@playwright/test'
+      # Must move in lockstep with @google/adk's own dependency: a direct bump
+      # creates a second copy in the tree and the two packages' Content types
+      # stop being assignable to each other (observed on 2.18 vs 2.19).
+      - dependency-name: '@google/genai'
       # Majors (zod 4, vite majors, ...) are API migrations, not routine
       # updates; take them deliberately, not from a bot, this close to the
       # hackathon deadline.
