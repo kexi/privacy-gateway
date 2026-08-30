@@ -63,16 +63,50 @@
         </div>
 
         <!--
+          User-defined secret terms. The detectors cover shapes (an email looks
+          like an email); a codename has no shape, so the only way to protect one
+          is for the person who knows it to name it. Matching is exact and
+          case-sensitive — see `findTermSpans` in the tokenizer for why.
+        -->
+        <div class="field mask-terms">
+          <label for="mask-terms">Additionally mask these phrases (comma-separated)</label>
+          <input
+            id="mask-terms"
+            name="mask_terms"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Titan Project, Project Hummingbird"
+            aria-describedby="mask-terms-help"
+          />
+          <p id="mask-terms-help" class="hint">
+            Unreleased product names, internal codenames — anything confidential that no detector
+            could know to look for. Each becomes a <code>⟦CUSTOM_n⟧</code> placeholder and is
+            restored in the answer you get back. Matching is exact and case-sensitive.
+          </p>
+          <!--
+            The chips are the confirmation that the box was parsed the way the
+            user meant. A comma-separated field is easy to get subtly wrong, and
+            the one place a silent misparse is unacceptable is the field whose
+            whole job is "this exact string must not leave".
+          -->
+          <ul id="mask-terms-preview" class="mask-terms-preview" aria-live="polite"></ul>
+        </div>
+
+        <!--
           The disclosure opt-in. These five categories are never restored into an
           answer by default; a checkbox here allows restoration of the values
           *this request* submits, for this response only. Default off, always:
           the safe policy must be what happens when nobody chooses.
         -->
         <fieldset class="disclosure">
-          <legend>高リスク情報の復元をこのリクエストに限り許可</legend>
+          <legend>Allow high-risk values back into this one answer</legend>
           <p id="disclosure-warning" class="warning">
-            <strong>注意:</strong>
-            許可すると、そのカテゴリの値が回答本文にそのまま復元されます。ログやスクリーンショットに残ると被害範囲が広がります。許可は<strong>このリクエストで送信した値だけ</strong>が対象で、次のリクエストには引き継がれません。
+            <strong>Careful:</strong>
+            an allowed category is restored verbatim into the answer body, so it spreads wherever
+            that answer goes — logs, screenshots, whatever reads it next. The permission covers
+            <strong>only the values this request submitted</strong> and is not carried into the next
+            one.
           </p>
           <div class="disclosure-options">
             <div class="disclosure-check">
@@ -83,7 +117,7 @@
                 value="CREDIT_CARD"
                 aria-describedby="disclosure-warning"
               />
-              <label for="allow-credit-card">カード番号 <code>CREDIT_CARD</code></label>
+              <label for="allow-credit-card">Card number <code>CREDIT_CARD</code></label>
             </div>
             <div class="disclosure-check">
               <input
@@ -93,7 +127,7 @@
                 value="API_KEY"
                 aria-describedby="disclosure-warning"
               />
-              <label for="allow-api-key">API キー <code>API_KEY</code></label>
+              <label for="allow-api-key">API key <code>API_KEY</code></label>
             </div>
             <div class="disclosure-check">
               <input
@@ -113,7 +147,7 @@
                 value="AWS_KEY"
                 aria-describedby="disclosure-warning"
               />
-              <label for="allow-aws-key">AWS キー <code>AWS_KEY</code></label>
+              <label for="allow-aws-key">AWS key <code>AWS_KEY</code></label>
             </div>
             <div class="disclosure-check">
               <input
@@ -123,7 +157,7 @@
                 value="MY_NUMBER"
                 aria-describedby="disclosure-warning"
               />
-              <label for="allow-my-number">マイナンバー <code>MY_NUMBER</code></label>
+              <label for="allow-my-number">My Number <code>MY_NUMBER</code></label>
             </div>
           </div>
         </fieldset>

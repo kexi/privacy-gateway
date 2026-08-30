@@ -13,7 +13,7 @@ project_id := env_var_or_default("PROJECT_ID", "all-thinkgs")
 region := env_var_or_default("REGION", "us-central1")
 ar_repo := env_var_or_default("AR_REPO", "agentic-fleet")
 image_tag := env_var_or_default("IMAGE_TAG", "latest")
-gemma_model := env_var_or_default("GEMMA_MODEL", "gemma3:12b")
+gemma_model := env_var_or_default("GEMMA_MODEL", "gemma4:12b")
 
 # GCS bucket holding the Terraform remote state.
 state_bucket := env_var_or_default("TF_STATE_BUCKET", project_id + "-tfstate")

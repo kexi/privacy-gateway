@@ -87,12 +87,14 @@ function run(
     requestId?: string;
     callCore?: (prompt: string) => Promise<string>;
     extractSpans?: (text: string) => Promise<Detection[]>;
+    maskTerms?: readonly string[];
   } = {},
 ) {
   return ask({
     text: overrides.text ?? CUSTOMER_EMAIL,
     requestId: overrides.requestId ?? REQUEST_ID,
     vault,
+    ...(overrides.maskTerms !== undefined ? { maskTerms: overrides.maskTerms } : {}),
     callCore: overrides.callCore ?? ((prompt) => Promise.resolve(echoingCore(prompt))),
     callSynthesis: passthroughSynthesis,
     coreActor: CORE_ACTOR,
@@ -286,5 +288,115 @@ describe('extraction failure', () => {
     ).rejects.toThrow('gemma is down');
 
     expect(coreCalled).toBe(false);
+  });
+});
+
+describe('user-defined secret terms', () => {
+  it('masks a named term that no detector would have found', async () => {
+    let sentToCore = '';
+    await ask({
+      text: 'Ship Titan Project by Friday.',
+      requestId: 'r-term-1',
+      vault,
+      maskTerms: ['Titan Project'],
+      callCore: (prompt) => {
+        sentToCore = prompt;
+        return Promise.resolve(echoingCore(prompt));
+      },
+      callSynthesis: passthroughSynthesis,
+      coreActor: CORE_ACTOR,
+      logger: silentLogger(),
+    });
+
+    expect(sentToCore).not.toContain('Titan Project');
+    expect(sentToCore).toContain('⟦CUSTOM_1⟧');
+  });
+
+  it('refuses and never reaches Core when a named term survives masking', async () => {
+    // The check that no regex could do. A tokenizer regression is simulated with
+    // a masking step that leaves the text untouched; the guard's literal term
+    // scan is the only thing between the codename and Gemini.
+    let coreCalled = false;
+
+    await expect(
+      ask({
+        text: 'Ship Titan Project by Friday.',
+        requestId: 'r-term-leak',
+        vault,
+        maskTerms: ['Titan Project'],
+        callCore: () => {
+          coreCalled = true;
+          return Promise.resolve('unreachable');
+        },
+        callSynthesis: passthroughSynthesis,
+        coreActor: CORE_ACTOR,
+        logger: silentLogger(),
+        tokenize: (text) => ({ text, mapping: {}, detections: [] }),
+      }),
+    ).rejects.toThrow(PiiLeakError);
+
+    expect(coreCalled).toBe(false);
+  });
+
+  it('refuses under CUSTOM without repeating the term', async () => {
+    try {
+      await ask({
+        text: 'Ship Titan Project.',
+        requestId: 'r-term-leak2',
+        vault,
+        maskTerms: ['Titan Project'],
+        callCore: () => Promise.resolve('unreachable'),
+        callSynthesis: passthroughSynthesis,
+        coreActor: CORE_ACTOR,
+        logger: silentLogger(),
+        tokenize: (text) => ({ text, mapping: {}, detections: [] }),
+      });
+      expect.unreachable('the guard must refuse a surviving term');
+    } catch (error) {
+      const leak = error as PiiLeakError;
+      expect(leak.categories).toEqual(['CUSTOM']);
+      expect(leak.message).not.toContain('Titan');
+    }
+  });
+
+  it('hands the terms to Synthesis so its own scan can run', async () => {
+    await run({ text: 'Ship Titan Project.', maskTerms: ['Titan Project'] });
+
+    expect(lastSynthesisInput?.maskTerms).toEqual(['Titan Project']);
+  });
+
+  it('hands Synthesis an empty list when no terms were named', async () => {
+    await run({ text: 'Draft a status update.' });
+
+    expect(lastSynthesisInput?.maskTerms).toEqual([]);
+  });
+
+  it('logs the term count and never a term', async () => {
+    const lines: string[] = [];
+    await ask({
+      text: 'Ship Titan Project.',
+      requestId: 'r-term-log',
+      vault,
+      maskTerms: ['Titan Project'],
+      callCore: (prompt) => Promise.resolve(echoingCore(prompt)),
+      callSynthesis: passthroughSynthesis,
+      coreActor: CORE_ACTOR,
+      logger: createLogger({ agent: 'gateway', write: (line) => lines.push(line) }),
+    });
+
+    const joined = lines.join('\n');
+    expect(joined).toContain('"term_count":1');
+    // The allowlist has no field a term could travel in, and this asserts the
+    // property end to end rather than trusting that.
+    expect(joined).not.toContain('Titan');
+  });
+
+  it('counts the CUSTOM placeholders it allocated in the stats', async () => {
+    const result = await run({
+      text: 'Ship Titan Project, then Titan Project again.',
+      maskTerms: ['Titan Project'],
+    });
+
+    expect(result.stats.counts_by_category['CUSTOM']).toBe(2);
   });
 });

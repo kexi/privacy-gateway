@@ -218,6 +218,84 @@ const VALIDATORS: Record<string, (value: string) => boolean> = {
   MY_NUMBER: (value) => digitsOf(value).length === 12,
 };
 
+/**
+ * The category allocated for a requester-supplied verbatim-mask term.
+ *
+ * Distinct from every detected category because nothing detected it: the
+ * requester asserted that this exact string is confidential, and no regex or
+ * model has an opinion about it.
+ */
+export const CUSTOM_CATEGORY = 'CUSTOM';
+
+/**
+ * Locate every occurrence of the requester's terms, longest term first.
+ *
+ * **Case-sensitive, deliberately.** Why not case-insensitive: a codename's case
+ * is part of its identity — `Titan` the unreleased product and `titan` the word
+ * in "titanium alloy" are different strings meaning different things — so
+ * folding case would mask ordinary prose the requester never asked to hide,
+ * mangling the prompt Core is asked to reason about. It would also mask more
+ * than the requester can predict, which is the opposite of what an explicit
+ * opt-in should do. A requester who wants both spellings masked names both,
+ * which the schema's case-preserving deduplication supports exactly.
+ *
+ * **Longest term first**, so overlapping terms nest correctly: with `Titan` and
+ * `Titan Project` both named, the longer one claims its span before the shorter
+ * can split it, and `Titan Project` becomes one placeholder rather than
+ * `⟦CUSTOM_n⟧ Project`. Ties are broken by the order the requester gave, which
+ * keeps the allocation deterministic.
+ *
+ * Overlapping matches of *different* terms are resolved the same way the regex
+ * detections are: the span accepted first wins, and a later span intersecting it
+ * is dropped rather than producing two placeholders over the same characters.
+ */
+export function findTermSpans(text: string, terms: readonly string[]): Detection[] {
+  const accepted: Detection[] = [];
+
+  const ordered = [...terms]
+    .map((term, order) => ({ term, order }))
+    .filter(({ term }) => term !== '')
+    .sort((a, b) => b.term.length - a.term.length || a.order - b.order);
+
+  for (const { term } of ordered) {
+    // `indexOf` rather than a built regex: a term is arbitrary user text, and
+    // escaping it into a pattern is a step that can only go wrong. Literal
+    // search has no metacharacters to get wrong in the first place.
+    for (
+      let from = text.indexOf(term);
+      from !== -1;
+      from = text.indexOf(term, from + term.length)
+    ) {
+      const end = from + term.length;
+      const overlaps = accepted.some((kept) => from < kept.end && kept.start < end);
+      if (overlaps) continue;
+      accepted.push({ start: from, end, category: CUSTOM_CATEGORY, value: term });
+    }
+  }
+
+  accepted.sort((a, b) => a.start - b.start);
+  return accepted;
+}
+
+/**
+ * True when any of `terms` still appears literally in `text`.
+ *
+ * The boundary check behind both the egress guard's term scan and the
+ * attester's: exact, case-sensitive, and the same comparison `findTermSpans`
+ * substitutes with, so a term that was masked cannot be reported as surviving
+ * and a term that survived cannot be reported as masked.
+ *
+ * Returns the *count* of surviving terms rather than the terms themselves —
+ * every caller either refuses or logs, and neither may hold a term.
+ */
+export function countSurvivingTerms(text: string, terms: readonly string[]): number {
+  let surviving = 0;
+  for (const term of terms) {
+    if (term !== '' && text.includes(term)) surviving += 1;
+  }
+  return surviving;
+}
+
 /** Detect PII / secret spans in `text`. Overlaps are already resolved. */
 export function detect(text: string): Detection[] {
   const candidates: Array<{ priority: number; detection: Detection }> = [];
@@ -313,9 +391,34 @@ export class SessionTokenizer {
    * `extra` carries the unstructured spans extracted by Gemma (personal names,
    * addresses and so on). Where such a span overlaps a regex detection the regex
    * wins, because the deterministic result is the one that can be audited.
+   *
+   * `terms` carries the requester's verbatim-mask phrases. They are substituted
+   * **first**, ahead of every detector: the requester asserted these exact
+   * strings are confidential, and an assertion outranks a heuristic. A regex
+   * detection overlapping a term is therefore dropped rather than the other way
+   * round — a codename that happens to contain something email-shaped is still
+   * the codename the requester named, and splitting it would leave part of it in
+   * the clear.
    */
-  tokenize(text: string, extra?: readonly Detection[] | undefined): TokenizeResult {
-    const detections = detect(text);
+  tokenize(
+    text: string,
+    extra?: readonly Detection[] | undefined,
+    terms?: readonly string[] | undefined,
+  ): TokenizeResult {
+    const termSpans = terms === undefined || terms.length === 0 ? [] : findTermSpans(text, terms);
+
+    // The term spans are seeded before `detect` runs so the overlap filter below
+    // resolves in their favour; `detect`'s own internal overlap resolution is
+    // unchanged, and only its surviving spans are tested against the terms.
+    const detections = [...termSpans];
+    for (const detection of detect(text)) {
+      const overlaps = termSpans.some(
+        (term) => detection.start < term.end && term.start < detection.end,
+      );
+      if (overlaps) continue;
+      detections.push(detection);
+    }
+    detections.sort((a, b) => a.start - b.start);
 
     if (extra !== undefined && extra.length > 0) {
       // Longest first, so a longer model span is not blocked by a shorter one
@@ -375,6 +478,17 @@ export function tokenize(
  * round trip: the caller already holds it, and printing it again only widens the
  * blast radius of a logged or screenshotted response. The placeholder is left in
  * place and the category is reported so the user knows why.
+ *
+ * **`CUSTOM` is deliberately absent.** Why not withhold a requester-named term:
+ * the requester typed the term into this very request, so withholding protects
+ * nothing they do not already hold — it is the one category where the
+ * "widens the blast radius" argument does not apply, because the reader of the
+ * answer is the person who supplied the string. Withholding it would instead
+ * break the answer: a reply about `⟦CUSTOM_1⟧` is unreadable to the person who
+ * asked about their own codename, and the feature's whole purpose is to let a
+ * frontier model reason about a confidential term and hand back something
+ * useful. The protection is that the term never crossed the boundary, not that
+ * it never comes back.
  */
 export const DEFAULT_WITHHELD_CATEGORIES: readonly string[] = [
   'API_KEY',

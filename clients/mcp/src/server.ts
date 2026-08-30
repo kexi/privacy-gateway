@@ -101,11 +101,23 @@ export function buildServer(options: BuildServerOptions = {}): McpServer {
           .string()
           .min(1)
           .describe('The request, in the clear; it is masked before it leaves.'),
+        mask_terms: z
+          .array(z.string().min(2).max(120))
+          .min(1)
+          .max(20)
+          .optional()
+          .describe(
+            'Extra phrases to mask verbatim, beyond what the detectors find — unreleased ' +
+              'product names, internal codenames, anything confidential that has no ' +
+              'detectable shape. Matched exactly and case-sensitively, so pass the term ' +
+              'with the capitalisation it actually uses. Each becomes a ⟦CUSTOM_n⟧ ' +
+              'placeholder and is restored in the answer you get back.',
+          ),
       },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
-    async ({ text }) => {
-      const result = await client.ask(text);
+    async ({ text, mask_terms: maskTerms }) => {
+      const result = await client.ask(text, maskTerms ?? []);
       if (!result.ok) return refusal(result);
 
       const payload = result.value;

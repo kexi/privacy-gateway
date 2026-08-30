@@ -43,6 +43,7 @@ export type SynthesisCaller = (
     knownTokens: readonly string[];
     vaultGeneration: number;
     rehydrateAllow: readonly string[];
+    maskTerms: readonly string[];
   },
   signal?: AbortSignal,
 ) => Promise<SynthesizeResponse>;
@@ -57,7 +58,11 @@ export type SpanExtractor = (text: string, signal?: AbortSignal) => Promise<Dete
  * guard still refuses — the guarantee that matters most here cannot be observed
  * while the tokenizer is working correctly.
  */
-export type Tokenize = (text: string, extra: readonly Detection[]) => TokenizeResult;
+export type Tokenize = (
+  text: string,
+  extra: readonly Detection[],
+  terms: readonly string[],
+) => TokenizeResult;
 
 /**
  * Called as each stage opens and closes, when the caller asked to be told.
@@ -117,6 +122,14 @@ export interface AskOptions {
    * on arrival. Empty by default, which is the existing behaviour exactly.
    */
   readonly rehydrateAllow?: readonly string[] | undefined;
+  /**
+   * Phrases the requester asked to have masked verbatim.
+   *
+   * Never logged: only `term_count` reaches a log line. The terms travel to the
+   * tokenizer, to the egress guard's term scan and on to Synthesis, all of which
+   * are inside the boundary; nothing here forwards them to Core.
+   */
+  readonly maskTerms?: readonly string[] | undefined;
   readonly vault: TokenVault;
   readonly callCore: CoreCaller;
   readonly callSynthesis: SynthesisCaller;
@@ -161,6 +174,7 @@ export class RequestAbortedError extends Error {
  */
 export async function ask(options: AskOptions): Promise<AskResult> {
   const { logger, requestId, vault, signal } = options;
+  const maskTerms = options.maskTerms ?? [];
 
   /**
    * Stop between steps once the deadline has fired.
@@ -233,11 +247,15 @@ export async function ask(options: AskOptions): Promise<AskResult> {
     checkpoint();
 
     const tokenize: Tokenize =
-      options.tokenize ?? ((text, detections) => tokenizer.tokenize(text, detections));
+      options.tokenize ??
+      ((text, detections, terms) => tokenizer.tokenize(text, detections, terms));
 
     const masked = await withSpan(SPAN.maskRegex, { request_id: requestId }, (span) => {
-      const value = tokenize(options.text, spans);
+      const value = tokenize(options.text, spans, maskTerms);
       span.setAttribute('placeholder_count', value.detections.length);
+      // A count, never a term: span attributes carry no PII value by rule, and a
+      // requester's codename is exactly the kind of value that rule exists for.
+      span.setAttribute('term_count', maskTerms.length);
       return Promise.resolve(value);
     });
     return { result: masked, extra: spans };
@@ -250,16 +268,29 @@ export async function ask(options: AskOptions): Promise<AskResult> {
   const entry = await vault.put(requestId, result.mapping, vaultTtlSeconds());
   checkpoint();
 
-  // 3. Egress guard: rerun the deterministic detection just before sending
-  //    (defense in depth).
+  // 3. Egress guard: rerun the deterministic detection just before sending, and
+  //    scan the outbound prompt for every requester-named term (defense in
+  //    depth). The term half is the stronger check of the two: it compares
+  //    literal strings rather than re-running the patterns that decided the
+  //    masking, so a substitution that silently failed cannot pass it.
   await staged('egress_guard', () =>
     withSpan(SPAN.guardEgress, { request_id: requestId }, (span) => {
-      const report = scan(maskedPrompt);
+      const report = scan(maskedPrompt, maskTerms);
       span.setAttribute('ok', report.ok);
       if (!report.ok) {
         span.setAttribute('categories', [...report.categories]);
-        logger.event('guard.egress.blocked', { categories: [...report.categories] }, 'ERROR');
-        throw new PiiLeakError(report.findings);
+        span.setAttribute('surviving_term_count', report.survivingTerms);
+        logger.event(
+          'guard.egress.blocked',
+          {
+            categories: [...report.categories],
+            // The count only. A refusal must not repeat the secret it refused
+            // to send.
+            ...(report.survivingTerms > 0 ? { surviving_term_count: report.survivingTerms } : {}),
+          },
+          'ERROR',
+        );
+        throw new PiiLeakError(report.findings, report.survivingTerms);
       }
       return Promise.resolve();
     }),
@@ -270,6 +301,10 @@ export async function ask(options: AskOptions): Promise<AskResult> {
     counts_by_category: counts,
     unstructured_spans: extra.length,
     vault_generation: entry.generation,
+    // How many terms the requester named, never which. `counts_by_category`
+    // already reports how many CUSTOM placeholders were actually allocated, so a
+    // term that matched nothing is visible as the difference between the two.
+    term_count: maskTerms.length,
   });
 
   // 4. Send only the masked prompt to Core, which sits outside the boundary.
@@ -314,6 +349,10 @@ export async function ask(options: AskOptions): Promise<AskResult> {
           knownTokens,
           vaultGeneration: entry.generation,
           rehydrateAllow: options.rehydrateAllow ?? [],
+          // Inside the boundary: Synthesis already holds every raw value behind
+          // every placeholder, and without the terms its attester cannot scan
+          // Core's output for a codename no regex knows.
+          maskTerms,
         },
         signal,
       );

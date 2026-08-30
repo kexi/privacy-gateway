@@ -151,6 +151,8 @@ interface SynthesisInput {
   readonly vaultGeneration: number;
   readonly requestId: string;
   readonly rehydrateAllow: readonly string[];
+  /** The requester's verbatim-mask terms; never leaves the boundary. */
+  readonly maskTerms: readonly string[];
 }
 
 /**
@@ -354,6 +356,9 @@ export function createApp(options: CreateAppOptions): express.Application {
         known_tokens: [...input.knownTokens],
         vault_generation: input.vaultGeneration,
         rehydrate_allow: [...input.rehydrateAllow],
+        // Sent only on this hop, which is Gateway → Synthesis: both ends are
+        // inside the boundary and this body never reaches Core.
+        ...(input.maskTerms.length > 0 ? { mask_terms: [...input.maskTerms] } : {}),
       }),
     });
 
@@ -400,6 +405,8 @@ export function createApp(options: CreateAppOptions): express.Application {
     text: string,
     /** The request's disclosure opt-in, already validated by the caller's schema. */
     rehydrateAllow: readonly string[],
+    /** The request's verbatim-mask terms, already validated by the caller's schema. */
+    maskTerms: readonly string[],
     onProgress?: (event: ProgressEvent) => void,
   ): Promise<AskResult> {
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
@@ -443,6 +450,7 @@ export function createApp(options: CreateAppOptions): express.Application {
                 text,
                 requestId: context.requestId,
                 rehydrateAllow,
+                maskTerms,
                 vault,
                 signal: controller.signal,
                 callCore: (maskedPrompt, signal) =>
@@ -520,7 +528,13 @@ export function createApp(options: CreateAppOptions): express.Application {
     logChatStart(context.logger, parsed.stream);
 
     try {
-      const result = await runAsk(req, context, parsed.text, parsed.rehydrateAllow);
+      const result = await runAsk(
+        req,
+        context,
+        parsed.text,
+        parsed.rehydrateAllow,
+        parsed.maskTerms,
+      );
       const completion = toChatCompletion(result, now(), parsed.rehydrateAllow);
 
       context.logger.event('openai.compat.chat.end', {
@@ -662,13 +676,14 @@ export function createApp(options: CreateAppOptions): express.Application {
     // is unaffected.
     const wantsStream = /text\/event-stream/u.test(req.headers.accept ?? '');
     const rehydrateAllow = parsed.data.rehydrate_allow ?? [];
+    const maskTerms = parsed.data.mask_terms ?? [];
     if (wantsStream) {
-      await handleAskStream(req, res, context, parsed.data.text, rehydrateAllow);
+      await handleAskStream(req, res, context, parsed.data.text, rehydrateAllow, maskTerms);
       return;
     }
 
     try {
-      res.json(toPayload(await runAsk(req, context, parsed.data.text, rehydrateAllow)));
+      res.json(toPayload(await runAsk(req, context, parsed.data.text, rehydrateAllow, maskTerms)));
     } catch (error) {
       handleAskError(error, res, context);
     }
@@ -696,6 +711,7 @@ export function createApp(options: CreateAppOptions): express.Application {
     context: RequestContext,
     text: string,
     rehydrateAllow: readonly string[],
+    maskTerms: readonly string[],
   ): Promise<void> {
     res.status(200);
     res.setHeader('content-type', 'text/event-stream; charset=utf-8');
@@ -712,7 +728,7 @@ export function createApp(options: CreateAppOptions): express.Application {
     };
 
     try {
-      const result = await runAsk(req, context, text, rehydrateAllow, (progress) => {
+      const result = await runAsk(req, context, text, rehydrateAllow, maskTerms, (progress) => {
         send('progress', progress);
       });
       send('result', toPayload(result));

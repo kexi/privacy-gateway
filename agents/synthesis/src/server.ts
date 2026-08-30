@@ -188,6 +188,10 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
             ...(input.rehydrate_allow !== undefined
               ? { rehydrateAllow: input.rehydrate_allow }
               : {}),
+            // Scanned against Core's output and then dropped. `persist` below is
+            // handed the masked prompt and the core response only, so no code
+            // path from here writes a term to the store.
+            ...(input.mask_terms !== undefined ? { maskTerms: input.mask_terms } : {}),
             vault,
             generatedBy: input.generated_by,
             logger: scoped,

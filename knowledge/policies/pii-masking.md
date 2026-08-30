@@ -4,7 +4,7 @@ title: PII masking policy
 description: What the gateway must mask before any text crosses the trust boundary, and what a response must satisfy before it is presented to a user.
 tags: [pii, security, policy]
 status: stable
-generated: { by: human:kei, at: 2026-08-24T00:00:00Z }
+generated: { by: claude_fleet_agent/opus-4, at: 2026-08-30T16:42:59Z }
 verified:
   - { by: human:kei, at: 2026-08-24T00:00:00Z }
 ---
@@ -31,11 +31,22 @@ placeholder of the form `⟦CATEGORY_N⟧`:
 | API keys and secrets        | `⟦API_KEY_n⟧`, `⟦AWS_KEY_n⟧`, `⟦JWT_n⟧` | regex                 |
 | Person name                 | `⟦PERSON_n⟧`                            | Gemma span extraction |
 | Postal address              | `⟦ADDRESS_n⟧`                           | Gemma span extraction |
+| Requester-named term        | `⟦CUSTOM_n⟧`                            | exact string match    |
 
 Structured identifiers are detected deterministically so that coverage is auditable and
 reproducible. Unstructured entities (names, addresses) are extracted by the self-hosted
 Gemma model, which never leaves the boundary. Where the two disagree on an overlapping
 span, the deterministic detector wins.
+
+`CUSTOM` is the exception to both: nothing detects it. An unreleased product name or an
+internal codename has no lexical form a regex could match and no public meaning a model
+could recognise — its confidentiality is a fact about the enterprise, not about the
+string. The requester therefore supplies the exact phrase in `mask_terms`, and it is
+substituted **before** every detector runs. Matching is case-sensitive, because a
+codename's case is part of its identity and folding it would mask ordinary prose nobody
+asked to hide. Where a requester-named term overlaps a detected span, the term wins: an
+explicit assertion that a string is confidential outranks a heuristic, and splitting the
+term would leave part of it in the clear.
 
 # What this is, and is not
 
@@ -70,6 +81,12 @@ screenshotted. The placeholder stays in place and the withheld categories are li
 the answer's `attestation.withheld`. `REHYDRATE_ALLOW_CATEGORIES` can re-enable specific
 categories for a deployment with a stated purpose.
 
+`CUSTOM` is **not** in that set and is restored by default. The requester supplied the
+term in this same request, so withholding it protects nothing they do not already hold,
+while a released answer full of `⟦CUSTOM_1⟧` is unreadable to the person who asked about
+their own codename. The guarantee for a requester-named term is that it never crossed the
+boundary, not that it never comes back.
+
 # Egress guard
 
 Masking is re-verified immediately before the A2A call to the Core Agent. If the
@@ -77,6 +94,20 @@ deterministic detector finds any raw identifier in the outbound text, the reques
 refused rather than sent. This is defense in depth: it catches a tokenizer regression or
 a missed span before it becomes a disclosure, and it does not depend on the model
 behaving correctly.
+
+The guard additionally scans the outbound text for each requester-named term as a literal
+string, and the deterministic attester performs the same scan over the Core Agent's
+response. Either finding refuses the request under category `CUSTOM`. This is the only
+check in the system that can _prove_ the masking applied: every other guard check re-runs
+the same patterns that decided the masking and can therefore only catch a fault over
+shapes it already knows, whereas a literal comparison catches a failed substitution
+outright.
+
+Requester-named terms are never persisted. They exist in the request, in the token vault
+alongside every other masked value, and in the two scans above. The audit record carries
+`attestation.custom_terms: {count: N}` — a count, never a term and never a digest of one,
+because a codename is drawn from a small guessable space and a hash of it would be a
+confirmation oracle rather than a redaction.
 
 # Response requirements
 

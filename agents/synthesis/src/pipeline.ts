@@ -31,7 +31,9 @@ import {
   categoryOf,
   COMPUTATION_RESOURCE,
   computationSha256,
+  countSurvivingTerms,
   currentTraceId,
+  CUSTOM_CATEGORY,
   dump,
   filterHighRiskCategories,
   filterPiiCategories,
@@ -242,6 +244,19 @@ export interface SynthesizeOptions {
    */
   readonly rehydrateAllow?: readonly string[] | undefined;
   /**
+   * The phrases the requester asked to have masked verbatim.
+   *
+   * Used for one thing: scanning Core's tokenized output for a term that came
+   * back in the clear. That check is per-request by nature — the terms are known
+   * only to this request — so it sits beside the attester rather than inside it:
+   * the bundled attester must stay replayable by a third party from a receipt,
+   * and a receipt carrying enterprise codenames is a receipt nobody can publish.
+   *
+   * Scanned and discarded. Nothing here persists a term, and the evidence
+   * document records only `custom_terms: {count}`.
+   */
+  readonly maskTerms?: readonly string[] | undefined;
+  /**
    * The rehydration step, injectable.
    *
    * Exists so a test can observe *whether* it was reached, which is the whole
@@ -351,6 +366,10 @@ function assembleWithin(
         ? { disclosureRequested: attestation.disclosure_requested }
         : {}),
       ...(attestation.rehydration !== undefined ? { rehydration: attestation.rehydration } : {}),
+      // A count, lifted for the same reason the two above are: a reader must be
+      // able to see that the term scan ran. It is the one part of the custom-term
+      // feature that is safe to write down.
+      ...(attestation.custom_terms !== undefined ? { customTerms: attestation.custom_terms } : {}),
     },
     ...(inputs.traceId !== undefined ? { traceId: inputs.traceId } : {}),
   });
@@ -613,7 +632,14 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
   // --- gate 2: Core must not have invented placeholders. ------------------
   const consistency = checkConsistency(options.knownTokens, coreAnswer);
 
-  // --- gate 3: the deterministic leak check. ------------------------------
+  // --- gate 3: the deterministic leak check, plus this request's term scan. --
+  //
+  // Two deterministic checks over the same text, kept separate because they are
+  // replayable by different parties. The attester's verdict comes from a receipt
+  // any third party can re-run; the term scan can only be run by something
+  // holding the requester's terms, which is to say inside this boundary. Folding
+  // the terms into the receipt would make the bundled attestation unpublishable.
+  const maskTerms = options.maskTerms ?? [];
   const verdict = await withSpan(
     SPAN.attestLeakCheck,
     { request_id: requestId },
@@ -621,17 +647,29 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       const result = verify(buildReceipt(requestId, maskedPrompt, coreAnswer));
       span.setAttribute('verdict', result.ok ? 'pass' : 'fail');
       span.setAttribute('findings', result.findings);
+      span.setAttribute('term_count', maskTerms.length);
       return Promise.resolve(result);
     },
   );
   const verdictFindings = filterPiiCategories(verdict.findings).categories;
 
+  // A term surviving in Core's output means the frontier model was shown the
+  // codename, or reproduced it from something it was shown. Either way the
+  // protection the requester explicitly asked for did not hold, and no regex
+  // anywhere in this fleet would have noticed: this scan is the only coverage
+  // the category has on the way back.
+  const survivingTerms = countSurvivingTerms(coreAnswer, maskTerms);
+
   const attestation: Attestation = {
-    ok: verdict.ok && consistency.ok,
+    ok: verdict.ok && consistency.ok && survivingTerms === 0,
     reason: verdict.ok ? consistency.reason : verdict.reason,
     findings: verdictFindings,
     details: verdict.details,
   };
+  // Recorded whenever terms were named, on a release and on a refusal alike: the
+  // audit trail should show that the scan ran and over how many terms, not only
+  // when it happened to find something. Never the terms themselves.
+  if (maskTerms.length > 0) attestation.custom_terms = { count: maskTerms.length };
 
   logger?.event('attest.verdict', {
     verdict: attestation.ok ? 'pass' : 'fail',
@@ -667,6 +705,32 @@ export async function synthesize(options: SynthesizeOptions): Promise<SynthesisR
       consistency,
       verdictFindings,
       verdictFindings,
+    );
+  }
+  if (survivingTerms > 0) {
+    attestation.ok = false;
+    attestation.reason ??= 'the response contains a term the request asked to have masked';
+    logger?.event(
+      'release.refused',
+      {
+        refusal: 'leak_check_failed',
+        categories: [CUSTOM_CATEGORY],
+        // The count, never the term. This log line is the audit trail for a
+        // codename leak; writing the codename into it would be the leak.
+        surviving_term_count: survivingTerms,
+      },
+      'ERROR',
+    );
+    refuse(
+      'leak_check_failed',
+      // The same public message every content refusal carries. A caller learns
+      // the category (CUSTOM) and nothing more specific: naming which of their
+      // terms came back would confirm the term to anyone reading the response.
+      'the leak check failed',
+      attestation,
+      consistency,
+      verdictFindings,
+      [CUSTOM_CATEGORY],
     );
   }
 

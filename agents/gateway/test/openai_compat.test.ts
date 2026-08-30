@@ -591,3 +591,74 @@ describe('the disclosure opt-in over the compat surface', () => {
     expect(promptsSeenByCore).toHaveLength(0);
   });
 });
+
+describe('user-defined secret terms over the compat surface', () => {
+  const WITH_CODENAME = 'Summarize the status of Titan Project for the board.';
+
+  it('masks a named term before the prompt crosses the boundary', async () => {
+    await startFleet(echoAllTokens);
+
+    const response = await chat(
+      standardBody(WITH_CODENAME, { x_privacy_gateway: { mask_terms: ['Titan Project'] } }),
+    );
+    expect(response.status).toBe(200);
+
+    // The masked prompt is what Core actually received, and it is also echoed
+    // back in the extension so an aware client can see the boundary held.
+    expect(promptsSeenByCore).toHaveLength(1);
+    expect(promptsSeenByCore[0]).not.toContain('Titan Project');
+    expect(promptsSeenByCore[0]).toContain('⟦CUSTOM_1⟧');
+
+    const body = OpenAiChatCompletionResponseSchema.parse(await response.json());
+    expect(body.x_privacy_gateway.masked_prompt).not.toContain('Titan Project');
+  });
+
+  it('restores the term in the answer, because the requester supplied it', async () => {
+    await startFleet(echoAllTokens);
+
+    const response = await chat(
+      standardBody(WITH_CODENAME, { x_privacy_gateway: { mask_terms: ['Titan Project'] } }),
+    );
+    const body = OpenAiChatCompletionResponseSchema.parse(await response.json());
+
+    expect(body.choices[0]?.message.content).toContain('Titan Project');
+    // CUSTOM is deliberately not in the withheld set: withholding a term the
+    // requester typed protects nothing and makes the answer unreadable.
+    expect(body.x_privacy_gateway.withheld).not.toContain('CUSTOM');
+  });
+
+  it('rejects a malformed term without sending anything', async () => {
+    await startFleet();
+
+    const response = await chat(
+      standardBody(WITH_CODENAME, { x_privacy_gateway: { mask_terms: ['a'] } }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('rejects a term carrying the reserved delimiters', async () => {
+    await startFleet();
+
+    const response = await chat(
+      standardBody(WITH_CODENAME, { x_privacy_gateway: { mask_terms: ['⟦CUSTOM_1⟧'] } }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+
+  it('rejects a misspelled key rather than silently masking nothing', async () => {
+    // The one failure mode an explicit masking request must not have: a caller
+    // believing a codename was hidden when the field was ignored.
+    await startFleet();
+
+    const response = await chat(
+      standardBody(WITH_CODENAME, { x_privacy_gateway: { mask_term: ['Titan Project'] } }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(promptsSeenByCore).toHaveLength(0);
+  });
+});

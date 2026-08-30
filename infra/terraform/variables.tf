@@ -33,7 +33,7 @@ variable "gemma_model" {
     This must match the tag baked into the image by `just build gemma`.
   EOT
   type        = string
-  default     = "gemma3:12b"
+  default     = "gemma4:12b"
 }
 
 variable "image_tag" {

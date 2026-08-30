@@ -66,8 +66,9 @@ UI のレビュー識別は常に「なし」と表示される。
 ```
 User ──HTTP──▶ Gateway (Gemma)
                  │ 0. 予約構文 ⟦…⟧ を拒否                  (400 reserved_syntax)
-                 │ 1. 検出 + トークン化  ──▶ Firestore Token Vault (request_id → {token: value})
-                 │ 2. egress ガードによる再スキャン         (422 outbound_guard_refused)
+                 │ 1. mask_terms 置換 → 検出 + トークン化
+                 │                       ──▶ Firestore Token Vault (request_id → {token: value})
+                 │ 2. egress ガード再スキャン + 語句スキャン (422 outbound_guard_refused)
                  ▼ A2A
                Core (Gemini 3.5)  — トークン上での推論 / プランニング / コード生成
                  │ マスク済み回答
@@ -75,7 +76,7 @@ User ──HTTP──▶ Gateway (Gemma)
                Synthesis (Gemma)
                  │ 3. Vault 参照 + generation 検証          (409/410)
                  │ 4. 整合性チェック                        (409 invented_token)
-                 │ 5. リークチェック                        (422 leak_check_failed)
+                 │ 5. リークチェック + 語句スキャン          (422 leak_check_failed)
                  │ 6. Gemma ジャッジ（助言的・非対称）      (422 judge_flagged / judge_unavailable)
                  │ 7. 開示ポリシーに従ってリハイドレート    (409 unresolved_token)
                  │    (既定の抑制集合 − env 許可 − リクエストの rehydrate_allow)
@@ -99,11 +100,13 @@ User ──HTTP──▶ Gateway (Gemma)
 | 生入力に予約構文 `⟦…⟧`                                          | `400 reserved_syntax`（マスキング前、Vault 書き込み前）                                |
 | Gemma のスパン抽出（`valid-empty` / `valid-spans` / `invalid`） | `invalid` またはトランスポート障害 → `502 extraction_unavailable`。Core には到達しない |
 | egress ガードがマスク済みプロンプト中に生 PII を検出            | `422 outbound_guard_refused`                                                           |
+| egress ガードがマスク済みプロンプト中に指定語句を検出           | `422 outbound_guard_refused`、カテゴリ `CUSTOM`                                        |
 | Vault マッピングが存在しない                                    | `409 vault_missing`                                                                    |
 | Vault マッピングが失効                                          | `410 vault_expired`                                                                    |
 | Vault の generation 不一致                                      | `409 vault_generation_mismatch`                                                        |
 | Core がプロンプトに無いプレースホルダを捏造                     | `409 invented_token`                                                                   |
 | 決定的リークチェックが失敗                                      | `422 leak_check_failed`                                                                |
+| Core の回答に依頼者が指定した語句が含まれる                     | `422 leak_check_failed`、カテゴリ `CUSTOM`                                             |
 | Gemma ジャッジが `leak: true` を返す                            | `422 judge_flagged`                                                                    |
 | Gemma ジャッジが利用不能 / 有効な判定なし                       | `422 judge_unavailable`                                                                |
 | リハイドレート後も未解決のプレースホルダが残る                  | `409 unresolved_token`                                                                 |
@@ -151,6 +154,52 @@ release に変えることは決してない。最初の判定が根拠カテゴ
 flag が止むまで振り直すのは検証ではなく茶番になる。非対称性は不変で、ジャッジは
 これまでもリリースを保証したことがなく、今や自分自身の flag を取り消すことすら
 できない。
+
+### ユーザー定義の秘匿語句
+
+検出器が扱えるのは**形**である。メールアドレスはメールアドレスらしく見え、
+カード番号は Luhn チェックサムを持ち、人名は Gemma が認識できる。しかし未発表の
+製品名や社内コードネームにはそうした手がかりが何もない。機密性は文字列の性質では
+なく企業側の事実であり、どんな正規表現もモデルもそれを守るべきだと知りようがない。
+
+そこで依頼者自身が指定する。`POST /v1/ask` は任意の `mask_terms: string[]`
+（1〜20 件、trim 後 2〜120 文字、`⟦`/`⟧` を含まない、大小文字を保ったまま重複排除）
+を受け取る。各語句は**すべての検出器より前**に走る完全一致置換で `⟦CUSTOM_n⟧` に
+置き換えられ、マッピングは他のカテゴリと同様に Vault へ入る。語句と重なった正規
+表現の検出結果は破棄される。「この文字列は機密だ」という依頼者の宣言はヒューリス
+ティクスに優先し、コードネームを分割すればその一部が平文のまま残ってしまうからだ。
+
+**マッチングは大小文字を区別する。** case-insensitive にしない理由: コードネームの
+大小文字はその同一性の一部であり、未発表製品の `Titan` と "titanium alloy" の中の
+`titan` は別の意味を持つ別の文字列である。case を畳むと依頼者が隠すよう求めていない
+通常の文章までマスクしてしまい、Core に推論させるプロンプトを壊す。両方の綴りを
+隠したい依頼者は両方を指定すればよい。
+
+**`CUSTOM` は withheld されない。** §9 の高リスク 5 カテゴリと違い、既定でリハイド
+レートされる。withheld にしない理由: 依頼者はまさにこのリクエストにその語句を自分で
+入力しており、伏せても依頼者が既に持っている情報を守ることにはならない。むしろ回答
+が壊れる — 自分のコードネームについて尋ねた人にとって `⟦CUSTOM_1⟧` を含む回答は
+読めない。守られているのは「語句が境界を越えなかった」ことであって、「戻ってこない」
+ことではない。
+
+**語句は境界チェックの中で最も強い。** egress ガードは送出するマスク済みプロンプトを、
+Synthesis の attester は Core のトークン化済み出力を、それぞれリクエスト単位で
+リテラル走査する。どちらかが語句を見つけた時点でリクエストは拒否される
+（`422 outbound_guard_refused` / `422 leak_check_failed`、カテゴリ `CUSTOM`）。
+ガードの他のチェックはマスキングを決めたのと同じパターンを再実行するだけなので、
+既知の形についてのトークナイザのバグしか捕まえられない。語句はリテラル文字列として
+比較されるため、置換がどこかで失敗していれば必ず検出される。マスキングが機能したことを
+**証明**できる唯一のカテゴリである。
+
+語句が流れるのは Gateway → Synthesis のみ（どちらも境界の内側であり、Synthesis は
+そもそも全プレースホルダの生の値を保持している）で、**永続化はしない**。OKF ドキュメント
+が記録するのは `attestation.custom_terms: {count: N}` だけである。語句ごとのダイジェスト
+にしない理由: コードネームは推測可能な小さい空間から選ばれるため、そのハッシュは
+秘匿ではなく確認オラクルになる。ログに載るのは `term_count` と `surviving_term_count`
+のみで、ログの allowlist には語句が入り得るフィールドが存在しない。
+
+同じリストは OpenAI 互換エンドポイントの `x_privacy_gateway: {mask_terms}` と
+MCP の `pgw_ask` でも受け付ける。
 
 ### 匿名化ではなく仮名化
 
@@ -241,15 +290,15 @@ Synthesis はパッケージのエントリポイントを import する。
 
 ## 7. API サーフェス
 
-| ルート                              | メソッド | 用途                                                                                                                                                                                                                                                                              |
-| ----------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/v1/ask`                           | POST     | `{text}` と任意の `rehydrate_allow`（§9）。リハイドレート済みの回答、OKF markdown、`trust_tier`、`status`、4 つの `dimensions`、`attestation`、`consistency`、`stats` を返す。ボディに `session_id`（または他の未知のフィールド — スキーマは `strict()`）が含まれていれば `400`。 |
-| `/v1/requests/:id`                  | GET      | 当該リクエストのマスク済み OKF 証跡ドキュメント。                                                                                                                                                                                                                                 |
-| `/v1/requests/:id/masked-prompt.md` | GET      | Core へ送られたマスク済みプロンプト（OKF `sources[]` のターゲット）。                                                                                                                                                                                                             |
-| `/v1/requests/:id/core-response.md` | GET      | Core のトークン化済み応答（OKF `sources[]` のターゲット）。                                                                                                                                                                                                                       |
-| `/v1/chat/completions`              | POST     | 同一パイプライン・同一ゲートの OpenAI 互換ファサード。`system`/`user` の content を連結し `assistant` ターンは捨てる。プライバシー情報は `x_privacy_gateway` で運ぶ。拒否はステータスを保ったまま返り、200 の謝罪文にはならない。                                                 |
-| `/v1/models`                        | GET      | OpenAI 互換のモデル一覧。ID は `privacy-gateway` ただ 1 つ — 呼び出し側が選ぶのは背後のモデルではなくフリートである。                                                                                                                                                             |
-| `/healthz`                          | GET      | 死活監視。                                                                                                                                                                                                                                                                        |
+| ルート                              | メソッド | 用途                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/v1/ask`                           | POST     | `{text}` と任意の `rehydrate_allow`（§9）・`mask_terms`（§3）。リハイドレート済みの回答、OKF markdown、`trust_tier`、`status`、4 つの `dimensions`、`attestation`、`consistency`、`stats` を返す。ボディに `session_id`（または他の未知のフィールド — スキーマは `strict()`）が含まれていれば `400`。 |
+| `/v1/requests/:id`                  | GET      | 当該リクエストのマスク済み OKF 証跡ドキュメント。                                                                                                                                                                                                                                                     |
+| `/v1/requests/:id/masked-prompt.md` | GET      | Core へ送られたマスク済みプロンプト（OKF `sources[]` のターゲット）。                                                                                                                                                                                                                                 |
+| `/v1/requests/:id/core-response.md` | GET      | Core のトークン化済み応答（OKF `sources[]` のターゲット）。                                                                                                                                                                                                                                           |
+| `/v1/chat/completions`              | POST     | 同一パイプライン・同一ゲートの OpenAI 互換ファサード。`system`/`user` の content を連結し `assistant` ターンは捨てる。プライバシー情報は `x_privacy_gateway` で運ぶ。拒否はステータスを保ったまま返り、200 の謝罪文にはならない。                                                                     |
+| `/v1/models`                        | GET      | OpenAI 互換のモデル一覧。ID は `privacy-gateway` ただ 1 つ — 呼び出し側が選ぶのは背後のモデルではなくフリートである。                                                                                                                                                                                 |
+| `/healthz`                          | GET      | 死活監視。                                                                                                                                                                                                                                                                                            |
 
 承認ルート・ティア参照ルート・セッション単位の回答ルートは存在しない:
 `POST /v1/sessions/:id/approve`、`GET /v1/sessions/:id/tier`、
@@ -444,8 +493,11 @@ UI は 4 つのディメンションを**別々に**表示し、1 つのバッ�
   `stale_after` は Vault の失効時刻、いずれかのゲートが失敗すれば `status: draft`。
 - トップレベルの `attestation:` ブロックが `computation`、`computation_sha256`、
   `attester_sha256`、`masked_prompt_sha256`、`core_response_sha256`、`verdict`、
-  `checked_at`、`request_id`、`trace_id`、該当する場合は `withheld` を保持する —
-  第三者がこのフリートを信頼せずに判定を再現できるだけの情報が揃っている。
+  `checked_at`、`request_id`、`trace_id`、該当する場合は `withheld` と
+  `custom_terms: {count: N}` を保持する — 第三者がこのフリートを信頼せずに判定を
+  再現できるだけの情報が揃っている。`custom_terms` は**件数のみ**である: 語句は
+  その性質上機密であり（§3）、ダイジェストにしても秘匿ではなく確認オラクルになる
+  ため、記録するのは「スキャンが何件を対象に走った」ことだけに留める。
   `just verify-answer <request_id>` で再現できる。
 - 壊れた `verified` エントリ（`by` が欠落または文字列でない）は信頼ティア導出の対象から
   除外されるため、破損したフィールドはクラッシュしたり過剰に信頼したりせず `unverified`

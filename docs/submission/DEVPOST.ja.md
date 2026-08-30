@@ -4,6 +4,7 @@
 
 - **カテゴリ**: Fortified Enterprise Fleet（Best Architectural Design も対象）
 - **一言**: 自前 GPU の Gemma が機密を預かり、Gemini 3.5 はプレースホルダだけで推論。全回答に再実行可能な leak-check attestation（OKF v0.2）が付く。OpenAI 互換でどのツールからも「モデルとして」選べ、Claude Desktop からは MCP で使える。
+- **ユーザー定義の秘匿語句**: 未発表の製品名や社内コードネームには検出できる形がないため、依頼者が `mask_terms` で指定すると全検出器より前に ⟦CUSTOM_1⟧ へ置換される。境界の両スキャンがリテラル文字列を探すので、マスキングが機能したことを*証明*できる唯一のチェックになる（他は判定に使ったパターンの再実行にすぎない）。語句は永続化せず、監査記録は件数のみを残す
 - **構成**: Gateway(Gemma/RTX PRO 6000) → A2A → Core(ADK TS + gemini-3.5-flash, Firestore 権限なし) → Synthesis(Gemma, fail-closed ゲート群) → OKF 文書
 - **苦労した点**: L4 枯渇→RTX PRO 6000 切替 / gemini-3.5-flash は global エンドポイント限定 / 「拒否時に復元しない」を構造で保証するリファクタ / internal ingress + Direct VPC egress の罠
 - **学び**: 仮名化は匿名化ではない。信頼は「主張」ではなく「再実行できる証明」で示す

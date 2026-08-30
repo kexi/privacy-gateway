@@ -54,6 +54,24 @@ When the result renders, hover the masked prompt panel:
 > ⟦PHONE_1⟧, ⟦CARD_1⟧. The mapping lives in Firestore with a TTL — keyed to
 > this one request."
 
+**Optional beat (~15s) — the secret no detector could find.** If the pacing
+allows, run a second request with a codename in the "Additionally mask these
+phrases" field:
+
+```
+Summarize the status of Titan Project for the board, in two lines.
+```
+
+Terms: `Titan Project`. Point at the masked prompt panel, then the answer.
+
+> Caption: "No regex knows 'Titan Project' is confidential — that's a fact about
+> the company, not about the string. So you name it, and it crosses the boundary
+> as ⟦CUSTOM_1⟧. The guard then looks for the literal words in the outbound
+> prompt: it's the one check that proves the masking worked instead of re-running
+> the pattern that decided it. You get the name back; Gemini never saw it."
+
+Skip this beat if the run is over time — the core story stands without it.
+
 ### 1:10–1:45 — The tokenized answer and the audit document (T1)
 
 Scroll to the final answer, then the OKF panel.

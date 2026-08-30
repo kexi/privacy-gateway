@@ -480,14 +480,20 @@ describe('the MCP surface is text-only', () => {
     const { tools } = await client.listTools();
     const ask = tools.find((tool) => tool.name === 'pgw_ask');
 
-    // The schema has one property and it is a string, so there is no shape an
-    // image or an audio clip could arrive in. The gateway behind it masks with
-    // regexes and a text model and cannot redact what it cannot read, so this
-    // is a guarantee rather than a simplification — a future `content` array
-    // here would need the same explicit refusal the OpenAI façade carries.
-    const schema = ask?.inputSchema as { properties?: Record<string, { type?: string }> };
-    expect(Object.keys(schema.properties ?? {})).toEqual(['text']);
+    // Every property is text-shaped, so there is no shape an image or an audio
+    // clip could arrive in. The gateway behind it masks with regexes and a text
+    // model and cannot redact what it cannot read, so this is a guarantee rather
+    // than a simplification — a future `content` array here would need the same
+    // explicit refusal the OpenAI façade carries.
+    const schema = ask?.inputSchema as {
+      properties?: Record<string, { type?: string; items?: { type?: string } }>;
+    };
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(['mask_terms', 'text']);
     expect(schema.properties?.['text']?.type).toBe('string');
+    // The terms are an array of strings and nothing else: a term is matched by
+    // literal comparison, so anything that is not a string has no meaning here.
+    expect(schema.properties?.['mask_terms']?.type).toBe('array');
+    expect(schema.properties?.['mask_terms']?.items?.type).toBe('string');
   });
 
   it('rejects a structured content array in place of the text', async () => {
@@ -503,5 +509,59 @@ describe('the MCP surface is text-only', () => {
     });
 
     expect(result.isError).toBe(true);
+  });
+});
+
+describe('pgw_ask forwards user-defined secret terms', () => {
+  /** A gateway double that records the body it was posted. */
+  function capturingGateway(bodies: unknown[]): typeof fetch {
+    return ((input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input.toString());
+      if (url.pathname !== '/v1/ask') {
+        return Promise.resolve(new Response('{}', { status: 404 }));
+      }
+      bodies.push(JSON.parse(String(init?.body ?? '{}')));
+      return Promise.resolve(jsonResponse(ASK_SUCCESS));
+    }) as typeof fetch;
+  }
+
+  it('sends mask_terms through to the gateway', async () => {
+    const bodies: unknown[] = [];
+    client = await connect(capturingGateway(bodies));
+
+    await client.callTool({
+      name: 'pgw_ask',
+      arguments: { text: 'Status of the project?', mask_terms: ['Titan Project'] },
+    });
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toEqual({
+      text: 'Status of the project?',
+      mask_terms: ['Titan Project'],
+    });
+  });
+
+  it('omits the field entirely when the caller names no terms', async () => {
+    // An empty array would fail the gateway's `min(1)`, so "asked for nothing"
+    // has to be encoded as an absent field rather than an empty one.
+    const bodies: unknown[] = [];
+    client = await connect(capturingGateway(bodies));
+
+    await client.callTool({ name: 'pgw_ask', arguments: { text: 'Hello.' } });
+
+    expect(bodies[0]).toEqual({ text: 'Hello.' });
+  });
+
+  it('refuses a term the tool schema rejects, before anything is sent', async () => {
+    const bodies: unknown[] = [];
+    client = await connect(capturingGateway(bodies));
+
+    const result = await client.callTool({
+      name: 'pgw_ask',
+      arguments: { text: 'Hello.', mask_terms: ['a'] },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(bodies).toHaveLength(0);
   });
 });

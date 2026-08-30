@@ -95,6 +95,16 @@ curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
 
+検出器が守るべきと知りようのないもの — 未発表の製品名や社内コードネーム — には
+`mask_terms` を添える:
+
+```bash
+curl -sS https://privacy-gateway.kexi.dev/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"Summarize the status of Titan Project for the board.",
+       "mask_terms":["Titan Project"]}'
+```
+
 `just urls` はこの一覧を Terraform から再生成し、`just health` は ID トークン付きで全サービス
 の死活を確認する。
 
@@ -231,6 +241,45 @@ UI ではチェックボックス群として提供し、既定はすべてオ�
 呼び出し元ではなく我々のバグなので唯一の 5xx 拒否である — となり、本文は他の拒否と同様に
 withheld される。リリース時には `attestation.rehydration: {substituted, withheld_remaining,
 verdict}` が付く。
+
+## ユーザー定義の秘匿語句
+
+検出が扱えるのは**形**である。メールアドレスはメールアドレスらしく見え、カード番号は
+チェックサムを持ち、人名は Gemma が認識できる。未発表の製品名や社内コードネームには
+その手がかりが一切ない。機密性は文字列の性質ではなく企業側の事実であり、どんな正規表現も
+モデルもそれを守るべきだと知りようがない。
+
+そこで依頼者自身が指定する。`POST /v1/ask` は任意の `mask_terms: ["Titan Project"]`
+（1〜20 件、各 2〜120 文字、`⟦`/`⟧` 不可）を受け取り、OpenAI 互換エンドポイントは
+`x_privacy_gateway: {mask_terms}` で同じリストを受け取り、MCP の `pgw_ask` には
+`mask_terms` パラメータがあり、デモ UI にはチップのプレビュー付きのカンマ区切り入力欄が
+ある。各語句は**すべての検出器より前**に走る完全一致置換で `⟦CUSTOM_n⟧` になる。長い語句
+から順に置換されるので、`Titan` と `Titan Project` の両方を指定しても長い方が 1 つの
+プレースホルダになり、分割されない。
+
+**マッチングは大小文字を区別する。** コードネームの大小文字はその同一性の一部であり、
+製品名の `Titan` は "titanium alloy" の中の `titan` ではない。case を畳むと誰も隠すよう
+求めていない通常の文章までマスクし、Core が推論するプロンプトを壊してしまう。両方の綴りを
+隠したいなら両方を指定する。
+
+`CUSTOM` は **withheld されない**。上記の高リスク 5 カテゴリと違い、語句は既定で回答に
+復元される。依頼者はまさにこのリクエストにその語句を入力しており、伏せても依頼者が既に
+持っている情報を守ることにはならないし、自分のコードネームについて尋ねた人にとって
+`⟦CUSTOM_1⟧` を含む回答は読めない。守っているのは「語句が境界を越えなかった」ことである。
+
+**これは境界上で最も強いチェックである。** egress ガード（送出するマスク済みプロンプト）
+と決定的アテスタ（Core のトークン化済み回答）の両方が各語句をリテラル走査し、どちらかが
+見つけた時点でリクエストを拒否する — `422 outbound_guard_refused` あるいは
+`422 leak_check_failed`、カテゴリは `CUSTOM`。ガードの他のチェックはマスキングを決めたのと
+同じパターンの再実行にすぎず、既知の形についてのトークナイザのバグしか捕まえられない。
+リテラル比較なら置換の失敗をそのまま捕捉できる。マスキングが機能したことを**証明**できる
+唯一のカテゴリである。
+
+語句は永続化されない。Gateway → Synthesis（どちらも境界の内側）を流れるだけで、監査記録が
+保持するのは `attestation.custom_terms: {count: N}` のみ。ダイジェストにしない理由は、
+コードネームが推測可能な小さい空間から選ばれるため、そのハッシュが秘匿ではなく確認オラクル
+になるからである。ログに載るのは `term_count` と `surviving_term_count` だけで、ログの
+allowlist には語句が入り得るフィールドが存在しない。
 
 ## 設計としてのテキスト専用
 
@@ -449,7 +498,7 @@ just verify-auth-internal   # VPC 内から: IAM が正当な呼び出し元を�
 
 | メソッド | パス                                 | 用途                                                                                                                                                                                                   |
 | -------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `POST`   | `/v1/ask`                            | `{text}` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計                                                                              |
+| `POST`   | `/v1/ask`                            | `{text}` と任意の `rehydrate_allow` / `mask_terms` → マスク済みプロンプト、復元済み回答（一時的）、OKF 文書、4 つの trust dimension、attestation、consistency、統計                                    |
 | `GET`    | `/v1/requests/{id}`                  | 保存済みの**マスク済み** OKF evidence ドキュメント（Markdown）                                                                                                                                         |
 | `GET`    | `/v1/requests/{id}/masked-prompt.md` | Core に送られたマスク済みプロンプト                                                                                                                                                                    |
 | `GET`    | `/v1/requests/{id}/core-response.md` | Core からのまだトークン化されたままの応答                                                                                                                                                              |

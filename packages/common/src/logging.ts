@@ -98,6 +98,12 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   text_length: 'number',
   tokens_withheld: 'number',
   dropped_categories: 'number',
+  // Requester-supplied verbatim-mask terms. Counts only, and deliberately no
+  // field anywhere in this table can carry a term: a term is an enterprise
+  // secret, and the whole reason someone names one is that it must not be
+  // written down outside the request and the vault.
+  term_count: 'number',
+  surviving_term_count: 'number',
   // Cost kill switch. Billing figures carry no PII: they are project-level
   // aggregates in the billing account's currency, published by Google's own
   // budget notifier rather than derived from any request.

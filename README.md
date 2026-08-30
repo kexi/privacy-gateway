@@ -93,6 +93,16 @@ curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
 
+Add `mask_terms` for anything the detectors could not know to protect — an unreleased
+product name, an internal codename:
+
+```bash
+curl -sS https://privacy-gateway.kexi.dev/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"Summarize the status of Titan Project for the board.",
+       "mask_terms":["Titan Project"]}'
+```
+
 `just urls` regenerates this list from Terraform, and `just health` probes every service
 with an ID token.
 
@@ -231,6 +241,46 @@ appeared (the attester re-run over the released text minus the values restored o
 purpose). A violation is `500 rehydration_incomplete` — the only 5xx refusal, because it
 is our bug rather than the caller's — and the body is withheld like any other refusal.
 Releases carry `attestation.rehydration: {substituted, withheld_remaining, verdict}`.
+
+## User-defined secret terms
+
+Detection covers _shapes_ — an email looks like an email, a card number carries a
+checksum, a personal name is something Gemma recognises. An unreleased product name or an
+internal codename has no shape at all: its confidentiality is a fact about the enterprise,
+not about the string, so no regex and no model can know to protect it.
+
+So the requester names it. `POST /v1/ask` takes an optional
+`mask_terms: ["Titan Project"]` (1–20 terms, 2–120 characters each, no `⟦`/`⟧`), the
+OpenAI-compatible endpoint takes the same list under `x_privacy_gateway: {mask_terms}`,
+MCP `pgw_ask` takes a `mask_terms` parameter, and the demo UI has a comma-separated field
+with a chip preview. Each term becomes a `⟦CUSTOM_n⟧` placeholder in an exact-match pass
+that runs **before** every detector; longer terms substitute first, so naming both `Titan`
+and `Titan Project` yields one placeholder for the longer phrase rather than splitting it.
+
+**Matching is case-sensitive.** A codename's case is part of its identity — `Titan` the
+product is not `titan` inside "titanium alloy" — so folding case would mask ordinary prose
+nobody asked to hide and mangle the prompt Core reasons about. Name both spellings to mask
+both.
+
+`CUSTOM` is **not** withheld: unlike the five high-risk categories above, a term is
+restored into the answer by default. The requester typed it into this very request, so
+withholding protects nothing they do not already hold, and a reply about `⟦CUSTOM_1⟧` is
+unreadable to the person who asked about their own codename. What protects them is that
+the term never crossed the boundary.
+
+**This is the strongest check on the boundary.** Both the egress guard (over the outbound
+masked prompt) and the deterministic attester (over Core's tokenized answer) scan for each
+term literally, and either one finding it refuses the request — `422
+outbound_guard_refused` or `422 leak_check_failed`, category `CUSTOM`. Every other guard
+check re-runs the same patterns that decided the masking, so it can only catch a tokenizer
+bug over shapes it already knows; a literal comparison catches a failed substitution
+outright. It is the one category where the fleet can _prove_ the masking worked.
+
+The terms are never persisted. They travel Gateway → Synthesis (both inside the boundary)
+and the audit record keeps only `attestation.custom_terms: {count: N}` — not a digest,
+because a codename comes from a small guessable space and a hash of one is a confirmation
+oracle rather than a redaction. Logs carry `term_count` and `surviving_term_count`; the
+logging allowlist has no field a term could travel in.
 
 ## Text only, by design
 
@@ -450,7 +500,7 @@ being closed.
 
 | Method | Path                                 | Purpose                                                                                                                                                                                                           |
 | ------ | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/v1/ask`                            | `{text}` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats                                                                                       |
+| `POST` | `/v1/ask`                            | `{text}` plus optional `rehydrate_allow` / `mask_terms` → masked prompt, ephemeral rehydrated answer, OKF document, four trust dimensions, attestation, consistency, stats                                        |
 | `GET`  | `/v1/requests/{id}`                  | the stored **masked** OKF evidence document (markdown)                                                                                                                                                            |
 | `GET`  | `/v1/requests/{id}/masked-prompt.md` | the masked prompt sent to Core                                                                                                                                                                                    |
 | `GET`  | `/v1/requests/{id}/core-response.md` | Core's still-tokenized response                                                                                                                                                                                   |

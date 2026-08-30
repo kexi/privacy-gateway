@@ -45,6 +45,15 @@ export const PII_CATEGORIES = [
   'PERSON',
   'ADDRESS',
   'ORGANIZATION',
+  /**
+   * A term the requester named, matched literally rather than detected.
+   *
+   * The only category no detector can produce on its own: an unreleased product
+   * name or an internal codename has no lexical form a regex could match and no
+   * public meaning a model could recognise. The requester supplies the string,
+   * and it is substituted before any detector runs.
+   */
+  'CUSTOM',
 ] as const;
 
 export const PiiCategorySchema = z.enum(PII_CATEGORIES);
@@ -111,6 +120,53 @@ export const RehydrateAllowSchema = z
   .max(HIGH_RISK_CATEGORIES.length)
   .transform((values) => [...new Set(values)]);
 
+// --- user-defined secret terms -----------------------------------------------
+
+/** How many terms one request may name. */
+export const MAX_MASK_TERMS = 20;
+/** The shortest term worth masking, in characters after trimming. */
+export const MIN_MASK_TERM_LENGTH = 2;
+/** The longest term one request may name, in characters after trimming. */
+export const MAX_MASK_TERM_LENGTH = 120;
+
+/**
+ * Phrases the requester wants masked verbatim, beyond anything a detector finds.
+ *
+ * The case is preserved and matching is **case-sensitive** (see
+ * `substituteTerms` in `tokenizer.ts`). Deduplication is case-preserving for the
+ * same reason: `Titan` and `titan` are two different requests, and collapsing
+ * them would silently drop one.
+ *
+ * `⟦` and `⟧` are rejected outright rather than escaped. A term carrying either
+ * delimiter is naming the placeholder namespace, which is exactly what
+ * `containsReservedSyntax` refuses in the prompt itself; accepting it here would
+ * be a second door into the same oracle.
+ *
+ * A term shorter than two characters is refused because a single character
+ * matches nearly everywhere: masking every `a` in a prompt destroys the text
+ * without protecting anything.
+ */
+export const MaskTermSchema = z
+  .string()
+  .transform((value) => value.trim())
+  .refine((value) => value.length >= MIN_MASK_TERM_LENGTH, {
+    message: `each term must be at least ${MIN_MASK_TERM_LENGTH} characters after trimming`,
+  })
+  .refine((value) => value.length <= MAX_MASK_TERM_LENGTH, {
+    message: `each term must be at most ${MAX_MASK_TERM_LENGTH} characters after trimming`,
+  })
+  .refine((value) => !value.includes('⟦') && !value.includes('⟧'), {
+    message: 'a term must not contain the reserved placeholder delimiters ⟦ ⟧',
+  });
+
+export const MaskTermsSchema = z
+  .array(MaskTermSchema)
+  .min(1, 'mask_terms must not be empty')
+  .max(MAX_MASK_TERMS, `at most ${MAX_MASK_TERMS} terms`)
+  // Deduplicated after trimming, so `["Titan ", "Titan"]` is one term rather than
+  // two placeholders for the same string. Case is part of the identity.
+  .transform((values) => [...new Set(values)]);
+
 /**
  * Keep only recognised categories, reporting how many were discarded.
  *
@@ -154,6 +210,23 @@ export const Sha256HexSchema = z
  * other verdict; the field is an enum rather than a boolean so a future
  * outcome that is neither can be added without a released `false`.
  */
+/**
+ * How many verbatim-mask terms this request named.
+ *
+ * A count and nothing else, in the attestation and in the OKF document alike. A
+ * term is an enterprise secret by construction — that is the whole reason
+ * someone names one — so the audit record states that the term scan ran and over
+ * how many terms, and stops there. Why not a digest of each term: a codename is
+ * drawn from a small guessable space, so a hash is a confirmation oracle, not a
+ * redaction.
+ */
+export const CustomTermsReportSchema = z
+  .object({
+    count: z.number().int().min(0),
+  })
+  .passthrough();
+export type CustomTermsReport = z.infer<typeof CustomTermsReportSchema>;
+
 export const RehydrationReportSchema = z
   .object({
     /** How many distinct placeholders were replaced with their vault value. */
@@ -195,6 +268,8 @@ export const AttestationSchema = z
     disclosure_requested: z.array(HighRiskCategorySchema).optional(),
     /** Present on a release; the post-rehydration completeness verdict. */
     rehydration: RehydrationReportSchema.optional(),
+    /** How many verbatim-mask terms this request named; never the terms. */
+    custom_terms: CustomTermsReportSchema.optional(),
     /**
      * How many category-enrichment attempts the advisory judge made on a
      * refusal — not verdict re-rolls. The judge's first `leak: true` is
@@ -230,6 +305,8 @@ export const AttestationBlockSchema = z
     /** What this request asked to have restored, recorded next to what it did not get. */
     disclosure_requested: z.array(HighRiskCategorySchema).optional(),
     rehydration: RehydrationReportSchema.optional(),
+    /** The count of verbatim-mask terms the term scan covered; never the terms. */
+    custom_terms: CustomTermsReportSchema.optional(),
   })
   .passthrough();
 export type AttestationBlock = z.infer<typeof AttestationBlockSchema>;
@@ -322,6 +399,15 @@ export const AskRequestSchema = z
      * unchanged, which is what every existing caller gets.
      */
     rehydrate_allow: RehydrateAllowSchema.optional(),
+    /**
+     * Extra phrases to mask verbatim, on top of what the detectors find.
+     *
+     * The terms themselves are request data of the same trust class as the vault
+     * mapping: they are held for the length of the request, stored in the vault
+     * like any other masked value, and never logged or persisted in the evidence
+     * — the audit record carries only `custom_terms: {count}`.
+     */
+    mask_terms: MaskTermsSchema.optional(),
   })
   .strict();
 export type AskRequest = z.infer<typeof AskRequestSchema>;
@@ -549,7 +635,11 @@ export const OpenAiChatCompletionRequestSchema = z
      * disclosure request must not have.
      */
     x_privacy_gateway: z
-      .object({ rehydrate_allow: RehydrateAllowSchema.optional() })
+      .object({
+        rehydrate_allow: RehydrateAllowSchema.optional(),
+        /** The same verbatim-masking list `/v1/ask` takes, on the compat surface. */
+        mask_terms: MaskTermsSchema.optional(),
+      })
       .strict()
       .optional(),
   })
@@ -666,6 +756,17 @@ export const SynthesizeRequestSchema = z.object({
    * the policy.
    */
   rehydrate_allow: RehydrateAllowSchema.optional(),
+  /**
+   * The requester's verbatim-mask terms, so the attester can scan for them.
+   *
+   * Inside-boundary data of the same trust class as the vault mapping: Synthesis
+   * already holds every raw value behind every placeholder, so a term adds no new
+   * exposure to this hop — and without it the deterministic attester has no way
+   * to catch Core echoing a codename that no regex knows. It is scanned and
+   * discarded: the evidence document records only `custom_terms: {count}`, never
+   * a term, and no hop outside the boundary ever receives this field.
+   */
+  mask_terms: MaskTermsSchema.optional(),
 });
 export type SynthesizeRequest = z.infer<typeof SynthesizeRequestSchema>;
 

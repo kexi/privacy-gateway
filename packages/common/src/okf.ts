@@ -224,6 +224,16 @@ export interface AttestationEvidence {
         readonly verdict: 'pass';
       }
     | undefined;
+  /**
+   * How many verbatim-mask terms the request named, when it named any.
+   *
+   * A count and only a count. The terms are enterprise secrets — an unreleased
+   * product name, an internal codename — so the document records that the term
+   * scan ran and its scope, and stops there. Why not a digest per term: a
+   * codename comes from a small guessable space, and a hash of one is a
+   * confirmation oracle rather than a redaction.
+   */
+  readonly customTerms?: { readonly count: number } | undefined;
 }
 
 export interface BuildGatewayAnswerOptions {
@@ -340,6 +350,9 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
             },
           }
         : {}),
+      ...(evidence.customTerms !== undefined
+        ? { custom_terms: { count: evidence.customTerms.count } }
+        : {}),
     },
   };
 
@@ -383,6 +396,16 @@ export function buildGatewayAnswer(options: BuildGatewayAnswerOptions): OkfDocum
         `the withheld placeholders, the exact vault value for every restored one, and no other ` +
         `identifier.\n`
       : '';
+  // Stated as a count in prose too, so a reader can see that the requester named
+  // terms and that the fleet scanned for them — without the document ever being
+  // the place someone's codename is written down.
+  const customTermsBlock =
+    evidence.customTerms !== undefined
+      ? `\nThe requester named ${evidence.customTerms.count} additional term(s) to be masked ` +
+        `verbatim. The terms themselves are deliberately not recorded here: they are ` +
+        `confidential by construction, which is why they were named. What is recorded is that ` +
+        `the outbound prompt and the core response were both scanned for every one of them.\n`
+      : '';
 
   const content = `# Answer (masked)
 
@@ -391,7 +414,7 @@ ${options.maskedAnswerBody.trim()}
 The rehydrated form of this answer was returned to the caller in the API response and is
 deliberately not stored. Only the masked text above, the hashes below, and the category
 counts are retained.
-${withheldBlock}${disclosureBlock}${rehydrationBlock}
+${withheldBlock}${disclosureBlock}${rehydrationBlock}${customTermsBlock}
 # Attestation
 
 Leak-policy check ${verdictLine}. It confirms only that the core agent's tokenized

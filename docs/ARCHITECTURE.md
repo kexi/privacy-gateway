@@ -61,8 +61,9 @@ as "none".
 ```
 User ──HTTP──▶ Gateway (Gemma)
                  │ 0. reject ⟦…⟧ reserved syntax          (400 reserved_syntax)
-                 │ 1. detect + tokenize  ──▶ Firestore Token Vault (request_id → {token: value})
-                 │ 2. egress guard re-scan                (422 outbound_guard_refused)
+                 │ 1. mask_terms pass, then detect + tokenize
+                 │                       ──▶ Firestore Token Vault (request_id → {token: value})
+                 │ 2. egress guard re-scan + term scan    (422 outbound_guard_refused)
                  ▼ A2A
                Core (Gemini 3.5)  — reasoning/planning/codegen on tokens
                  │ masked answer
@@ -70,7 +71,7 @@ User ──HTTP──▶ Gateway (Gemma)
                Synthesis (Gemma)
                  │ 3. vault lookup + generation check      (409/410)
                  │ 4. consistency check                    (409 invented_token)
-                 │ 5. leak check                           (422 leak_check_failed)
+                 │ 5. leak check + term scan               (422 leak_check_failed)
                  │ 6. Gemma judge (advisory, asymmetric)    (422 judge_flagged / judge_unavailable)
                  │ 7. rehydrate with disclosure policy      (409 unresolved_token)
                  │    (default-withheld − env allow − request rehydrate_allow)
@@ -94,11 +95,13 @@ only masked artifacts are persisted (`status: draft`, `verified` omitted).
 | Reserved `⟦…⟧` syntax in raw input                                | `400 reserved_syntax` (before masking, before the vault)                               |
 | Gemma span extraction (`valid-empty` / `valid-spans` / `invalid`) | `invalid` or a transport failure → `502 extraction_unavailable`; Core is never reached |
 | Egress guard finds raw PII in the masked prompt                   | `422 outbound_guard_refused`                                                           |
+| Egress guard finds a requester-named term in the masked prompt    | `422 outbound_guard_refused`, category `CUSTOM`                                        |
 | Vault mapping missing                                             | `409 vault_missing`                                                                    |
 | Vault mapping expired                                             | `410 vault_expired`                                                                    |
 | Vault generation mismatch                                         | `409 vault_generation_mismatch`                                                        |
 | Core invented a placeholder absent from the prompt                | `409 invented_token`                                                                   |
 | Deterministic leak check fails                                    | `422 leak_check_failed`                                                                |
+| Core's answer contains a requester-named term                     | `422 leak_check_failed`, category `CUSTOM`                                             |
 | Gemma judge returns `leak: true`                                  | `422 judge_flagged`                                                                    |
 | Gemma judge unavailable / no usable verdict                       | `422 judge_unavailable`                                                                |
 | Unresolved placeholder survives rehydration                       | `409 unresolved_token`                                                                 |
@@ -144,6 +147,59 @@ attester-clean body is exactly the case where the judge is the only coverage tho
 get — re-asking a probabilistic veto until it stops flagging is how a veto becomes theatre,
 not verification. The asymmetry is unchanged — a judge has never been able to vouch for a
 release, and now it cannot even undo its own flag.
+
+### User-defined secret terms
+
+Detection covers _shapes_. An email looks like an email, a card number carries a
+Luhn checksum, a personal name is something Gemma can recognise. An unreleased
+product name or an internal codename has none of that: it is an ordinary-looking
+noun phrase whose confidentiality is a fact about the enterprise, not about the
+string. No regex and no model can know to protect it.
+
+So the requester names it. `POST /v1/ask` accepts an optional
+`mask_terms: string[]` (1–20 entries, each 2–120 characters after trimming, no
+`⟦`/`⟧`, deduplicated case-preserving). Each term is substituted for a
+`⟦CUSTOM_n⟧` placeholder in an exact-match pass that runs **before** every
+detector, and the mapping goes into the vault like any other. A regex detection
+overlapping a term is dropped rather than splitting it: the requester's assertion
+that this exact string is confidential outranks a heuristic, and splitting a
+codename would leave part of it in the clear.
+
+**Matching is case-sensitive.** Why not case-insensitive: a codename's case is
+part of its identity — `Titan` the unreleased product and `titan` inside
+"titanium alloy" are different strings meaning different things — so folding case
+would mask ordinary prose the requester never asked to hide, mangling the prompt
+Core is asked to reason about, and would mask more than the requester can
+predict. A requester who wants both spellings names both.
+
+**`CUSTOM` is not withheld.** It rehydrates by default, unlike the five high-risk
+categories in §9. Why not withhold it: the requester typed the term into this
+very request, so withholding protects nothing they do not already hold — and it
+would break the answer, since a reply about `⟦CUSTOM_1⟧` is unreadable to the
+person who asked about their own codename. The protection is that the term never
+crossed the boundary, not that it never comes back.
+
+**The terms are the strongest thing the boundary checks.** Both the egress guard
+and the Synthesis attester gain a per-request literal scan — the guard over the
+outbound masked prompt, the attester over Core's tokenized output — and either
+one finding a term refuses the request (`422 outbound_guard_refused` /
+`422 leak_check_failed`, category `CUSTOM`). Every other guard check re-runs the
+same patterns that decided the masking, so it can only catch a tokenizer bug over
+shapes it already knows; a term is compared as a literal string, so if the
+substitution failed anywhere, this finds it. It is the one category where the
+guard can _prove_ the masking worked rather than re-running the detector that
+decided it.
+
+The terms travel Gateway → Synthesis (both inside the boundary, and Synthesis
+already holds every raw value behind every placeholder) and are **never**
+persisted: the OKF document records `attestation.custom_terms: {count: N}` and
+nothing more. Why not a digest per term: a codename comes from a small guessable
+space, so a hash of one is a confirmation oracle rather than a redaction. Logs
+carry `term_count` and `surviving_term_count` only — there is no field in the
+logging allowlist a term could travel in.
+
+The same list is accepted on the OpenAI-compatible endpoint under
+`x_privacy_gateway: {mask_terms}` and by MCP `pgw_ask`.
 
 ### Pseudonymization, not anonymization
 
@@ -204,15 +260,15 @@ has no Firestore role. Gateway and Synthesis import the package entry point.
 
 ## 7. API surface
 
-| Route                               | Method | Purpose                                                                                                                                                                                                                                                                                      |
-| ----------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/v1/ask`                           | POST   | `{text}` plus the optional `rehydrate_allow` (§9). Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
-| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                                                           |
-| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                                                               |
-| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                                                       |
-| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.                                        |
-| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                                                        |
-| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                                                    |
+| Route                               | Method | Purpose                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/v1/ask`                           | POST   | `{text}` plus the optional `rehydrate_allow` (§9) and `mask_terms` (§3). Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
+| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                                                                                 |
+| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                                                                                     |
+| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                                                                             |
+| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.                                                              |
+| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                                                                              |
+| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                                                                          |
 
 There is no approval route, no tier-lookup route and no session-scoped answer route:
 `POST /v1/sessions/:id/approve`, `GET /v1/sessions/:id/tier` and
@@ -402,8 +458,11 @@ provenance, trust, freshness, lifecycle and attestation are first-class on each 
   entry ever (§2). `stale_after` = vault expiry, `status: draft` on any failed gate.
 - A top-level `attestation:` block carries `computation`, `computation_sha256`, `attester_sha256`,
   `masked_prompt_sha256`, `core_response_sha256`, `verdict`, `checked_at`, `request_id`, `trace_id`
-  and, when applicable, `withheld` — enough for a third party to replay the verdict without trusting
-  this fleet. Replay it with `just verify-answer <request_id>`.
+  and, when applicable, `withheld` and `custom_terms: {count: N}` — enough for a third party to
+  replay the verdict without trusting this fleet. `custom_terms` is a **count only**: the terms are
+  confidential by construction (§3), and a digest of one would be a confirmation oracle rather than
+  a redaction, so the record states that the scan ran and over how many terms and stops there.
+  Replay it with `just verify-answer <request_id>`.
 - Malformed `verified` entries (missing or non-string `by`) are excluded from the trust-tier
   derivation, so a corrupted field derives `unverified` rather than crashing or over-trusting. An
   invalid or absent `stale_after` derives freshness `unknown`, never `fresh`.

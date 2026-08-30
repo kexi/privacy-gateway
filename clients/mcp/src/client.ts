@@ -128,12 +128,21 @@ export class GatewayClient {
     }
   }
 
-  /** `POST /v1/ask`. */
-  async ask(text: string): Promise<GatewayResult<AskPayload>> {
+  /**
+   * `POST /v1/ask`.
+   *
+   * `maskTerms` is omitted from the body when empty rather than sent as `[]`:
+   * the schema requires at least one entry, so an empty array is a 400 rather
+   * than a no-op.
+   */
+  async ask(text: string, maskTerms: readonly string[] = []): Promise<GatewayResult<AskPayload>> {
     const response = await this.request('/v1/ask', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        ...(maskTerms.length > 0 ? { mask_terms: [...maskTerms] } : {}),
+      }),
     });
     if (!response.ok) return toFailure(response);
     return { ok: true, value: (await response.json()) as AskPayload };

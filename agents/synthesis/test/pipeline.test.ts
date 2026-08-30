@@ -636,3 +636,93 @@ describe('judge categories are a closed enum', () => {
     expect(JSON.stringify(error.categories)).not.toContain('Taro Yamada');
   });
 });
+
+describe('the requester-named term scan', () => {
+  it('refuses when Core echoed a term back in the clear', async () => {
+    // The deterministic attester passes this body — a codename matches none of
+    // its patterns — so this scan is the only thing standing between the leak
+    // and the caller. The whole point of the boundary hardening.
+    const refused = await refusal('The ⟦PERSON_1⟧ plan for Titan Project is ready.', {
+      maskTerms: ['Titan Project'],
+    });
+
+    expect(refused.kind).toBe('leak_check_failed');
+    expect(refused.status).toBe(422);
+    expect(refused.categories).toEqual(['CUSTOM']);
+  });
+
+  it('releases when no term survived', async () => {
+    const result = await run('The ⟦PERSON_1⟧ plan for ⟦CUSTOM_1⟧ is ready.', {
+      maskTerms: ['Titan Project'],
+      // The token has to resolve, so the vault must know it.
+      vault: await (async () => {
+        const seeded = new InMemoryTokenVault();
+        await seeded.put(
+          REQUEST_ID,
+          {
+            '⟦PERSON_1⟧': 'Taro Yamada',
+            '⟦EMAIL_1⟧': 'taro@example.co.jp',
+            '⟦CUSTOM_1⟧': 'Titan Project',
+          },
+          3600,
+        );
+        return seeded;
+      })(),
+      vaultGeneration: 1,
+      knownTokens: [...KNOWN_TOKENS, '⟦CUSTOM_1⟧'],
+    });
+
+    expect(result.attestation.ok).toBe(true);
+    // CUSTOM is not withheld: the requester supplied the term, so getting it
+    // back is the point.
+    expect(result.answer).toContain('Titan Project');
+  });
+
+  it('is case-sensitive, agreeing with the substitution it verifies', async () => {
+    // `titanium` is not the codename. Refusing here would turn a correct
+    // masking into a 422 the caller could do nothing about.
+    const result = await run('⟦PERSON_1⟧ chose titanium alloy.', { maskTerms: ['Titan'] });
+    expect(result.attestation.ok).toBe(true);
+  });
+
+  it('records the term count, and never a term, on a release', async () => {
+    const result = await run('Hello ⟦PERSON_1⟧.', {
+      maskTerms: ['Titan Project', 'Hummingbird'],
+    });
+
+    expect(result.attestation.custom_terms).toEqual({ count: 2 });
+    expect(result.markdown).not.toContain('Titan Project');
+    expect(result.markdown).not.toContain('Hummingbird');
+    // The count reaches the replayable block too, so a reader can see the scan
+    // ran without the document ever holding the terms.
+    const metadata = parseOkf(result.markdown).metadata as {
+      attestation?: { custom_terms?: { count?: number } };
+    };
+    expect(metadata.attestation?.custom_terms?.count).toBe(2);
+  });
+
+  it('records the count on a refusal too, without naming the term', async () => {
+    const refused = await refusal('Titan Project ships.', { maskTerms: ['Titan Project'] });
+
+    expect(refused.evidence.attestation.custom_terms).toEqual({ count: 1 });
+    // The evidence document is served unauthenticated. A refusal that wrote the
+    // codename into it would be the leak the refusal just prevented.
+    expect(refused.evidence.markdown).not.toContain('Titan Project');
+    expect(refused.evidence.markdown).toContain(WITHHELD_BODY_MARKER);
+    expect(refused.message).not.toContain('Titan Project');
+  });
+
+  it('omits the block entirely when no terms were named', async () => {
+    const result = await run('Hello ⟦PERSON_1⟧.');
+    expect(result.attestation.custom_terms).toBeUndefined();
+  });
+
+  it('never rehydrates when a term survived', async () => {
+    // The ordering guarantee applies here as to every other gate: a refused
+    // request must not have had its real values assembled into a string at all.
+    const rehydrate = vi.fn(rehydrateWithPolicy);
+    await refusal('Titan Project ships.', { maskTerms: ['Titan Project'], rehydrate });
+
+    expect(rehydrate).not.toHaveBeenCalled();
+  });
+});

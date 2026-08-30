@@ -23,11 +23,46 @@ curl -sS http://localhost:8081/v1/ask \
   -d '{"text":"Customer Taro Yamada (taro@example.co.jp) reports a failed charge."}'
 ```
 
-`{text}` plus the optional `rehydrate_allow` (below) and nothing else. A body
-carrying `session_id` is rejected with `400`: there are no sessions, and a
-caller-supplied id would be a rehydration oracle. The response holds the masked
-prompt that actually crossed the boundary, the rehydrated answer (returned once,
-never stored), the OKF document, the four trust dimensions, and the attestation.
+`{text}` plus the optional `rehydrate_allow` and `mask_terms` (both below) and
+nothing else. A body carrying `session_id` is rejected with `400`: there are no
+sessions, and a caller-supplied id would be a rehydration oracle. The response
+holds the masked prompt that actually crossed the boundary, the rehydrated answer
+(returned once, never stored), the OKF document, the four trust dimensions, and
+the attestation.
+
+**User-defined secret terms.** The detectors cover shapes — an email looks like
+an email, a card number carries a checksum. An unreleased product name or an
+internal codename has no shape, so the requester names it:
+
+```bash
+curl -sS http://localhost:8081/v1/ask \
+  -H 'content-type: application/json' \
+  -d '{"text":"Summarize the status of Titan Project for the board.",
+       "mask_terms":["Titan Project"]}'
+```
+
+1–20 terms, each 2–120 characters after trimming, no `⟦`/`⟧`, deduplicated with
+case preserved. Each becomes a `⟦CUSTOM_n⟧` placeholder in an exact-match pass
+that runs before every detector, so the term never crosses the boundary; longer
+terms substitute first, so naming both `Titan` and `Titan Project` produces one
+placeholder for the longer phrase rather than splitting it.
+
+**Matching is case-sensitive.** A codename's case is part of its identity —
+`Titan` the product is not `titan` inside "titanium alloy" — so folding case
+would mask ordinary prose you never asked to hide. Name both spellings if you
+want both masked.
+
+`CUSTOM` is **not** in the withheld set: the term comes back in your answer,
+because you supplied it and withholding it would only make the answer unreadable.
+The protection is that the term never reached the frontier model.
+
+Both boundary scans cover the terms literally: the egress guard checks the
+outbound prompt (`422 outbound_guard_refused`) and the attester checks Core's
+answer (`422 leak_check_failed`), each reporting category `CUSTOM`. This is the
+only check that can _prove_ the masking worked, rather than re-running the
+detector that decided it. The terms are never persisted — the OKF document
+records `attestation.custom_terms: {count: N}` and nothing else, and no log field
+can carry a term.
 
 **Per-request disclosure opt-in.** `API_KEY`, `AWS_KEY`, `JWT`, `CREDIT_CARD` and
 `MY_NUMBER` are never restored into an answer by default. A caller may allow
@@ -157,20 +192,25 @@ request made one. Stock clients ignore it; an aware client reads it. `id` is
 `chatcmpl-<request_id>`, so a caller holding only an OpenAI-shaped response can
 still fetch `/v1/requests/<id>` for the evidence.
 
-**Request extension.** The same field carries the disclosure opt-in on the way
-in, since OpenAI has no place for it either:
+**Request extension.** The same field carries the disclosure opt-in and the
+verbatim-mask terms on the way in, since OpenAI has no place for either:
 
 ```json
 {
   "model": "privacy-gateway",
   "messages": [{ "role": "user", "content": "..." }],
-  "x_privacy_gateway": { "rehydrate_allow": ["CREDIT_CARD"] }
+  "x_privacy_gateway": {
+    "rehydrate_allow": ["CREDIT_CARD"],
+    "mask_terms": ["Titan Project"]
+  }
 }
 ```
 
 Same rules as `/v1/ask`. The object is strict — a misspelled key inside it is a
 `400` rather than a silently ignored opt-in — while unknown _top-level_ sampling
-knobs are still stripped, so a stock SDK keeps working.
+knobs are still stripped, so a stock SDK keeps working. Strictness matters most
+for `mask_terms`: a typo that quietly masked nothing is the one failure mode a
+request to hide a codename must not have.
 
 **Text only, by design.** A message whose `content` is an array of parts is
 accepted only if every part is `{"type": "text"}`. Any other part kind
@@ -240,11 +280,15 @@ error while still withholding the body like any other refusal.
 `clients/mcp` is a stdio MCP server exposing three tools. See
 `clients/mcp/README.md` for Claude Desktop / Claude Code / Codex configuration.
 
-| tool           | input          | returns                                                                     |
-| -------------- | -------------- | --------------------------------------------------------------------------- |
-| `pgw_ask`      | `{text}`       | answer, masked prompt, derived trust tier, status, ids, withheld categories |
-| `pgw_evidence` | `{request_id}` | the stored masked OKF document                                              |
-| `pgw_verify`   | `{request_id}` | a replayed attestation with a per-digest verdict list                       |
+| tool           | input                 | returns                                                                     |
+| -------------- | --------------------- | --------------------------------------------------------------------------- |
+| `pgw_ask`      | `{text, mask_terms?}` | answer, masked prompt, derived trust tier, status, ids, withheld categories |
+| `pgw_evidence` | `{request_id}`        | the stored masked OKF document                                              |
+| `pgw_verify`   | `{request_id}`        | a replayed attestation with a per-digest verdict list                       |
+
+`mask_terms` is the same list `/v1/ask` takes — phrases to mask verbatim, matched
+exactly and case-sensitively, so pass a codename with the capitalisation it
+actually uses.
 
 Two properties matter when writing against it:
 
@@ -288,9 +332,14 @@ content chunk, for the same reason the OpenAI SSE does.
 
 ```bash
 uv run clients/python/pgw.py ask "text"
+uv run clients/python/pgw.py ask "text" --allow CREDIT_CARD --mask-term "Titan Project"
 uv run clients/python/pgw.py evidence <request_id> [--json]
 uv run clients/python/pgw.py verify <request_id>
 ```
+
+`--allow` and `--mask-term` are both repeatable and map to `rehydrate_allow` and
+`mask_terms` respectively. Note that `--gateway` is a _top-level_ flag, so it
+comes before the subcommand.
 
 The only client that can check all four digests, because it can hash the bundle
 files in the checkout it lives in.

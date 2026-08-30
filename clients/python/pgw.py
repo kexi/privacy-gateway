@@ -9,7 +9,7 @@ JSON over HTTP, so consuming the fleet needs no SDK and no shared runtime with
 the agents. This file exists to demonstrate exactly that.
 
 Usage:
-    uv run clients/python/pgw.py ask "text" [--allow CREDIT_CARD] [--gateway URL]
+    uv run clients/python/pgw.py ask "text" [--allow CATEGORY] [--mask-term PHRASE] [--gateway URL]
     uv run clients/python/pgw.py evidence <request_id> [--gateway URL] [--json]
     uv run clients/python/pgw.py verify <request_id> [--base URL]
 
@@ -120,6 +120,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
     # like a disclosure request in a log or a proxy trace.
     if args.allow:
         payload["rehydrate_allow"] = args.allow
+    # Same rule, and a stricter one: the schema requires at least one entry, so
+    # an empty list would be a 400 rather than a no-op.
+    if args.mask_term:
+        payload["mask_terms"] = args.mask_term
 
     with client(args.gateway) as http:
         try:
@@ -482,6 +486,18 @@ def build_parser() -> argparse.ArgumentParser:
             "allow one high-risk category to be restored in THIS response only "
             "(API_KEY, AWS_KEY, JWT, CREDIT_CARD, MY_NUMBER); repeatable. "
             "Anything else is refused with 400"
+        ),
+    )
+    ask.add_argument(
+        "--mask-term",
+        action="append",
+        default=[],
+        metavar="PHRASE",
+        help=(
+            "mask this exact phrase before the request leaves the boundary, on top of "
+            "what the detectors find (an unreleased product name, an internal codename); "
+            "repeatable, up to 20. Matching is case-sensitive, so pass the term with the "
+            "capitalisation it actually uses. It is restored in the answer you get back"
         ),
     )
     ask.set_defaults(func=cmd_ask)

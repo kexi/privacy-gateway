@@ -95,6 +95,68 @@ button:focus-visible {
   color: var(--muted);
 }
 
+/* --- user-defined secret terms ---------------------------------------------- */
+
+/*
+ * The terms field borrows the textarea's monospace treatment: what is typed here
+ * is matched byte for byte, so the control should look like something whose
+ * exact characters matter rather than like ordinary prose.
+ */
+.mask-terms input[type='text'] {
+  width: 100%;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.85rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+.mask-terms input[type='text']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/*
+ * The parsed terms, echoed back.
+ *
+ * Coloured with the CUSTOM hue so the chip here, the placeholder in the masked
+ * prompt and the restored value in the answer are visibly the same thing — the
+ * same traceability rule every other category follows.
+ */
+.mask-terms-preview {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.5rem 0 0;
+  padding: 0;
+}
+
+.mask-terms-preview:empty {
+  margin: 0;
+}
+
+.mask-terms-preview li {
+  --cat-hue: 310;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid oklch(65% 0.13 var(--cat-hue) / 0.55);
+  background: oklch(65% 0.13 var(--cat-hue) / 0.12);
+  color: var(--text);
+}
+
+/* A term the schema will refuse, marked before the request is sent rather than
+   after: the round trip is not the place to learn a term was too short. */
+.mask-terms-preview li.invalid {
+  border-color: color-mix(in srgb, var(--danger, crimson) 60%, var(--border));
+  background: color-mix(in srgb, var(--danger, crimson) 12%, transparent);
+  text-decoration: line-through;
+}
+
 /* --- the disclosure opt-in -------------------------------------------------- */
 
 .disclosure {
@@ -373,7 +435,8 @@ button.secondary {
 
 .findings,
 .withheld,
-.advisory {
+.advisory,
+.custom-terms {
   margin: 0;
   font-size: 0.82rem;
   color: var(--muted);

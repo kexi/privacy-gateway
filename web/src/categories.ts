@@ -34,6 +34,11 @@ const CATEGORY_HUES: Record<PiiCategory, number> = {
   PERSON: 265,
   ADDRESS: 5,
   ORGANIZATION: 170,
+  // Far from ORGANIZATION (170) and PERSON (265), the two it is most likely to
+  // sit beside: a codename is often a product or project name, so the reader
+  // must be able to tell "the requester named this" apart from "a model guessed
+  // this was an organisation" at a glance.
+  CUSTOM: 310,
 };
 
 /** Hue for an unrecognised category, so an unknown never renders uncoloured. */

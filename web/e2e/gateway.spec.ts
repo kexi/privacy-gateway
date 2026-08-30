@@ -18,6 +18,14 @@ const CUSTOMER_EMAIL =
 const LEAK_MARKER = 'SCENARIO-LEAK';
 const INVENT_MARKER = 'SCENARIO-INVENT';
 
+/** Submits with the verbatim-mask terms box filled in as well. */
+async function submitWithTerms(page: Page, text: string, terms: string): Promise<void> {
+  await page.goto('/');
+  await page.fill('#input', text);
+  await page.fill('#mask-terms', terms);
+  await page.click('#submit');
+}
+
 /** Submits through the button and waits for whichever panel appears. */
 async function submit(page: Page, text: string): Promise<void> {
   await page.goto('/');
@@ -336,9 +344,9 @@ test.describe('the disclosure opt-in', () => {
   test('groups the boxes under a legend and warns what allowing means', async ({ page }) => {
     await page.goto('/');
 
-    await expect(page.locator('fieldset.disclosure legend')).toHaveText(/高リスク情報の復元/);
+    await expect(page.locator('fieldset.disclosure legend')).toHaveText(/Allow high-risk values/);
     await expect(page.locator('#disclosure-warning')).toContainText(
-      /このリクエストで送信した値だけ/,
+      /only the values this request submitted/,
     );
     // The warning is announced with the control, not merely printed near it.
     await expect(
@@ -420,5 +428,110 @@ test.describe('the disclosure opt-in', () => {
     // The audit record still holds only the masked body: the disclosure was for
     // the one response, never for the stored evidence.
     expect(okf).not.toContain('4242 4242 4242 4242');
+  });
+});
+
+test.describe('user-defined secret terms', () => {
+  const CODENAME = 'Titan Project';
+  const WITH_CODENAME = `Summarize the status of ${CODENAME} for the board, in two lines.`;
+
+  test('previews the parsed terms as chips before anything is sent', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#mask-terms', 'Titan Project, Hummingbird');
+
+    // The echo is the confirmation that the comma-separated box was read the way
+    // the user meant. Believing a term was masked when it was not is the whole
+    // failure mode this field has.
+    await expect(page.locator('#mask-terms-preview li')).toHaveCount(2);
+    await expect(page.locator('#mask-terms-preview li').first()).toHaveText('Titan Project');
+  });
+
+  test('marks a term the schema would reject rather than sending it', async ({ page }) => {
+    await page.goto('/');
+    await page.fill('#mask-terms', 'a');
+
+    await expect(page.locator('#mask-terms-preview li.invalid')).toHaveCount(1);
+  });
+
+  test('masks the term in the prompt the frontier model receives', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const masked = await page.locator('#masked').innerText();
+    expect(masked).not.toContain(CODENAME);
+    expect(masked).toContain('⟦CUSTOM_1⟧');
+  });
+
+  test('shows the CUSTOM placeholder as a chip in the masked pane', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // The alignment and highlight machinery picks CUSTOM up through the shared
+    // category map, exactly as it does every detected category.
+    await expect(page.locator('#masked .pii-chip[data-category="CUSTOM"]')).not.toHaveCount(0);
+  });
+
+  test('lists CUSTOM in the legend with its count', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    await expect(page.locator('#legend .legend-row[data-category="CUSTOM"]')).toHaveCount(1);
+  });
+
+  test('restores the term in the answer, because the requester supplied it', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // CUSTOM is deliberately not withheld: the requester already holds the term,
+    // so withholding protects nothing and makes the answer unreadable.
+    const answer = await page.locator('#answer').innerText();
+    expect(answer).toContain(CODENAME);
+    expect(answer).not.toContain('⟦CUSTOM_1⟧');
+  });
+
+  test('never writes the term into the stored evidence', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const requestId = await page.locator('#correlation code').first().innerText();
+
+    // The evidence routes are unauthenticated. A codename written into any of
+    // the three would be a leak of exactly the thing the requester asked to hide.
+    for (const path of ['', '/masked-prompt.md', '/core-response.md']) {
+      const response = await page.request.get(`/v1/requests/${requestId}${path}`);
+      expect(response.status(), path).toBe(200);
+      expect(await response.text(), path).not.toContain(CODENAME);
+    }
+  });
+
+  test('shows the term count in the attestation panel, never a term', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    const attestation = await page.locator('#attestation').innerText();
+    expect(attestation).toContain('Requester-named terms scanned for');
+    expect(attestation).not.toContain(CODENAME);
+  });
+
+  test('records only the term count in the OKF document', async ({ page }) => {
+    await submitWithTerms(page, WITH_CODENAME, CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // `textContent`: the document sits inside a collapsed <details>.
+    const okf = (await page.locator('#okf').textContent()) ?? '';
+    expect(okf).toContain('custom_terms');
+    expect(okf).toContain('count: 1');
+    expect(okf).not.toContain(CODENAME);
+  });
+
+  test('leaves an ordinary request untouched when no terms are named', async ({ page }) => {
+    await submit(page, WITH_CODENAME);
+    await expect(page.locator('#results')).toBeVisible({ timeout: 30_000 });
+
+    // Nothing detects a codename, so without the opt-in it crosses the boundary
+    // in the clear. That is the gap the feature exists to close, stated as a test
+    // so the two halves cannot be confused for each other.
+    const masked = await page.locator('#masked').innerText();
+    expect(masked).toContain(CODENAME);
   });
 });

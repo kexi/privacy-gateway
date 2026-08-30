@@ -10,8 +10,11 @@ import { describe, expect, it } from 'vitest';
 import {
   categoryOf,
   containsReservedSyntax,
+  countSurvivingTerms,
+  CUSTOM_CATEGORY,
   DEFAULT_WITHHELD_CATEGORIES,
   detect,
+  findTermSpans,
   findTokens,
   luhnValid,
   rehydrate,
@@ -307,5 +310,160 @@ describe('digit-bearing categories', () => {
   it('strips and neutralizes an IPV4 placeholder', () => {
     expect(stripPlaceholders('at ⟦IPV4_1⟧ today')).not.toContain('⟦');
     expect(neutralizePlaceholders('at ⟦IPV4_1⟧ today')).toContain('[masked');
+  });
+});
+
+describe('user-defined secret terms', () => {
+  it('masks a phrase no detector could have found', () => {
+    // The whole point of the feature: "Titan Project" is not an email, a key or
+    // a number, so nothing in `detect` has an opinion about it. The requester
+    // asserting it is confidential is the only signal there is.
+    const result = new SessionTokenizer().tokenize(
+      'Ship Titan Project by Friday.',
+      [],
+      ['Titan Project'],
+    );
+
+    expect(result.text).not.toContain('Titan Project');
+    expect(result.text).toContain('⟦CUSTOM_1⟧');
+    expect(result.mapping['⟦CUSTOM_1⟧']).toBe('Titan Project');
+  });
+
+  it('substitutes the longer term first, so overlapping terms nest', () => {
+    // With both named, "Titan Project" must become one placeholder rather than
+    // `⟦CUSTOM_n⟧ Project` — a shorter term must never split a longer one.
+    const result = new SessionTokenizer().tokenize(
+      'Titan Project ships.',
+      [],
+      ['Titan', 'Titan Project'],
+    );
+
+    expect(result.text).toBe('⟦CUSTOM_1⟧ ships.');
+    expect(result.mapping['⟦CUSTOM_1⟧']).toBe('Titan Project');
+  });
+
+  it('still masks the shorter term where the longer one does not appear', () => {
+    const result = new SessionTokenizer().tokenize(
+      'Titan Project and Titan alone.',
+      [],
+      ['Titan', 'Titan Project'],
+    );
+
+    expect(result.text).not.toContain('Titan');
+    // Two distinct terms, so two distinct placeholders: equality is preserved
+    // per term, exactly as it is per detected value.
+    expect(Object.keys(result.mapping).sort()).toEqual(['⟦CUSTOM_1⟧', '⟦CUSTOM_2⟧']);
+  });
+
+  it('gives every occurrence of one term the same placeholder', () => {
+    const result = new SessionTokenizer().tokenize('Titan, then Titan again.', [], ['Titan']);
+
+    expect(result.text).toBe('⟦CUSTOM_1⟧, then ⟦CUSTOM_1⟧ again.');
+  });
+
+  it('matches case-sensitively, so ordinary prose is left alone', () => {
+    // Changing case changes meaning: `titanium` is not the codename, and masking
+    // it would mangle the prompt the frontier model is asked to reason about.
+    const result = new SessionTokenizer().tokenize('Titan uses titanium alloy.', [], ['Titan']);
+
+    expect(result.text).toBe('⟦CUSTOM_1⟧ uses titanium alloy.');
+  });
+
+  it('lets a term win over an overlapping regex detection', () => {
+    // The requester asserted this exact string is confidential. Splitting it so
+    // the email-shaped part becomes ⟦EMAIL_1⟧ would leave the rest of the
+    // codename in the clear, which is the opposite of what was asked for.
+    const result = new SessionTokenizer().tokenize(
+      'Codename ops@titan.example is live.',
+      [],
+      ['ops@titan.example'],
+    );
+
+    expect(result.text).toBe('Codename ⟦CUSTOM_1⟧ is live.');
+    expect(result.mapping['⟦CUSTOM_1⟧']).toBe('ops@titan.example');
+  });
+
+  it('still masks the detected PII that does not overlap a term', () => {
+    const result = new SessionTokenizer().tokenize(
+      'Titan Project, contact taro@example.co.jp.',
+      [],
+      ['Titan Project'],
+    );
+
+    expect(result.text).not.toContain('Titan Project');
+    expect(result.text).not.toContain('taro@example.co.jp');
+    expect(result.text).toContain('⟦EMAIL_1⟧');
+  });
+
+  it('round-trips: rehydrating restores the original text exactly', () => {
+    const original = 'Titan Project ships; Titan Project again, plus taro@example.co.jp.';
+    const result = new SessionTokenizer().tokenize(original, [], ['Titan Project']);
+
+    expect(rehydrate(result.text, result.mapping)).toBe(original);
+  });
+
+  it('restores a CUSTOM value under the default disclosure policy', () => {
+    // CUSTOM is deliberately not withheld: the requester supplied the term, so
+    // withholding it protects nothing and makes the answer unreadable.
+    const result = new SessionTokenizer().tokenize('Titan Project ships.', [], ['Titan Project']);
+    const restored = rehydrateWithPolicy(result.text, result.mapping);
+
+    expect(restored.text).toBe('Titan Project ships.');
+    expect(restored.withheldCategories).not.toContain(CUSTOM_CATEGORY);
+  });
+
+  it('leaves the text untouched when no terms are named', () => {
+    const before = new SessionTokenizer().tokenize('Ship Titan Project.', []);
+    const after = new SessionTokenizer().tokenize('Ship Titan Project.', [], []);
+
+    expect(before.text).toBe(after.text);
+    expect(after.text).toContain('Titan Project');
+  });
+
+  it('masks the union when two equal-length terms overlap', () => {
+    // Neither term can claim its whole span, but the characters they share are
+    // covered by the one that wins — so neither term survives literally, which
+    // is what the egress guard actually checks for.
+    const result = new SessionTokenizer().tokenize('aXbXc', [], ['Xb', 'bX']);
+
+    expect(countSurvivingTerms(result.text, ['Xb', 'bX'])).toBe(0);
+  });
+
+  it('finds no span for a term that does not occur', () => {
+    expect(findTermSpans('nothing here', ['Titan'])).toEqual([]);
+  });
+
+  it('drops a term span that overlaps one already accepted', () => {
+    // Two terms sharing characters produce one span, not two overlapping
+    // placeholders over the same run of text.
+    const spans = findTermSpans('Titan Project', ['Titan Project', 'Project']);
+
+    expect(spans).toHaveLength(1);
+    expect(spans[0]?.category).toBe(CUSTOM_CATEGORY);
+    expect(spans[0]?.value).toBe('Titan Project');
+  });
+});
+
+describe('counting surviving terms', () => {
+  it('counts a term that is still present verbatim', () => {
+    expect(countSurvivingTerms('Titan Project ships', ['Titan Project'])).toBe(1);
+  });
+
+  it('counts nothing once the term has been substituted', () => {
+    expect(countSurvivingTerms('⟦CUSTOM_1⟧ ships', ['Titan Project'])).toBe(0);
+  });
+
+  it('counts each surviving term once, however often it occurs', () => {
+    expect(countSurvivingTerms('Titan Titan Titan', ['Titan'])).toBe(1);
+  });
+
+  it('is case-sensitive, matching the substitution it verifies', () => {
+    // The guard must agree with the tokenizer: a check that folded case would
+    // refuse a request whose masking was in fact complete.
+    expect(countSurvivingTerms('titanium alloy', ['Titan'])).toBe(0);
+  });
+
+  it('counts nothing when no terms were named', () => {
+    expect(countSurvivingTerms('Titan Project ships', [])).toBe(0);
   });
 });

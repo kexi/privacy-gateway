@@ -240,6 +240,8 @@ export function parseChatRequest(
       readonly text: string;
       readonly stream: boolean;
       readonly rehydrateAllow: readonly HighRiskCategory[];
+      /** Phrases to mask verbatim, from `x_privacy_gateway.mask_terms`. */
+      readonly maskTerms: readonly string[];
     }
   | { readonly ok: false; readonly status: number; readonly body: OpenAiErrorBody } {
   const parsed = OpenAiChatCompletionRequestSchema.safeParse(body);
@@ -300,6 +302,7 @@ export function parseChatRequest(
     text,
     stream: parsed.data.stream ?? false,
     rehydrateAllow: parsed.data.x_privacy_gateway?.rehydrate_allow ?? [],
+    maskTerms: parsed.data.x_privacy_gateway?.mask_terms ?? [],
   };
 }
 

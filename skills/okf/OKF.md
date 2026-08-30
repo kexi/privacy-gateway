@@ -76,7 +76,7 @@ attester:
   - `sources` = `masked-prompt`（`/requests/<request_id>/masked-prompt.md`）、`core-response`（`/requests/<request_id>/core-response.md`、`author: core_agent/<model>`）、`pii-policy`。**前 2 つは Gateway が実際に配信する**（リンク切れの provenance は再現できない）。**生 PII を sources や本文に書かない**。
   - `verified[]` = `process:leak-check@<attester sha256 先頭>` ⇒ machine-confirmed。**LLM の actor を書かない**: 合否を決めるのは TypeScript の regex コードで、Gemma は助言に過ぎない。
   - **`human:` actor をこのプロダクトが作ることはない。** 公開 Gateway は誰も認証していないため、承認クリックから作った `human:<id>` は「誰でもない人」の主張になる。tier 導出自体は汎用機能としてライブラリに残す（他の consumer には認証済みレビュアーが居るため）。
-  - トップレベルに `attestation:` ブロックを置く: `computation`, `computation_sha256`, `attester_sha256`, `masked_prompt_sha256`, `core_response_sha256`, `verdict`, `checked_at`, `request_id`, `trace_id`, `withheld`。これが `just verify-answer <request_id>` での再現を可能にする。
+  - トップレベルに `attestation:` ブロックを置く: `computation`, `computation_sha256`, `attester_sha256`, `masked_prompt_sha256`, `core_response_sha256`, `verdict`, `checked_at`, `request_id`, `trace_id`, `withheld`、該当時は `custom_terms: {count: N}`。これが `just verify-answer <request_id>` での再現を可能にする。**`custom_terms` は件数のみ**とする: ユーザー定義の秘匿語句（`mask_terms`）はその性質上機密であり、語句そのものはもちろん、ダイジェストも書かない（推測可能な小さい空間から選ばれるためハッシュは確認オラクルになる）。
   - `stale_after` = Token Vault の有効期限と一致させる。
   - `status: draft` は検査失敗時。失敗理由を本文 `# Attestation` に残し、`verified` は省略する。**失敗時は答えを返さない**（再水和しない）。
 - UI では 4 つの次元を **別々に** 表示する: ポリシー判定 / 文書ステータス / 鮮度 / レビュー主体（常に `none`）。1 つの tier バッジに潰さない。tier 自体は `verified` から **導出して** 表示する。

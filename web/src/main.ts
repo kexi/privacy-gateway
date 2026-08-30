@@ -63,8 +63,71 @@ const gpuNote = el<HTMLParagraphElement>('gpu-note');
 const warmupButton = el<HTMLButtonElement>('warmup');
 const progressPane = el<HTMLElement>('progress');
 const stepsList = el<HTMLOListElement>('steps');
+const maskTermsInput = el<HTMLInputElement>('mask-terms');
+const maskTermsPreview = el<HTMLUListElement>('mask-terms-preview');
 
 input.value = SAMPLE;
+
+// --- user-defined secret terms -----------------------------------------------
+
+/** Mirrors `MIN_MASK_TERM_LENGTH` / `MAX_MASK_TERM_LENGTH` in the shared schema. */
+const MIN_TERM_LENGTH = 2;
+const MAX_TERM_LENGTH = 120;
+/** Mirrors `MAX_MASK_TERMS`. */
+const MAX_TERMS = 20;
+
+/**
+ * Split the comma-separated field into terms.
+ *
+ * Trimmed and deduplicated exactly as `MaskTermsSchema` does, so the chips are
+ * the terms the server will actually see rather than an approximation of them.
+ * Case is preserved on both sides: `Titan` and `titan` are two terms.
+ */
+function parseMaskTerms(raw: string): string[] {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const part of raw.split(',')) {
+    const term = part.trim();
+    if (term === '' || seen.has(term)) continue;
+    seen.add(term);
+    terms.push(term);
+  }
+  return terms;
+}
+
+/** Whether the server's schema would accept this term. */
+function isValidTerm(term: string): boolean {
+  return (
+    term.length >= MIN_TERM_LENGTH &&
+    term.length <= MAX_TERM_LENGTH &&
+    !term.includes('⟦') &&
+    !term.includes('⟧')
+  );
+}
+
+/**
+ * Echo the parsed terms back as chips.
+ *
+ * The point is not decoration: a comma-separated box is easy to misread, and
+ * this is the one field where believing a term was masked when it was not is the
+ * whole failure mode. A term the schema would reject is struck through here
+ * rather than after a round trip.
+ */
+function renderMaskTerms(): void {
+  const terms = parseMaskTerms(maskTermsInput.value);
+  maskTermsPreview.innerHTML = terms
+    .slice(0, MAX_TERMS)
+    .map((term) => {
+      const invalid = isValidTerm(term) ? '' : ' invalid';
+      const title = isValidTerm(term)
+        ? `masked verbatim, case-sensitive`
+        : `too short, too long, or contains the reserved delimiters ⟦ ⟧`;
+      return `<li class="${invalid.trim()}" title="${escapeHtml(title)}">${escapeHtml(term)}</li>`;
+    })
+    .join('');
+}
+
+maskTermsInput.addEventListener('input', renderMaskTerms);
 
 // --- GPU warmth --------------------------------------------------------------
 
@@ -386,8 +449,17 @@ function renderSteps(): void {
   const reduced = prefersReducedMotion();
   const elapsedMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
   // Where the in-flight step began, so its live count is its own duration rather
-  // than the whole run's.
-  const lastEnd = steps.reduce((latest, step) => Math.max(latest, step.endedAtMs ?? 0), 0);
+  // than the whole run's. `elapsedMs` is the browser's clock, so only the
+  // browser-clock steps can be subtracted from it — `gpu_wakeup` is the one such
+  // step, and mixing in a server-clock end would make the live counter jump
+  // backwards and stall.
+  const wakeupEnd = steps.find((step) => step.stage === 'gpu_wakeup')?.endedAtMs;
+  const serverEnd = steps.reduce(
+    (latest, step) =>
+      step.stage === 'gpu_wakeup' ? latest : Math.max(latest, step.endedAtMs ?? 0),
+    0,
+  );
+  const lastEnd = (wakeupEnd ?? 0) + serverEnd;
 
   stepsList.innerHTML = steps
     .map((step) => {
@@ -446,7 +518,14 @@ function applyProgress(stage: ProgressStage, state: 'start' | 'end', elapsedMs: 
 
   step.state = 'done';
   step.endedAtMs = elapsedMs;
-  const previousEnd = steps[index - 1]?.endedAtMs ?? 0;
+
+  // `gpu_wakeup` is timed on the browser's clock and every other stage on the
+  // server's, so a difference across that boundary is meaningless. Only stages
+  // sharing a clock are subtracted; the first server-timed stage measures from
+  // 0, which is exactly what its `elapsed_ms` already means.
+  const previous = steps[index - 1];
+  const previousEnd =
+    previous === undefined || previous.stage === 'gpu_wakeup' ? 0 : (previous.endedAtMs ?? 0);
   step.durationMs = Math.max(0, elapsedMs - previousEnd);
 
   // Advance the cursor so the list always shows one step in flight rather than
@@ -580,6 +659,16 @@ function renderAttestation(response: AskResponse): void {
     rows.push(
       `<p class="withheld">Withheld by the disclosure policy (left masked in the answer):
         ${attestation.withheld.map((c) => `<code>${escapeHtml(c)}</code>`).join(', ')}</p>`,
+    );
+  }
+  if (attestation.custom_terms && attestation.custom_terms.count > 0) {
+    // The count, exactly as the audit record carries it. The terms themselves are
+    // never in the response, so there is nothing here that could render one even
+    // by mistake — which is the point worth stating on screen.
+    rows.push(
+      `<p class="custom-terms">Requester-named terms scanned for:
+        <code>${attestation.custom_terms.count}</code>
+        <small>(the terms themselves are never logged, stored, or shown — only this count)</small></p>`,
     );
   }
   if (attestation.judge && typeof attestation.judge.leak === 'boolean') {
@@ -774,6 +863,10 @@ composer.addEventListener('submit', (event) => {
   }
 
   const rehydrateAllow = selectedDisclosures();
+  // Only the terms the server would accept. An invalid one is already struck
+  // through in the preview, and sending it would turn the whole request into a
+  // 400 rather than masking the terms that were fine.
+  const maskTerms = parseMaskTerms(maskTermsInput.value).filter(isValidTerm).slice(0, MAX_TERMS);
 
   // A cold fleet means the first Gemma call waits on a container start, so the
   // wait is named up front rather than left to look like a hang. `unknown` is
@@ -795,13 +888,28 @@ composer.addEventListener('submit', (event) => {
     text,
     (progressEvent) => {
       if (wakeupOpen && progressEvent.stage === 'masking') {
-        applyProgress('gpu_wakeup', 'end', progressEvent.elapsed_ms);
+        // Timed from the browser, not from `elapsed_ms`.
+        //
+        // `elapsed_ms` is measured from the moment the request reached the
+        // Gateway, which is *after* the GPU wake it is supposed to describe —
+        // and because `gpu_wakeup` is the first step, `applyProgress` subtracted
+        // a previous end of 0 and reported the masking stage's own elapsed time.
+        // On a warm fleet that rounded to `0.0s`, which read as "the GPU started
+        // instantly" for the one step whose whole purpose is to explain a
+        // two-minute wait.
+        //
+        // The browser is the only place that can see this: it starts the clock
+        // before the request is sent, so it spans the container start that the
+        // server, by definition, is not yet running for.
+        const waitedMs = runStartedAt === undefined ? 0 : Date.now() - runStartedAt;
+        applyProgress('gpu_wakeup', 'end', waitedMs);
         wakeupOpen = false;
         setBusy(true, 'Masking, reasoning on the frontier model, verifying…');
       }
       applyProgress(progressEvent.stage, progressEvent.state, progressEvent.elapsed_ms);
     },
     rehydrateAllow,
+    maskTerms,
   )
     .then((response) => {
       // The text as it was submitted, not as the textarea reads now: a user who

@@ -47,7 +47,7 @@ dev-synthesis:
     VAULT_BACKEND=memory pnpm --filter @privacy-gateway/synthesis dev
 
 # Pull the Gemma model into the local Ollama
-pull-gemma model="gemma3:12b":
+pull-gemma model="gemma4:12b":
     ollama pull {{ model }}
 
 # --- web --------------------------------------------------------------------

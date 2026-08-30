@@ -32,7 +32,7 @@ export type AgentName = z.infer<typeof AgentNameSchema>;
  */
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 /** Ollama tag pulled by `just pull-gemma`. */
-export const DEFAULT_GEMMA_MODEL = 'gemma3:12b';
+export const DEFAULT_GEMMA_MODEL = 'gemma4:12b'; // adopted 2026-08-31: 6/6 judge validation, parity with gemma3
 /** Vault lifetime; the OKF `stale_after` is kept equal to it. */
 export const DEFAULT_VAULT_TTL_SECONDS = 3600;
 /**
