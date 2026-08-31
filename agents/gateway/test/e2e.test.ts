@@ -30,6 +30,7 @@ import { createApp as createSynthesisApp } from '@privacy-gateway/synthesis/serv
 import { InMemoryAnswerStore } from '@privacy-gateway/synthesis/store';
 import type express from 'express';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { clearExtractionCache } from '../src/agent.ts';
 import { createApp, createApp as createGatewayApp } from '../src/server.ts';
 
 const CORE_BASE_URL = 'http://core.test';
@@ -173,6 +174,10 @@ async function startFleet(
   gemmaSpans?: unknown,
   overrides: Record<string, string> = {},
 ): Promise<void> {
+  // The span cache is process-global while every other piece of fleet state is
+  // rebuilt here, so without this a chunk extracted by an earlier test would be
+  // answered from memory and this fleet's stub Gemma would never be consulted.
+  clearExtractionCache();
   vault = new InMemoryTokenVault();
   store = new InMemoryAnswerStore();
   const logger = createLogger({ agent: 'gateway', write: () => undefined });

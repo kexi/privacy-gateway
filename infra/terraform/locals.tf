@@ -87,10 +87,26 @@ locals {
       ingress    = "INGRESS_TRAFFIC_ALL"
       vpc_egress = true
       env = {
-        GEMMA_AUTH         = "iam"
-        CORE_BASE_URL      = local.run_url["core-agent"]
-        SYNTHESIS_BASE_URL = local.run_url["synthesis-agent"]
-        GEMMA_BASE_URL     = local.gemma_base_url
+        GEMMA_AUTH = "iam"
+        # 256 KiB, up from the 64 KiB code default: Codex CLI's Responses API
+        # requests carry ~147 KB of instructions/tool context. Cost exposure
+        # stays bounded by the per-IP rate limit, the request deadline, one GPU
+        # instance and the billing kill switch.
+        MAX_BODY_BYTES = "262144"
+        # ~4 KB chunks: per-chunk Gemma latency falls superlinearly with size
+        # (5.7 KB answered in 9 s while 12 KB took ~120 s), so many small
+        # parallel chunks beat few large ones on the single GPU.
+        EXTRACTION_CHUNK_BYTES = "4000"
+        # All four llama.cpp slots, up from the three the code used to reserve.
+        # A 147 KB Codex prompt is ~37 chunks, and at a measured 26-40 s per 4 KB
+        # chunk the fan-out width is what decides whether the request beats its
+        # deadline. Why not keep one slot for the Synthesis judge: the judge runs
+        # after masking, not beside it, so the reserved slot was idle during the
+        # only phase that could have used it.
+        EXTRACTION_CONCURRENCY = "4"
+        CORE_BASE_URL          = local.run_url["core-agent"]
+        SYNTHESIS_BASE_URL     = local.run_url["synthesis-agent"]
+        GEMMA_BASE_URL         = local.gemma_base_url
         # Why 150 and not the 60 s compiled-in default: on a cold fleet the
         # first /v1/ask blew the deadline and returned 504 before Gemma had
         # answered. The GPU instance itself starts in ~5 s; what dominates is

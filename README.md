@@ -610,22 +610,31 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
-Codex CLI selects it the same way — the fleet is just another OpenAI-compatible provider.
-In `~/.codex/config.toml`:
+Codex CLI selects it the same way, over the **Responses API** (`POST /v1/responses`).
+Codex ≥ 0.149 dropped `chat/completions` for custom providers and refuses to start with
+`wire_api = "chat"`; the same release rejects `[profiles.*]` tables inside `config.toml`,
+so the profile lives in its own file, `~/.codex/pgw.config.toml`:
 
 ```toml
-[model_providers.privacy-gateway]
+model = "privacy-gateway"
+model_provider = "pgw"
+
+[model_providers.pgw]
 name = "Privacy Gateway"
 base_url = "https://privacy-gateway.kexi.dev/v1"
-wire_api = "chat"
-
-[profiles.privacy-gateway]
-model_provider = "privacy-gateway"
-model = "privacy-gateway"
+wire_api = "responses"
 ```
 
-Then `codex --profile privacy-gateway`. `GET /v1/models` advertises exactly one id,
+Then `codex --profile pgw`. `GET /v1/models` advertises exactly one id,
 `privacy-gateway`: a caller selects the _fleet_, not the model behind it.
+
+On that surface `instructions` is prepended to the `input` turns before masking, and the
+answer comes back as one `message` item whose `content[0]` is an `output_text`. Codex
+hard-codes `stream: true`, so the reply is SSE: one delta, then
+`response.output_item.done`, then `response.completed`. A refused release is a terminal
+`response.failed` carrying the gateway's error code — never a completed turn. Codex's tool
+declarations are accepted and ignored: the fleet has no sandbox to run a tool in, and
+fabricating a call the model never made would be a command the caller executes.
 
 **Message mapping.** `system` and `user` contents are concatenated in order, separated by a
 blank line, into the one text the pipeline masks. `assistant` turns are dropped: they are the

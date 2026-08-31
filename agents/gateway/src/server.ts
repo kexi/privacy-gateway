@@ -65,6 +65,14 @@ import {
   toOpenAiError,
   writeSseCompletion,
 } from './openai_compat.ts';
+import {
+  logResponsesStart,
+  parseResponsesRequest,
+  responsesError,
+  toResponsesObject,
+  writeResponsesSse,
+  writeResponsesSseError,
+} from './responses_compat.ts';
 import { ask, RequestAbortedError, ReservedSyntaxError, type AskResult } from './pipeline.ts';
 import { StatusCache } from './status.ts';
 import { wakeGemma } from './warmup.ts';
@@ -253,6 +261,13 @@ export function createApp(options: CreateAppOptions): express.Application {
     void handleChatCompletions(req, res, next);
   });
 
+  // The Responses API surface. Codex CLI >= 0.149 dropped chat/completions for
+  // custom providers, so a `wire_api = "responses"` client reaches only this.
+  // Same gates, same vault discipline; see `responses_compat.ts`.
+  app.post('/v1/responses', (req, res, next) => {
+    void handleResponses(req, res, next);
+  });
+
   app.get('/v1/requests/:id', (req, res, next) => {
     void handleEvidence(req, res, next);
   });
@@ -410,7 +425,10 @@ export function createApp(options: CreateAppOptions): express.Application {
     onProgress?: (event: ProgressEvent) => void,
   ): Promise<AskResult> {
     const parentContext = contextFromHeaders(req.headers as Record<string, string | undefined>);
-    const routePath = req.path === '/v1/chat/completions' ? '/v1/chat/completions' : '/v1/ask';
+    // The allowlist types `path` as an enum, so it is matched against the known
+    // routes rather than interpolated from whatever the caller requested.
+    const COMPAT_ROUTES = ['/v1/chat/completions', '/v1/responses'];
+    const routePath = COMPAT_ROUTES.includes(req.path) ? req.path : '/v1/ask';
 
     // One deadline for the whole chain, expressed as a real cancellation.
     //
@@ -580,6 +598,97 @@ export function createApp(options: CreateAppOptions): express.Application {
           classified.categories,
         ),
       );
+  }
+
+  /**
+   * The OpenAI **Responses API** endpoint.
+   *
+   * The second rendering of the same pipeline, for clients that speak only this
+   * wire — Codex CLI >= 0.149 among them. A refusal is reported as a Responses
+   * error, or as a terminal `response.failed` event once the stream has already
+   * been committed to a 200, so a gate that refuses never surfaces as a success.
+   */
+  async function handleResponses(req: Request, res: Response, next: NextFunction): Promise<void> {
+    const context = contextOf(req);
+    if (context === undefined) return next();
+    if (rateLimited(req, res, context)) return;
+
+    const parsed = parseResponsesRequest(req.body, context.requestId);
+    if (!parsed.ok) {
+      context.logger.event(
+        'openai.compat.responses.rejected',
+        { error_code: parsed.body.error.code ?? 'invalid_request' },
+        'WARNING',
+      );
+      res.status(parsed.status).json(parsed.body);
+      return;
+    }
+
+    logResponsesStart(context.logger, parsed.stream);
+
+    try {
+      const result = await runAsk(
+        req,
+        context,
+        parsed.text,
+        parsed.rehydrateAllow,
+        parsed.maskTerms,
+      );
+      const response = toResponsesObject(result, now(), parsed.rehydrateAllow);
+
+      context.logger.event('openai.compat.responses.end', {
+        document_status: result.status,
+        trust_tier: result.trustTier,
+      });
+
+      if (parsed.stream) {
+        writeResponsesSse(res, response);
+        return;
+      }
+      res.json(response);
+    } catch (error) {
+      handleResponsesError(error, res, context, parsed.stream);
+    }
+  }
+
+  /**
+   * Map a pipeline failure onto a Responses error.
+   *
+   * Uses the same `classifyAskError` the native and chat endpoints use, so the
+   * three surfaces can never disagree about whether something was refused. A
+   * streaming caller gets `response.failed` rather than a status, because the
+   * 200 and its headers are already on the wire by the time a gate refuses —
+   * and Codex maps that event to an error, not to a turn.
+   */
+  function handleResponsesError(
+    error: unknown,
+    res: Response,
+    context: RequestContext,
+    stream: boolean,
+  ): void {
+    const classified = classifyAskError(error);
+    context.logger.event(
+      'openai.compat.responses.refused',
+      {
+        error_code: classified.code,
+        ...(classified.categories.length > 0 ? { categories: [...classified.categories] } : {}),
+      },
+      'ERROR',
+    );
+
+    const body = responsesError(
+      classified.status,
+      classified.code,
+      classified.message,
+      context.requestId,
+      classified.categories,
+    );
+
+    if (stream) {
+      writeResponsesSseError(res, body, context.requestId, now());
+      return;
+    }
+    res.status(classified.status).json(body);
   }
 
   /**

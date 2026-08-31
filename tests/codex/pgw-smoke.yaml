@@ -1,0 +1,49 @@
+# Codex CLI reaches the deployed fleet as its model provider and gets an answer
+# back. This is the thinnest possible proof that the whole chain works end to
+# end: Codex -> Responses API -> Gateway (mask with Gemma) -> A2A -> Core
+# (Gemini) -> HTTP -> Synthesis -> leak check -> rehydrate -> SSE back to Codex.
+#
+# Why a PTY: `codex exec` renders a live status line and only flushes its final
+# answer when it believes it is attached to a terminal. Piping stdout changes
+# what it prints, so a plain subprocess check would assert on different bytes
+# than a human sees.
+name: pgw-smoke
+env:
+  # Codex colorizes and redraws by default; a dumb terminal keeps the captured
+  # output close to plain text so `contains` matches the answer, not an escape
+  # sequence that happens to sit between the letters.
+  TERM: dumb
+  NO_COLOR: '1'
+workspace:
+  # Why temp: `codex exec` writes session state relative to its cwd and may
+  # inspect the surrounding tree. A throwaway 0700 dir keeps the run from
+  # touching this repository.
+  temp: true
+steps:
+  # Why a bare shell plus `send` rather than putting the whole command line in
+  # `spawn`: pitty splits `spawn` with `split_whitespace` and execs the result
+  # directly, honoring no quoting at all, so a multi-word prompt cannot survive
+  # as one argument. Sending the line to a real shell lets the shell do the
+  # quoting, which is also closer to how a person invokes Codex.
+  - spawn: bash --noprofile --norc
+  # `exec` replaces the shell with Codex, so the child pitty polls for an exit
+  # code is Codex itself rather than a shell that outlives it.
+  #
+  # Why the prompt asks for a token it does not itself spell: a PTY echoes every
+  # sent line back (twice, with the shell's prompt redraw), so asserting on a
+  # string that appears verbatim in the command line would match the echo and
+  # pass without the fleet answering at all. `PGW` and `OK` are sent separately
+  # and only the model's reply joins them, so the assertion cannot be satisfied
+  # by the echo.
+  - send: "exec codex exec --skip-git-repo-check --profile pgw 'Reply with the word PGW, then a space, then the word OK. Output that line and nothing else.'"
+  - expect:
+      contains: PGW OK
+      # Generous on purpose. The GPU-backed Gemma service scales to zero, so a
+      # cold fleet spends roughly two minutes starting before the masking pass
+      # even begins. Warm, this resolves in a few seconds.
+      timeout: 240s
+  - expect_exit:
+      code: 0
+      # Codex still has to tear down its session after printing the answer, and
+      # the poll form removes the race a fixed `wait` would leave.
+      timeout: 60s

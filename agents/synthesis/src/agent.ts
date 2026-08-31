@@ -56,7 +56,9 @@ export function buildSynthesisAgent(model?: string): LlmAgent {
       'rehydration or attestation; those run on this service’s HTTP routes.',
     model: ollamaModelId(model),
     instruction: INSTRUCTION,
-    generateContentConfig: { responseMimeType: 'application/json' },
+    // maxOutputTokens: the verdict object is tiny; the cap exists so a
+    // confused judge can never pin a GPU slot with runaway generation.
+    generateContentConfig: { responseMimeType: 'application/json', maxOutputTokens: 1024 },
     tools: [],
   });
 }

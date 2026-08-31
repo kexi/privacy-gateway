@@ -607,22 +607,32 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
-Codex CLI も同じ要領で選べる——このフリートは単なる OpenAI 互換プロバイダにすぎない。
-`~/.codex/config.toml` に:
+Codex CLI も同じ要領で選べるが、経路は **Responses API**（`POST /v1/responses`）である。
+Codex 0.149 以降はカスタムプロバイダ向けの `chat/completions` を廃止し、`wire_api = "chat"`
+では起動を拒否する。同じリリースで `config.toml` 内の `[profiles.*]` テーブルも拒否される
+ようになったため、プロファイルは専用ファイル `~/.codex/pgw.config.toml` に置く:
 
 ```toml
-[model_providers.privacy-gateway]
+model = "privacy-gateway"
+model_provider = "pgw"
+
+[model_providers.pgw]
 name = "Privacy Gateway"
 base_url = "https://privacy-gateway.kexi.dev/v1"
-wire_api = "chat"
-
-[profiles.privacy-gateway]
-model_provider = "privacy-gateway"
-model = "privacy-gateway"
+wire_api = "responses"
 ```
 
-あとは `codex --profile privacy-gateway`。`GET /v1/models` が広告する ID は
+あとは `codex --profile pgw`。`GET /v1/models` が広告する ID は
 `privacy-gateway` ただ 1 つ——呼び出し側が選ぶのは背後のモデルではなく*フリート*である。
+
+この面では `instructions` を `input` の各ターンの前に連結してからマスクし、回答は
+`content[0]` が `output_text` である単一の `message` アイテムとして返る。Codex は
+`stream: true` をハードコードしているため応答は SSE であり、delta を 1 回、続いて
+`response.output_item.done`、`response.completed` を送る。リリースが拒否された場合は
+完了ターンではなく、ゲートウェイのエラーコードを載せた終端イベント `response.failed` になる。
+Codex が送るツール宣言は受理した上で無視する——このフリートにツールを実行するサンドボックスは
+なく、モデルが行っていない呼び出しを捏造することは、呼び出し側が実行してしまうコマンドを
+でっち上げることに等しいからである。
 
 **メッセージのマッピング**: `system` と `user` の content を順序どおり空行区切りで連結し、
 パイプラインがマスクする単一のテキストにする。`assistant` ターンは破棄する——それはこの

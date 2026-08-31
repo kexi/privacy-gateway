@@ -86,6 +86,12 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   masked_count: 'number',
   unstructured_spans: 'number',
   span_count: 'number',
+  // How many pieces a large input was split into for span extraction. A count of
+  // model calls, saying nothing about what any chunk contained.
+  chunk_count: 'number',
+  // How deep the bisection fallback had to go before a chunk became readable.
+  // Bounded by log2(chunk_bytes / min_chunk_bytes); a level count, not content.
+  depth: 'number',
   tokens_resolved: 'number',
   tokens_unknown: 'number',
   withheld_count: 'number',

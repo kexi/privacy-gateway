@@ -86,6 +86,55 @@ transport failure or an uninterpretable response is `502 extraction_unavailable`
 Core is never called, because the regexes alone cannot see a personal name or an
 address.
 
+**Chunked extraction.** The extractor caps Gemma's output at `maxOutputTokens: 4096`,
+and that cap is not negotiable: without it a ~147 KB prompt from a coding agent made
+Gemma generate until the context was exhausted, pinning the project's single Cloud Run
+GPU for 15+ minutes — the generating instance never idled out, so the service could
+neither serve nor accept a new revision (recovery runbook in `skills/pgw-logs/LOGS.md`).
+But a span list for 147 KB of input does not fit in 4096 tokens either, so a single
+call truncated mid-JSON and every large request refused with `extraction_unavailable`.
+Input above `EXTRACTION_CHUNK_BYTES` (default 12000 characters) is therefore split on
+the safest available boundary — paragraph, then line, then a hard cut — with a 200-character
+overlap so an entity straddling a boundary is still seen whole by one chunk. Chunks are
+extracted concurrently across all 4 of Gemma's llama.cpp slots (`EXTRACTION_CONCURRENCY`),
+and the span lists are merged with duplicates collapsed by value + category (the
+granularity the tokenizer already works at). Input at or below the threshold takes exactly
+the previous single call. The fan-out used to hold one slot back for the Synthesis judge;
+that slot was idle during masking, because the judge runs after it rather than beside it,
+so reserving it cost a quarter of the fan-out during the only phase that could use it.
+
+**Repeated chunks are extracted once per process.** A coding-agent CLI resends a
+near-identical instruction preamble — tool schemas, workspace rules, tens of kilobytes of
+it — on every turn, and the chunks it splits into are byte-identical from one request to
+the next. An in-process LRU of 256 entries maps a chunk's SHA-256 to the spans extracted
+from it, so a second turn pays only for the chunks that changed; measured locally, a
+20 KB Codex-shaped payload cost 159 s cold and 1 ms warm. The cache lives in **memory
+only and is never persisted**: a span holds the raw personal-data value verbatim, so
+writing it to Firestore would be exactly the disclosure this gateway prevents. Only
+readable outcomes are cached — an `invalid` is one bad sample, and remembering it would
+let a single failed roll refuse every later request carrying that chunk.
+
+**The parser tolerates packaging, never content.** With markdown-and-code input the model
+mirrors the input's style back: a code fence around its answer, a sentence introducing it,
+an echoed brace from the chunk. Balanced-brace scanning (string-literal aware) picks the
+first top-level object carrying a `spans` key, so a preamble that merely mentions `{` no
+longer defeats the parse. Nothing is repaired — no brace appended, no truncated string
+closed — so malformed JSON is still `invalid` and still fails the request closed.
+
+**Density, not size, is the real bound.** Measurement showed a 5.7 KB prose page with two
+entities extracting in 9 s while a **1.7 KB** passage of repeated PII-dense lines refused
+after 67 s: what overflows the output budget is the number of distinct spans, and no byte
+threshold predicts it. Two changes follow. First, the instruction asks for each distinct
+value **exactly once** rather than once per occurrence — `spansToDetections` re-locates
+every occurrence with `indexOf`, so the repetition changed no masking decision and was
+pure output spend; `mergeSpans` still deduplicates on arrival, because a prompt rule is a
+request and not a guarantee. Second, a chunk that is still unreadable after its retry is
+**halved and re-extracted**, recursively, down to `EXTRACTION_MIN_CHUNK_BYTES` (default
+1000). Each level halves the text, so depth is at most log2(chunk/min) — about 4 with the
+defaults, bounding a pathological 12 KB chunk at 126 model calls. The fail-closed contract
+is unchanged at the bottom: a chunk that reaches the floor still uninterpretable fails the
+whole extraction, because a chunk nobody could read is a chunk whose names are unknown.
+
 ### Everything fails closed
 
 Every gate below stops the pipeline on failure: no rehydrated answer is returned, and
@@ -258,6 +307,8 @@ has no Firestore role. Gateway and Synthesis import the package entry point.
 - **Why a separate Synthesis agent instead of rehydrating in Gateway?** Separation of duties: the agent that verifies _output_ safety should not be the one that decided _input_ masking; it also makes the leak check an independent gate on every response.
 - **Why A2A for Gateway → Core but plain HTTP for Gateway → Synthesis?** Core's job is reasoning, so A2A's LLM-oriented protocol fits. Synthesis's HTTP routes return an audit artifact (the OKF document, the masked prompt, Core's tokenized response) that must come back byte-for-byte, not as something an LLM has rephrased — so the route the Gateway actually uses is plain authenticated HTTP even though Synthesis also exposes an A2A surface that acknowledges the exchange.
 - **Why separate services at all instead of in-process sub-agents?** The boundary is the product. Separate services with separate IAM identities make "Core cannot reach Firestore" a deployable guarantee enforced by IAM, not a code convention — see the note on the dependency graph in §5.
+
+**Not adopted (and why).** A `gemma:g26b` image exists in Artifact Registry from an experiment in raising the extractor to `gemma4:26b`, on the theory that a larger model breaks the JSON-only contract less often. It is not deployed: measurement showed `gemma4:12b` already returning clean JSON on Codex-shaped chunks, so the contract was not the bottleneck — per-chunk latency was — and a larger model generates more slowly, which makes that worse. Raising `REQUEST_DEADLINE_SECONDS` past 150 was rejected for the same reason: it hides a capacity limit instead of removing one, and the chunk cache addresses the repeat-turn case that actually matters.
 
 ## 7. API surface
 

@@ -48,6 +48,7 @@ Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. 
 
 - Unit/integration: **vitest** in every package (`pnpm -r test`). Tests state _what_ is guaranteed.
 - Browser E2E: **Playwright** (chromium) in `web/e2e`, run via `just web-e2e`; not in pre-commit/pre-push, runs in CI. Mock Core/Ollama over HTTP; never hit real Gemini/Gemma in tests.
+- Codex surface: `just codex-smoke` routinely; the full `just codex-e2e` only as a final pre-submission check — it drives the real CLI's ~147 KB prompt through the GPU.
 
 ## Infrastructure
 

@@ -50,6 +50,15 @@ dev-synthesis:
 pull-gemma model="gemma4:12b":
     ollama pull {{ model }}
 
+# Inspect Gemma's raw span-extraction output on a Codex-shaped payload (needs a local ollama)
+#
+# The one place a failing chunk's raw model output can be read: production must
+# not log it, because the answer echoes the input it was asked about. Local only,
+# never in CI — it makes real model calls against `just pull-gemma`'s model.
+# An empty `model` lets the script fall back to the tag config.ts defines.
+extraction-lab bytes="60000" model="":
+    pnpm --filter @privacy-gateway/gateway exec tsx tools/extraction-lab.ts {{ bytes }} {{ model }}
+
 # --- web --------------------------------------------------------------------
 
 # Start the Vite dev server (proxies /v1 to the Gateway)

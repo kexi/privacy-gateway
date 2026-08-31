@@ -197,6 +197,34 @@ verify-auth-internal:
     echo "Job finished. Read its output with:"
     echo "  just logs-service verify-auth 30"
 
+# Check the Codex wire contract against the deployed fleet with a small payload (routine)
+#
+# The Codex surface check to run day to day. It speaks the Responses API directly
+# rather than launching the CLI, so it verifies the protocol — SSE event
+# sequence, masking, rehydration — without the CLI's ~147 KB instruction block,
+# whose masking cost on a single GPU is a capacity property, not a protocol one.
+# The full CLI path is `just codex-e2e`, kept for the final pre-submission check.
+codex-smoke:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Why a nonce: the scenario asserts a per-run token round-trips, so a cached
+    # or hallucinated answer cannot pass it.
+    #
+    # Why letters rather than the obvious timestamp-and-$RANDOM: a long run of
+    # digits is what a card number looks like, so the numeric form was detected
+    # as CREDIT_CARD, masked, and — since CREDIT_CARD is a withheld category —
+    # never rehydrated. The fleet was behaving exactly as designed; the test was
+    # feeding it a nonce indistinguishable from the PII it exists to catch.
+    export PGW_NONCE="PGW$(LC_ALL=C tr -dc 'A-Z' </dev/urandom | head -c 10)"
+    # Resolved from the deployment rather than hard-coded, so this cannot quietly
+    # keep testing a service that has been replaced.
+    PGW_BASE_URL="${PGW_BASE_URL:-$(gcloud run services describe gateway-agent \
+      --project "{{ PROJECT_ID }}" --region "{{ REGION }}" \
+      --format='value(status.url)')}"
+    export PGW_BASE_URL
+    echo "gateway: ${PGW_BASE_URL}"
+    nix run github:kexi/pitty/v1.2.2 -- run tests/codex/pgw-responses.yaml
+
 # Smoke-test the deployed Gateway end to end with a fixed PII sample
 smoke:
     #!/usr/bin/env bash

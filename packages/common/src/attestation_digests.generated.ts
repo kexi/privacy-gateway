@@ -19,4 +19,4 @@ export const ATTESTER_SHA256_BUILD =
 
 /** SHA-256 of `knowledge/computations/leak-check.md`. */
 export const COMPUTATION_SHA256_BUILD =
-  'efa7e03c46f5158efed2641a4988cb7f49a32792a67d563826be070946d6cdbc';
+  '818736ce10622a56801d848aab46485afa87e91ee7a5dfffb8f193efc135efc0';

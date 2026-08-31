@@ -24,8 +24,8 @@
     <mxCell id="c_rest" value="REST&#10;POST /v1/ask  {text}&#10;full evidence + trust dimensions" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#546E7A;fontSize=11;verticalAlign=middle;" vertex="1" parent="1">
       <mxGeometry x="60" y="272" width="230" height="60" as="geometry"/>
     </mxCell>
-    <mxCell id="c_openai" value="OpenAI-compatible&#10;POST /v1/chat/completions&#10;select &quot;privacy-gateway&quot; as a model" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#546E7A;fontSize=11;verticalAlign=middle;" vertex="1" parent="1">
-      <mxGeometry x="60" y="344" width="230" height="60" as="geometry"/>
+    <mxCell id="c_openai" value="OpenAI-compatible&#10;POST /v1/chat/completions&#10;POST /v1/responses (Codex CLI)&#10;select &quot;privacy-gateway&quot; as a model" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#546E7A;fontSize=11;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="60" y="340" width="230" height="68" as="geometry"/>
     </mxCell>
     <mxCell id="c_mcp" value="MCP server (clients/mcp)&#10;pgw_ask · pgw_evidence · pgw_verify&#10;Claude Desktop / Code / Codex" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#546E7A;fontSize=11;verticalAlign=middle;" vertex="1" parent="1">
       <mxGeometry x="60" y="416" width="230" height="60" as="geometry"/>

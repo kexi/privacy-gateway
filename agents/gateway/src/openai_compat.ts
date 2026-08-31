@@ -90,18 +90,23 @@ function contentToText(content: OpenAiChatMessage['content']): string {
     .join('');
 }
 
-/** `GET /v1/models`: one id, because a caller selects the fleet, not a model. */
+/**
+ * `GET /v1/models`: one id, because a caller selects the fleet, not a model.
+ * Carries both OpenAI's `data` and Codex's `models` key: Codex ≥0.149 decodes
+ * a `models` field and logs a stream error on the OpenAI shape alone, and a
+ * superset response satisfies both clients without content negotiation.
+ */
 export function modelList(now: () => number): OpenAiModelList {
+  const entry = {
+    id: OPENAI_MODEL_ID,
+    object: 'model' as const,
+    created: Math.floor(now() / 1000),
+    owned_by: OPENAI_MODEL_ID,
+  };
   return {
     object: 'list',
-    data: [
-      {
-        id: OPENAI_MODEL_ID,
-        object: 'model',
-        created: Math.floor(now() / 1000),
-        owned_by: OPENAI_MODEL_ID,
-      },
-    ],
+    models: [entry],
+    data: [entry],
   };
 }
 

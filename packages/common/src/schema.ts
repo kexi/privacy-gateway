@@ -827,6 +827,8 @@ export const OpenAiModelSchema = z.object({
 export const OpenAiModelListSchema = z.object({
   object: z.literal('list'),
   data: z.array(OpenAiModelSchema),
+  /** Codex ≥0.149 decodes `models`, not OpenAI's `data`; we serve both. */
+  models: z.array(OpenAiModelSchema),
 });
 export type OpenAiModelList = z.infer<typeof OpenAiModelListSchema>;
 

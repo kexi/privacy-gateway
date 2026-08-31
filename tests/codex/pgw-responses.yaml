@@ -1,0 +1,71 @@
+# The Responses API surface Codex speaks, exercised with a small payload.
+#
+# What this proves: the wire contract the Codex CLI depends on works end to end
+# against the live fleet — `/v1/responses` accepts a Responses-API request, the
+# gateway masks it, Core and Synthesis answer, the leak check passes, and the
+# result streams back as the SSE event sequence Codex parses. A per-run nonce
+# makes it a genuine round trip rather than a plausible cached answer.
+#
+# Why not drive the real `codex` binary here: the CLI prepends its own ~147 KB
+# instruction block — tool schemas, workspace rules, policy text — to every turn,
+# and on the single-GPU deployment masking that much input dominates the request.
+# That is a real limitation worth testing, but it is a *load* property, not a
+# protocol one, and bundling the two meant a wire-format regression and a GPU
+# capacity limit produced the same red. This scenario isolates the protocol; the
+# full CLI path stays in `pgw-smoke.yaml` / `pgw-masking.yaml`.
+#
+# The address is synthetic and allow-listed in .gitleaks.toml. EMAIL is a
+# rehydrated category, so it must come back — a placeholder reaching the client
+# would be a rehydration bug.
+name: pgw-responses
+env:
+  TERM: dumb
+  NO_COLOR: '1'
+workspace:
+  temp: true
+steps:
+  - spawn: bash --noprofile --norc
+  # `curl -N` disables buffering so the SSE frames arrive as they are produced
+  # rather than in one block at the end, which is what Codex itself sees.
+  #
+  # Why the prompt asks the model to emit a token the command line does not
+  # spell: a PTY echoes every sent line back, so asserting on a string present in
+  # the request body would match the echo rather than the fleet's answer. Only
+  # the model joins "ACK" to the nonce.
+  #
+  # Why the body is double-quoted rather than single-quoted: bash performs no
+  # expansion inside single quotes, so a single-quoted body would send the four
+  # literal characters `${PGW_NONCE}` to the fleet while pitty compared the
+  # reply against the *expanded* value — a mismatch that looks like the fleet
+  # answering wrongly. The inner JSON quotes are backslash-escaped instead.
+  - send: >-
+      exec curl -sS -N -X POST "${PGW_BASE_URL}/v1/responses"
+      -H "Content-Type: application/json"
+      -d "{\"model\":\"privacy-gateway\",\"stream\":true,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Acknowledge this record for Taro Yamada at taro@example.com. Reply with one line: the letters A C K with no spaces, then a space, then ${PGW_NONCE}. Output nothing else.\"}]}]}"
+  # The generated answer.
+  #
+  # Why the assertion is `"text":"ACK PGW` and not the whole nonce: **pitty
+  # v1.2.2 does not expand `${VAR}` inside an `expect` block** — only `spawn` and
+  # `send` are interpolated — so an assertion naming the variable compares
+  # against the four literal characters `${PGW_NONCE}` and can never match. The
+  # nonce still does its job: it is interpolated into the request, so the reply
+  # can only contain `ACK PGW…` if the fleet generated a fresh answer to *this*
+  # run's prompt, and the JSON `"text":` prefix ties the match to the output item
+  # rather than to the masked prompt echoed back in `response.created`.
+  #
+  # Why this is the first assertion rather than following a `response.created`
+  # one: pitty matches forward from a cursor that only advances, and asserting on
+  # `response.created` first moves that cursor past the frame that also carries
+  # the answer text. Matching the answer implies the stream opened correctly, so
+  # the earlier assertion bought nothing and cost the later match.
+  - expect:
+      contains: '"text":"ACK PGW'
+      timeout: 240s
+  # The terminal event. Codex treats a stream without it as a failed turn, so its
+  # presence is what makes this a complete response rather than a truncated one.
+  - expect:
+      contains: 'response.completed'
+      timeout: 60s
+  - expect_exit:
+      code: 0
+      timeout: 30s

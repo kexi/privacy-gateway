@@ -157,3 +157,114 @@ test.describe('POST /v1/chat/completions', () => {
     expect(first.x_privacy_gateway.trust_tier).toBe('machine-confirmed');
   });
 });
+
+/** Parses an SSE body into its event types, in wire order. */
+function eventTypes(body: string): string[] {
+  return body
+    .split('\n\n')
+    .filter((block) => block.trim().length > 0)
+    .map((block) => {
+      const line = block.split('\n').find((candidate) => candidate.startsWith('data: ')) ?? '';
+      return (JSON.parse(line.slice('data: '.length)) as { type: string }).type;
+    });
+}
+
+/**
+ * The Responses API surface, which is the only wire Codex CLI >= 0.149 speaks
+ * to a custom provider. The event names and their order are what the CLI's SSE
+ * parser requires, so these run against the real fleet rather than a unit mock.
+ */
+test.describe('POST /v1/responses', () => {
+  test('answers a non-streaming body with a response object carrying the privacy facts', async ({
+    request,
+  }) => {
+    const response = await request.post('/v1/responses', {
+      data: { model: 'privacy-gateway', instructions: 'Be terse.', input: CUSTOMER },
+    });
+
+    expect(response.status()).toBe(200);
+
+    const body = (await response.json()) as {
+      id: string;
+      object: string;
+      status: string;
+      output: Array<{
+        type: string;
+        role: string;
+        content: Array<{ type: string; text: string }>;
+      }>;
+      x_privacy_gateway: { request_id: string; trust_tier: string; masked_prompt: string };
+    };
+
+    expect(body.object).toBe('response');
+    expect(body.status).toBe('completed');
+    expect(body.output[0]?.type).toBe('message');
+    expect(body.output[0]?.role).toBe('assistant');
+    expect(body.output[0]?.content[0]?.type).toBe('output_text');
+    expect(body.output[0]?.content[0]?.text.length).toBeGreaterThan(0);
+
+    expect(body.id).toBe(`resp-${body.x_privacy_gateway.request_id}`);
+    expect(body.x_privacy_gateway.trust_tier).toBe('machine-confirmed');
+    expect(body.x_privacy_gateway.masked_prompt).not.toContain('taro@example.co.jp');
+  });
+
+  test('streams the event sequence Codex parses, ending with response.completed', async ({
+    request,
+  }) => {
+    const response = await request.post('/v1/responses', {
+      data: { model: 'privacy-gateway', input: CUSTOMER, stream: true },
+    });
+
+    expect(response.status()).toBe(200);
+    expect(response.headers()['content-type']).toContain('text/event-stream');
+
+    const body = await response.text();
+    expect(eventTypes(body)).toEqual([
+      'response.created',
+      'response.output_item.added',
+      'response.output_text.delta',
+      'response.output_item.done',
+      'response.completed',
+    ]);
+
+    // The answer Codex keeps comes off `output_item.done`, not the delta.
+    const doneBlock = body
+      .split('\n\n')
+      .find((block) => block.includes('"response.output_item.done"'));
+    const done = JSON.parse(
+      (doneBlock?.split('\n').find((line) => line.startsWith('data: ')) ?? '').slice(
+        'data: '.length,
+      ),
+    ) as { item: { content: Array<{ text: string }> } };
+    expect(done.item.content[0]?.text.length).toBeGreaterThan(0);
+  });
+
+  test('refuses a stream with response.failed rather than a completed turn', async ({
+    request,
+  }) => {
+    const response = await request.post('/v1/responses', {
+      data: { model: 'privacy-gateway', input: `${CUSTOMER} ${LEAK_MARKER}`, stream: true },
+    });
+
+    // The 200 was already committed when the gate refused, so the refusal is
+    // the terminal event — and never a completed turn.
+    const body = await response.text();
+    expect(eventTypes(body)).toEqual(['response.failed']);
+    expect(body).not.toContain('response.completed');
+    expect(body).not.toContain('leaked.person@example.com');
+  });
+
+  test('reports a non-streaming refusal as an error with the status preserved', async ({
+    request,
+  }) => {
+    const response = await request.post('/v1/responses', {
+      data: { model: 'privacy-gateway', input: `${CUSTOMER} ${LEAK_MARKER}` },
+    });
+
+    expect(response.status()).toBe(422);
+    const body = (await response.json()) as { error: { type: string; categories?: string[] } };
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.categories).toContain('EMAIL');
+    expect(body).not.toHaveProperty('output');
+  });
+});

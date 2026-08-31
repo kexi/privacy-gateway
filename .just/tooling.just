@@ -100,6 +100,41 @@ test *args:
 test-coverage *args:
     pnpm exec vitest run --coverage {{ args }}
 
+# Drive the real Codex CLI against the deployed fleet in a PTY (heavy; final pre-submission check only)
+#
+# Not part of routine verification — use `just codex-smoke` for that. This drives
+# the unmodified CLI, which prepends ~147 KB of instructions to every turn. On the
+# single-GPU deployment masking that much input can exceed the 150 s request
+# deadline on a cold fleet: a known capacity limit, documented in
+# `tests/codex/README.md`, not a regression in the fleet's logic.
+codex-e2e *scenarios:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Why a nonce: pgw-masking asserts a per-run token round-trips, so a cached
+    # or hallucinated answer cannot pass. pitty resolves ${PGW_NONCE} through its
+    # parent-environment fallback, so exporting it here is enough.
+    #
+    # Why letters rather than the obvious timestamp-and-$RANDOM: a long run of
+    # digits is what a card number looks like, so the numeric form was detected
+    # as CREDIT_CARD, masked, and — since CREDIT_CARD is a withheld category —
+    # never rehydrated, failing the assertion on a fleet that was working
+    # correctly. A nonce must not be indistinguishable from the PII being masked.
+    export PGW_NONCE="PGW$(LC_ALL=C tr -dc 'A-Z' </dev/urandom | head -c 10)"
+    # Why the exact tag: pitty's scenario format is SemVer-stable but the tool is
+    # explicitly not production ready, so its README asks dependents to pin.
+    # First run builds pitty from source (a few minutes); later runs hit the
+    # Nix store and start instantly.
+    #
+    # The two CLI scenarios are named rather than passing the directory: it also
+    # holds `pgw-responses.yaml`, which is `codex-smoke`'s and does not need the
+    # CLI at all. `pitty run` takes one path per invocation, so they are looped
+    # rather than passed together.
+    targets=({{ if scenarios == '' { 'tests/codex/pgw-smoke.yaml tests/codex/pgw-masking.yaml' } else { scenarios } }})
+    for scenario in "${targets[@]}"; do
+      echo "==> ${scenario}"
+      nix run github:kexi/pitty/v1.2.2 -- run "$scenario"
+    done
+
 # Lint the TypeScript workspace with oxlint
 lint-ts *args:
     ./.just/web-check.sh lint {{ args }}

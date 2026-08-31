@@ -168,21 +168,57 @@ completion = client.chat.completions.create(
 print(completion.choices[0].message.content)
 ```
 
-Codex CLI selects it through a provider profile in `~/.codex/config.toml`:
+Codex CLI reaches the gateway over the **Responses API**, not `chat/completions`.
+Codex ≥ 0.149 refuses to start with `wire_api = "chat"`:
 
-```toml
-[model_providers.privacy-gateway]
-name = "Privacy Gateway"
-base_url = "https://privacy-gateway.kexi.dev/v1"
-wire_api = "chat"
-
-[profiles.privacy-gateway]
-model_provider = "privacy-gateway"
-model = "privacy-gateway"
+```
+Error loading config.toml: `wire_api = "chat"` is no longer supported.
+How to fix: set `wire_api = "responses"` in your provider config.
 ```
 
-`GET /v1/models` advertises exactly one id, `privacy-gateway`: a caller selects
-the _fleet_, not the model behind it.
+The same release also rejects `[profiles.*]` tables inside `config.toml`, so the
+profile lives in its own file, `~/.codex/pgw.config.toml`:
+
+```toml
+model = "privacy-gateway"
+model_provider = "pgw"
+
+[model_providers.pgw]
+name = "Privacy Gateway"
+base_url = "https://privacy-gateway.kexi.dev/v1"
+wire_api = "responses"
+```
+
+Then `codex --profile pgw`. `GET /v1/models` advertises exactly one id,
+`privacy-gateway`: a caller selects the _fleet_, not the model behind it.
+
+**Which check to run.** `just codex-smoke` is the routine one: it posts a small
+payload straight to `/v1/responses` and asserts the SSE contract (`response.created`
+→ nonce → `response.completed`), so it catches a wire-format regression in
+seconds. `just codex-e2e` drives the real `codex exec` in a PTY and is for the
+**final pre-submission check only** — the CLI prepends ~147 KB of instructions to
+every turn, and masking that on the single GPU can exceed the 150 s deadline on a
+cold fleet (a known capacity limit, not a bug). See `tests/codex/README.md` for
+the prerequisites and why neither is in CI.
+
+**Responses mapping.** `instructions` is prepended to the `input` turns and the
+whole thing is flattened into the one text the pipeline masks; `developer` turns
+count as system turns, `assistant` turns are dropped, and replayed `reasoning` /
+`function_call` items are ignored. The answer comes back as a single `message`
+item whose `content[0]` is an `output_text`.
+
+**Tools.** Codex declares its shell toolset on every request. The gateway accepts
+the declaration and ignores it: it has no sandbox to run a tool in, and
+fabricating a call the model never made would be a command the caller executes.
+The honest behaviour is a text answer and never a `function_call` item, which
+Codex reads as a turn that chose not to use a tool.
+
+**Streaming.** Codex hard-codes `stream: true`, so the gateway answers SSE. The
+whole answer arrives as one delta followed by `response.output_item.done` and
+`response.completed`, because the leak check runs on the complete Core answer —
+streaming tokens as produced would release text before the verdict that decides
+whether it may be released at all. A refused release arrives as a terminal
+`response.failed` carrying the gateway's own error code, never as a completed turn.
 
 **Message mapping.** `system` and `user` contents are concatenated in order,
 separated by a blank line, into the single text the pipeline masks. `assistant`

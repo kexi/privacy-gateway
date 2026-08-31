@@ -53,6 +53,7 @@ Local pipe: `just dev 2>&1 | tee /tmp/pgw-dev.log`, then `just logs-local <reque
 | gateway   | `GET /v1/requests/:id/masked-prompt.md`             | the masked prompt Core received (an OKF `sources` target)                                                                          |
 | gateway   | `GET /v1/requests/:id/core-response.md`             | Core's still-tokenized response (an OKF `sources` target)                                                                          |
 | gateway   | `POST /v1/chat/completions`                         | OpenAI-compatible façade over the same pipeline; look for the `openai.compat.chat.*` events                                        |
+| gateway   | `POST /v1/responses`                                | Responses-API façade over the same pipeline (Codex CLI); look for the `openai.compat.responses.*` events                           |
 | gateway   | `GET /v1/models`                                    | OpenAI-compatible model list; one id, `privacy-gateway`                                                                            |
 | gateway   | `GET /v1/status`                                    | Gemma warm/cold plus the cold-start estimate; derived from a recorded timestamp, cached ~5s, and never wakes the GPU               |
 | gateway   | `POST /v1/warmup`                                   | starts the GPU-backed Gemma service; look for `warmup.requested`. **Billed while the instance lives** (~15 idle minutes)           |
@@ -129,28 +130,32 @@ Expected span tree (names are stable identifiers):
 
 Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. Key events:
 
-| event                             | agent     | meaning / what to check                                                                                                                                                                                                                                      |
-| --------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `request.start` / `request.end`   | gateway   | envelope; `duration_ms`, `status`                                                                                                                                                                                                                            |
-| `mask.done`                       | gateway   | `placeholder_count` per category; 0 on PII-laden input ⇒ detector regression. `term_count` is how many verbatim-mask terms the requester named (never which); compare against `counts_by_category.CUSTOM` to see how many actually matched                   |
-| `mask.gemma.unparseable`          | gateway   | the span extractor's answer could not be read; two of these ⇒ 502, request never reached Core                                                                                                                                                                |
-| `mask.gemma.failed`               | gateway   | extractor transport failure ⇒ 502 immediately; the regexes cannot see names or addresses                                                                                                                                                                     |
-| `request.refused`                 | gateway   | a gate refused; read `refusal` for which one and `categories` for the (category-level) detail                                                                                                                                                                |
-| `request.rate_limited`            | gateway   | over the per-IP demo quota (`RATE_LIMIT_PER_MINUTE`)                                                                                                                                                                                                         |
-| `warmup.requested`                | gateway   | a manual GPU wake was dispatched; spends money until the instance idles out                                                                                                                                                                                  |
-| `judge.retry`                     | synthesis | the judge was re-asked once after an unevidenced flag over an attester-clean body; `verdict` is the second answer. Capped at one retry                                                                                                                       |
-| `guard.egress.blocked`            | gateway   | raw PII would have left the boundary — request refused (correct behavior; inspect categories). `surviving_term_count` > 0 with category `CUSTOM` means a requester-named term survived masking, which is a tokenizer fault rather than a caller mistake      |
-| `a2a.core.send` / `a2a.core.recv` | gateway   | Core round-trip; `status`, `duration_ms`; 401/403 ⇒ IAM invoker binding / ID token audience                                                                                                                                                                  |
-| `a2a.receive`                     | core      | inbound A2A request accepted; `placeholder_count`                                                                                                                                                                                                            |
-| `guard.inbound.blocked`           | core      | Core's own guard refused a payload that still held raw PII (categories only)                                                                                                                                                                                 |
-| `llm.gemini.call`                 | core      | model id, token counts; 404 ⇒ wrong `GEMINI_MODEL` (use `gemini-3.5-flash`)                                                                                                                                                                                  |
-| `attest.verdict`                  | synthesis | `verdict: pass                                                                                                                                                                                                                                               | fail`, `findings` (categories only) |
-| `judge.gemma`                     | synthesis | Gemma judge result. **Asymmetric**: `leak: true` or a null verdict blocks the release; `leak: false` adds no trust                                                                                                                                           |
-| `release.ok`                      | synthesis | the answer was released; `tokens_resolved`, `withheld_count`                                                                                                                                                                                                 |
-| `release.refused`                 | synthesis | no answer was released; `refusal` names the gate                                                                                                                                                                                                             |
-| `okf.persist`                     | synthesis | Firestore write; permission errors ⇒ SA roles (`sa-synthesis` needs datastore.user)                                                                                                                                                                          |
-| `openai.compat.chat.*`            | gateway   | the OpenAI-compatible façade: `.start`, `.end`, `.refused`, `.rejected`. Same pipeline and same gates as `/v1/ask`, so the `mask.*` / `guard.*` / `a2a.*` events for the request look identical — filter on these only to tell which surface the caller used |
-| `config.invalid`                  | any       | zod env validation failed at boot; message lists the keys                                                                                                                                                                                                    |
+| event                             | agent     | meaning / what to check                                                                                                                                                                                                                                                        |
+| --------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `request.start` / `request.end`   | gateway   | envelope; `duration_ms`, `status`                                                                                                                                                                                                                                              |
+| `mask.done`                       | gateway   | `placeholder_count` per category; 0 on PII-laden input ⇒ detector regression. `term_count` is how many verbatim-mask terms the requester named (never which); compare against `counts_by_category.CUSTOM` to see how many actually matched                                     |
+| `mask.gemma.chunked`              | gateway   | the input was over `EXTRACTION_CHUNK_BYTES` and extracted in pieces; `chunk_count`, `duration_ms`, `text_length`. Absent ⇒ single-call path. This is where a large-prompt request spends most of its masking time                                                              |
+| `mask.gemma.bisected`             | gateway   | a chunk overflowed the output budget and was halved; `depth`, `chunk_count`, `text_length`. This is the density fallback working. Bounded by log2(chunk/min), so `depth` cannot climb indefinitely                                                                             |
+| `mask.gemma.cached`               | gateway   | the chunk was extracted earlier in this process and answered from memory; `text_length` only. On an agent-CLI turn most chunks should hit this — that is what keeps a 147 KB prompt inside its deadline. All misses on a repeat turn ⇒ a new instance, or an unstable preamble |
+| `mask.gemma.unparseable`          | gateway   | the span extractor's answer could not be read; two of these ⇒ 502, request never reached Core. On the chunked path it is per chunk, and one unreadable chunk fails the whole extraction                                                                                        |
+| `mask.gemma.failed`               | gateway   | extractor transport failure ⇒ 502 immediately; the regexes cannot see names or addresses                                                                                                                                                                                       |
+| `request.refused`                 | gateway   | a gate refused; read `refusal` for which one and `categories` for the (category-level) detail                                                                                                                                                                                  |
+| `request.rate_limited`            | gateway   | over the per-IP demo quota (`RATE_LIMIT_PER_MINUTE`)                                                                                                                                                                                                                           |
+| `warmup.requested`                | gateway   | a manual GPU wake was dispatched; spends money until the instance idles out                                                                                                                                                                                                    |
+| `judge.retry`                     | synthesis | the judge was re-asked once after an unevidenced flag over an attester-clean body; `verdict` is the second answer. Capped at one retry                                                                                                                                         |
+| `guard.egress.blocked`            | gateway   | raw PII would have left the boundary — request refused (correct behavior; inspect categories). `surviving_term_count` > 0 with category `CUSTOM` means a requester-named term survived masking, which is a tokenizer fault rather than a caller mistake                        |
+| `a2a.core.send` / `a2a.core.recv` | gateway   | Core round-trip; `status`, `duration_ms`; 401/403 ⇒ IAM invoker binding / ID token audience                                                                                                                                                                                    |
+| `a2a.receive`                     | core      | inbound A2A request accepted; `placeholder_count`                                                                                                                                                                                                                              |
+| `guard.inbound.blocked`           | core      | Core's own guard refused a payload that still held raw PII (categories only)                                                                                                                                                                                                   |
+| `llm.gemini.call`                 | core      | model id, token counts; 404 ⇒ wrong `GEMINI_MODEL` (use `gemini-3.5-flash`)                                                                                                                                                                                                    |
+| `attest.verdict`                  | synthesis | `verdict: pass                                                                                                                                                                                                                                                                 | fail`, `findings` (categories only) |
+| `judge.gemma`                     | synthesis | Gemma judge result. **Asymmetric**: `leak: true` or a null verdict blocks the release; `leak: false` adds no trust                                                                                                                                                             |
+| `release.ok`                      | synthesis | the answer was released; `tokens_resolved`, `withheld_count`                                                                                                                                                                                                                   |
+| `release.refused`                 | synthesis | no answer was released; `refusal` names the gate                                                                                                                                                                                                                               |
+| `okf.persist`                     | synthesis | Firestore write; permission errors ⇒ SA roles (`sa-synthesis` needs datastore.user)                                                                                                                                                                                            |
+| `openai.compat.chat.*`            | gateway   | the OpenAI-compatible façade: `.start`, `.end`, `.refused`, `.rejected`. Same pipeline and same gates as `/v1/ask`, so the `mask.*` / `guard.*` / `a2a.*` events for the request look identical — filter on these only to tell which surface the caller used                   |
+| `openai.compat.responses.*`       | gateway   | the Responses-API façade (`POST /v1/responses`, the wire Codex CLI ≥ 0.149 uses): `.start`, `.end`, `.refused`, `.rejected`. Same pipeline and gates again — a `.refused` on a streaming request was delivered as a `response.failed` event, not an HTTP status                |
+| `config.invalid`                  | any       | zod env validation failed at boot; message lists the keys                                                                                                                                                                                                                      |
 
 ## 6. Typical failure → first place to look
 
@@ -164,6 +169,7 @@ Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. 
 | Gemma timeouts                           | `gemma-serving` logs (model load on cold start ≈ 30–60 s on the RTX PRO 6000); `--no-cpu-throttling`, min instances                        |
 | 403 between services                     | `infra/terraform/iam.tf` bindings; token audience must be the callee's URL                                                                 |
 | No trace / broken trace                  | `OTEL_ENABLED`, exporter errors in that service's logs (`event="otel.export.error"`)                                                       |
+| `just roll` fails; startup probe timeout | gemma-serving is wedged on a runaway generation and the only GPU is pinned. Full runbook in §8                                             |
 
 ## 7. Firestore
 
@@ -178,3 +184,72 @@ Canonical list: `docs/OBSERVABILITY.md` (English) / `docs/OBSERVABILITY.ja.md`. 
 - `token_vault` docs are masked-token → raw-value mappings with an `expires_at` TTL and a
   `generation` counter. They are inside the trust boundary; never copy their contents into
   a report.
+
+## 8. Incident: gemma wedged / new revision probe timeout with GPU quota 1
+
+### Symptom
+
+- `just roll gemma-serving` (or any deploy touching it) fails with **"Deployment failed"**
+  and a **startup probe timeout after ~11 minutes**. The roll cannot even start the new
+  revision.
+- Requests to the fleet hang and then return `504`, or `502 extraction_unavailable`.
+- `GET /v1/status` misleadingly reports gemma as **cold**. The status probe reports on
+  reachability, and a wedged instance answers nothing, so "cold" and "busy forever" look
+  identical from outside. Do not read `cold` as "nothing is running".
+
+### Cause
+
+The project's GPU quota is **1**. One in-flight generation therefore owns the whole
+service. A runaway or simply very long generation — the original incident was a ~147 KB
+Codex prompt sent to an uncapped span extractor, which generated until the context was
+exhausted — keeps that instance busy for 15+ minutes. A generating instance never goes
+idle, so:
+
+- it will not scale to zero,
+- Cloud Run cannot place the new revision (quota 1, and the old one will not release),
+- the startup probe on the new revision times out and the deploy is rejected.
+
+Nothing recovers on its own within a useful timeframe. The GPU must be forcibly drained.
+
+### Recovery
+
+```bash
+# 1. Force every instance down. `--scaling=0` is a hard stop, unlike
+#    --min-instances=0, which only stops *keeping* an instance warm.
+gcloud beta run services update gemma-serving \
+  --region us-central1 --project all-thinkgs --scaling=0
+
+# 2. Wait for the instances to actually drain before restoring scaling.
+#    Restoring too early re-admits the wedged instance and the roll fails again.
+gcloud run services describe gemma-serving \
+  --region us-central1 --project all-thinkgs \
+  --format='value(status.traffic, status.latestReadyRevisionName)'
+
+# 3. Restore autoscaling once nothing is running.
+gcloud beta run services update gemma-serving \
+  --region us-central1 --project all-thinkgs \
+  --scaling=auto --min-instances=0 --max-instances=1
+```
+
+Then re-run the roll. Leave the service at `min-instances=0` / `max-instances=1`
+(`AUTOMATIC` scaling) — this is the steady state the Terraform config asserts, and
+`just warm` / `just chill` are the supported way to pin it temporarily for a demo.
+
+### Prevention
+
+Output caps. The Gateway's span extractor sets `maxOutputTokens: 4096` and the Synthesis
+judge is capped likewise: a bounded generation cannot pin the GPU indefinitely, which is
+what turned an ordinary slow request into a fleet-wide outage. The cap in turn is what
+makes **chunked extraction** necessary — a 147 KB prompt's span list does not fit in 4096
+tokens, so the input is split (`EXTRACTION_CHUNK_BYTES`, default 12000) and extracted 3
+chunks at a time, leaving one of Gemma's 4 slots free for the judge.
+
+Size is not the only bound: **density** is. A 1.7 KB passage naming a hundred distinct
+people overflows the same budget a 12 KB prose page does not, so a chunk that is still
+unreadable after its retry is halved and re-extracted down to `EXTRACTION_MIN_CHUNK_BYTES`
+(default 1000) — see `mask.gemma.bisected` (`depth`). The extraction prompt also asks for
+each distinct value exactly once, since `spansToDetections` re-locates every occurrence
+itself and per-occurrence repetition was spending the output budget for nothing.
+
+Watch `mask.gemma.chunked` for `chunk_count` / `duration_ms` and `mask.gemma.bisected` for
+`depth`; never raise the token cap to "make large prompts work".
