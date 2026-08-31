@@ -200,11 +200,11 @@ Then `codex --profile pgw`. `GET /v1/models` advertises exactly one id,
 **Which check to run.** `just codex-smoke` is the routine one: it posts a small
 payload straight to `/v1/responses` and asserts the SSE contract (`response.created`
 → nonce → `response.completed`), so it catches a wire-format regression in
-seconds. `just codex-e2e` drives the real `codex exec` in a PTY and is for the
-**final pre-submission check only** — the CLI prepends ~147 KB of instructions to
-every turn, and masking that on the single GPU can exceed the 240 s deadline on a
-cold fleet (a known capacity limit, not a bug). See `tests/codex/README.md` for
-the prerequisites and why neither is in CI.
+seconds. `just codex-e2e` drives the real `codex exec` in a PTY and is the
+**heavier, pre-submission-grade check** — the CLI prepends ~147 KB of
+instructions to every turn (~59 KB of it actually forwarded), and a warm turn
+completes in ~30 s end to end (measured 2026-08-31). See `tests/codex/README.md`
+for the prerequisites and why neither is in CI.
 
 **Responses mapping.** `instructions` is prepended to the `input` turns and the
 whole thing is flattened into the one text the pipeline masks; `developer` turns

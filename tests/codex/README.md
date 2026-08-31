@@ -42,11 +42,12 @@ jq 'select(.event=="openai.compat.responses.start")
 
 Divide `forwarded_text_bytes` by the deployed `EXTRACTION_CHUNK_BYTES` (4000) for
 the chunk count, which fans out four at a time across the four llama.cpp slots of
-one GPU — a global cap, held across bisection too. A **cold fleet's first CLI turn
-can still exceed the 240 s request deadline**, because the scale-from-zero case
-also waits for Ollama to load `gemma4:12b`. That is a known capacity limit of a
-single-GPU deployment, not a defect in the fleet's logic: the gateway either
-answers or refuses cleanly, and never degrades its masking to go faster.
+one GPU — a global cap, held across bisection too. With the schema-constrained,
+no-thinking extractor, a real warm CLI turn completes in **~30 s** (measured
+2026-08-31, `codex exec` end to end); a scale-from-zero turn adds Ollama's
+`gemma4:12b` load (~90 s) and still fits the 240 s deadline. Either way the
+gateway answers or refuses cleanly, and never degrades its masking to go
+faster.
 
 Two things make repeat turns much cheaper. The gateway keeps an in-process LRU of
 already-extracted chunks, and the CLI's preamble is byte-identical between turns,

@@ -51,8 +51,9 @@ reasons never sees a secret at all.
   (cards, keys) are withheld by default; they are restored only through an
   explicit per-request opt-in, recorded as `disclosure_requested`, while the
   stored evidence remains masked either way.
-- **Consume it six ways**: web UI, REST, an OpenAI-compatible endpoint (select
-  `privacy-gateway` as a model in Codex CLI/Cursor/any custom-base-URL tool),
+- **Consume it six ways**: web UI, REST, an OpenAI-compatible endpoint —
+  the real Codex CLI runs against it as its model, a full `codex exec` turn
+  (~59 KB of instructions masked chunk by chunk) answering in ~30 s warm —
   an MCP server for Claude Desktop/Claude Code, a localhost model-picker shim
   (Anthropic Messages + native Ollama APIs), and a single-file PEP 723 Python
   CLI.
