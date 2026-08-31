@@ -15,6 +15,41 @@ use, the same fail-closed gates run and the same evidence is stored.
 Deployed Gateway: `https://privacy-gateway.kexi.dev`. Local: `http://localhost:8081`.
 Substitute either for the base URL in the examples below.
 
+## 0. The Basic-auth gate
+
+`BASIC_AUTH_CREDENTIALS=user:pass` on the Gateway turns on an HTTP Basic gate
+over every surface; unset, the gateway is exactly as public as the examples
+below assume. The deployed demo runs **gated** through the judging window — the
+credential is distributed via the submission form, never this repository.
+Per-client, verified against the live deployment on 2026-09-01:
+
+- **curl**: `curl -u user:pass …` composes with every example below.
+- **Web UI and audit page**: the browser answers the 401 challenge with its own
+  credential dialog; enter it once and every in-page fetch inherits it.
+- **OpenAI SDK**: the `api_key` field can **not** carry the credential — the SDK
+  sends it as `Authorization: Bearer …` and the gate accepts only `Basic `.
+  Pass the header explicitly:
+
+  ```python
+  client = OpenAI(
+      base_url="https://privacy-gateway.kexi.dev/v1",
+      api_key="unused",
+      default_headers={"Authorization": "Basic <base64(user:pass)>"},
+  )
+  ```
+
+- **Codex CLI**: `env_key` has the same Bearer problem, so put the header in
+  the provider block instead — see the profile in §2.
+- **MCP server, Ollama shim, `pgw.py`**: no credential channel today. They work
+  against an ungated deployment or `http://localhost:8081`; pointed at the gated
+  demo, every call answers 401. Embedding `user:pass@` in `PGW_GATEWAY_URL` does
+  not work either — Node's `fetch` rejects a URL that carries credentials.
+
+`/healthz` is exempt so the liveness probe stays unauthenticated — but that is
+only observable locally: on Cloud Run, Google's frontend intercepts `/healthz`
+and answers its own 404 on both the custom domain and the `run.app` host, so
+the request never reaches the container from outside.
+
 ## 1. The native endpoint
 
 ```bash
@@ -192,6 +227,9 @@ model_max_output_tokens = 8192
 name = "Privacy Gateway"
 base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "responses"
+# Only when the deployment is gated (§0). `http_headers`, not `env_key`:
+# Codex sends an env_key as `Bearer`, which the Basic gate refuses.
+http_headers = { "Authorization" = "Basic <base64(user:pass)>" }
 ```
 
 Then `codex --profile pgw`. `GET /v1/models` advertises exactly one id,

@@ -191,6 +191,21 @@ variable "budget_jpy" {
   }
 }
 
+variable "basic_auth_credentials" {
+  description = <<-EOT
+    Optional HTTP Basic gate over every Gateway surface, as "user:pass".
+    Empty (the default) leaves the gateway public. Set, every route except the
+    liveness probe demands the credential; a value without a colon fails
+    closed — the gate turns on and nothing can match it. Demo-grade like
+    admin_token: pass it per apply (`-var basic_auth_credentials=...`), never
+    commit it, and pass it on EVERY apply while the judging window is open —
+    an apply without it rolls a revision that runs open.
+  EOT
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "admin_token" {
   description = <<-EOT
     Capability token for the read-only audit view at /audit. Empty (the

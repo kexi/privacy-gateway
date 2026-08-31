@@ -836,6 +836,9 @@ line for `gemma-serving` while the quota is pending.
 
 ### 8.2 Gateway (public, no auth)
 
+When the judging-window Basic gate is enabled (§9.6), add `-u user:pass` to these
+probes; without it they answer 401, which is itself proof the gate is up.
+
 ```bash
 GATEWAY_URL=$(gcloud run services describe gateway-agent \
   --region=us-central1 --format='value(status.url)')
@@ -1153,6 +1156,41 @@ A token that was ever used in a `?key=` URL against a deployed revision must be 
 disclosed and rotated, because it is already in the request log.
 
 ---
+
+### 9.6 The judging-window Basic gate
+
+`BASIC_AUTH_CREDENTIALS=user:pass` on the Gateway turns on an HTTP Basic gate over
+every surface except the liveness probe. Unset, the gateway is public. A set value
+without a colon **fails closed**: the gate turns on and nothing can match it, which is
+the safe reading of a credential that was clearly intended but mistyped. Comparison is
+constant-time. (The `/healthz` exemption is observable only locally: from outside,
+Google's frontend intercepts `/healthz` with its own 404 on both the custom domain and
+the `run.app` host, so the request never reaches the container.)
+
+Client-side consequences live in `skills/pgw-client/CLIENT.md` §0 — most importantly,
+the OpenAI SDK's `api_key` field cannot carry the credential (it sends `Bearer`; the
+gate accepts only `Basic`), Codex needs `http_headers` in its provider block, and the
+MCP server / Ollama shim / `pgw.py` have no credential channel at all.
+
+Like `admin_token`, this is a Terraform variable (`basic_auth_credentials`,
+`sensitive`, default `""`), passed per apply and never committed:
+
+```bash
+# the durable home is 1Password; `just sync-judge-secret` copies it into the
+# macOS keychain (service privacy-gateway-basic-auth, account judge). The
+# keychain holds the password alone — the env value is judge:<password>.
+just tf-apply basic_auth_credentials="judge:$(security find-generic-password \
+  -a judge -s privacy-gateway-basic-auth -w)"
+```
+
+Judges read the credential from the submission form's testing instructions — the
+Devpost-sanctioned pattern for gated demos — never from this repository.
+
+**Pass the variable on every apply while the judging window is open.** An apply
+without it rolls a revision whose gate is empty, and the fleet runs open. (The gate
+was first enabled out-of-band on 2026-09-01, before this variable existed; the
+variable is now the source of truth, and the first apply that omits it would have
+silently removed the out-of-band value — that near-miss is why it is declared.)
 
 ## 10. Teardown
 

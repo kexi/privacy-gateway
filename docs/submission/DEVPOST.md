@@ -119,7 +119,9 @@ zod · vitest · Playwright · MCP · OKF v0.2
 
 ## Links
 
-- Hosted demo: https://privacy-gateway.kexi.dev
+- Hosted demo: https://privacy-gateway.kexi.dev — gated behind HTTP Basic auth for
+  the judging window; the credential is in this submission's testing instructions
+  (browsers prompt for it; for API clients see `skills/pgw-client/CLIENT.md` §0)
 - Repository: https://github.com/kexi/privacy-gateway ⟨confirm access for judges⟩
 - Video: ⟨YouTube URL, ≤4 min, English subtitles⟩
 - Architecture diagram: https://github.com/kexi/privacy-gateway/blob/main/docs/diagram/architecture.drawio.png

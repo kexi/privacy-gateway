@@ -820,6 +820,9 @@ just tf-output # Terraform の output（deterministic_urls を含む）
 
 ### 8.2 Gateway（公開・認証不要）
 
+審査期間中の Basic ゲート（§9.6）が有効なときは、以下のプローブに `-u user:pass` を
+付けること。付けなければ 401 が返るが、それ自体がゲートが立っている証明になる。
+
 ```bash
 GATEWAY_URL=$(gcloud run services describe gateway-agent \
   --region=us-central1 --format='value(status.url)')
@@ -1137,6 +1140,41 @@ capability を残さない）、以降は `X-Admin-Token` ヘッダーとして�
 ログに載っているため漏洩したものとして扱い、ローテーションすること。
 
 ---
+
+### 9.6 審査期間中の Basic ゲート
+
+Gateway に `BASIC_AUTH_CREDENTIALS=user:pass` を設定すると、liveness プローブを除く
+全サーフェスに HTTP Basic のゲートがかかる。未設定なら gateway は公開のまま。コロンを
+含まない値は**フェイルクローズド**——ゲートは立つが何もマッチしなくなる。これは「設定
+する意図は明らかだがタイポした資格情報」の安全側の解釈である。比較は定数時間で行う。
+（`/healthz` の免除はローカルでしか観測できない。外からは Google のフロントエンドが
+カスタムドメイン・`run.app` ホストの両方で `/healthz` を横取りして独自の 404 を返すため、
+リクエストはコンテナに届かない。）
+
+クライアント側への影響は `skills/pgw-client/CLIENT.md` §0 を参照——特に重要なのは、
+OpenAI SDK の `api_key` では資格情報を運べないこと（SDK は `Bearer` で送るがゲートは
+`Basic` しか受け付けない）、Codex はプロバイダブロックに `http_headers` が必要なこと、
+MCP サーバー / Ollama shim / `pgw.py` には資格情報を渡す口が一切ないこと。
+
+`admin_token` と同じく Terraform 変数（`basic_auth_credentials`、`sensitive`、既定値
+`""`）で、apply ごとに渡す。コミットは決してしない：
+
+```bash
+# 恒久的な保管場所は 1Password。`just sync-judge-secret` が macOS キーチェーン
+# （service privacy-gateway-basic-auth、account judge）へコピーする。キーチェーンが
+# 保持するのはパスワード単体で、env の値は judge:<password> の形になる。
+just tf-apply basic_auth_credentials="judge:$(security find-generic-password \
+  -a judge -s privacy-gateway-basic-auth -w)"
+```
+
+審査員は資格情報を提出フォームのテスト手順から読む（ゲート付きデモに対する Devpost
+公認のパターン）。このリポジトリには決して置かない。
+
+**審査期間が開いている間は、すべての apply でこの変数を渡すこと。** 渡さない apply は
+ゲートが空のリビジョンをロールし、フリートは開放状態で動く。（ゲートは 2026-09-01 に
+この変数が存在しない状態で out-of-band に有効化された。現在はこの変数が source of
+truth であり、変数を省いた最初の apply が out-of-band の値を黙って消すところだった——
+そのニアミスがこの変数を宣言した理由である。）
 
 ## 10. テアダウン
 

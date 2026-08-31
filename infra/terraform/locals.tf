@@ -143,6 +143,12 @@ locals {
         # have no audit surface to gate, and a secret is not handed to a service
         # that has no use for it.
         ADMIN_TOKEN = var.admin_token
+
+        # The judging-window Basic gate (docs/DEPLOY.md §9.6). Empty installs
+        # no gate. Only the Gateway takes it: the private services are gated
+        # by IAM, and a shared secret is not handed to services that never
+        # face the internet.
+        BASIC_AUTH_CREDENTIALS = var.basic_auth_credentials
       }
     }
   }

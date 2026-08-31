@@ -93,6 +93,15 @@ every other service is private (IAM invoker + ID token) or internal-ingress only
 | `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress only             |
 | `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private (Pub/Sub push + OIDC)     |
 
+> **Judging-window access.** The hosted Gateway is gated behind HTTP Basic auth
+> (credentials in the Devpost submission's testing instructions, never in this
+> repository). Add `-u user:pass` to the curl examples below. The OpenAI SDK's
+> `api_key` field cannot carry it (it sends `Bearer`; the gate accepts only
+> `Basic`) — per-client instructions, including Codex and the SDK header
+> workaround, are in [`skills/pgw-client/CLIENT.md`](skills/pgw-client/CLIENT.md)
+> §0. The MCP server, the Ollama shim and `pgw.py` have no credential channel
+> yet: run those against a local or ungated deployment.
+
 ```bash
 curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -H 'content-type: application/json' \
@@ -628,6 +637,9 @@ model_max_output_tokens = 8192
 name = "Privacy Gateway"
 base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "responses"
+# Only when the deployment is gated: Codex sends an env_key as `Bearer`,
+# which the Basic gate refuses, so the header goes here instead.
+http_headers = { "Authorization" = "Basic <base64(user:pass)>" }
 ```
 
 Then `codex --profile pgw`. `GET /v1/models` advertises exactly one id,

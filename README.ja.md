@@ -95,6 +95,15 @@ Ollama と本番の Cloud Run GPU を同一のコードパスで扱える。
 | `gemma-serving`   | `https://gemma-serving-turszib42q-uc.a.run.app`   | internal ingress のみ          |
 | `kill-switch`     | `https://kill-switch-turszib42q-uc.a.run.app`     | private（Pub/Sub push + OIDC） |
 
+> **審査期間中のアクセス。** ホストされた Gateway は HTTP Basic 認証で保護されている
+> （認証情報は Devpost 提出フォームのテスト手順に記載。このリポジトリには置かない）。
+> 以下の curl 例には `-u user:pass` を付けること。OpenAI SDK の `api_key` では通らない
+> （SDK は `Bearer` で送るが、ゲートは `Basic` しか受け付けない）——Codex や SDK の
+> ヘッダー指定を含むクライアント別の手順は
+> [`skills/pgw-client/CLIENT.md`](skills/pgw-client/CLIENT.md) §0 を参照。
+> MCP サーバー・Ollama shim・`pgw.py` にはまだ認証情報を渡す口がないため、
+> ローカルまたはゲートなしのデプロイに対して使うこと。
+
 ```bash
 curl -sS https://privacy-gateway.kexi.dev/v1/ask \
   -H 'content-type: application/json' \
@@ -625,6 +634,9 @@ model_max_output_tokens = 8192
 name = "Privacy Gateway"
 base_url = "https://privacy-gateway.kexi.dev/v1"
 wire_api = "responses"
+# ゲート付きデプロイのときだけ必要: Codex は env_key を `Bearer` で送るが
+# ゲートは Basic しか受け付けないので、ヘッダーはここに書く。
+http_headers = { "Authorization" = "Basic <base64(user:pass)>" }
 ```
 
 あとは `codex --profile pgw`。`GET /v1/models` が広告する ID は

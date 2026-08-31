@@ -105,6 +105,11 @@ env = { PGW_GATEWAY_URL = "http://localhost:8081" }
 
 ## Notes
 
+- **No credential channel yet.** When the deployment enables the Basic-auth gate
+  (`BASIC_AUTH_CREDENTIALS`, see `skills/pgw-client/CLIENT.md` §0), this server
+  cannot authenticate: there is no header option, and Node's `fetch` rejects a
+  `user:pass@` URL in `PGW_GATEWAY_URL` outright. Point it at a local
+  (`http://localhost:8081`) or ungated deployment instead.
 - **stdout is the protocol channel.** Nothing in this package writes to stdout;
   the one startup line goes to stderr.
 - **No request text is ever logged.** The gateway exists to keep raw PII inside
