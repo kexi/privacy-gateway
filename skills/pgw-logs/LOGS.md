@@ -235,6 +235,25 @@ Then re-run the roll. Leave the service at `min-instances=0` / `max-instances=1`
 (`AUTOMATIC` scaling) — this is the steady state the Terraform config asserts, and
 `just warm` / `just chill` are the supported way to pin it temporarily for a demo.
 
+### The min-instances ghost (observed 2026-08-31)
+
+`min-instances` is recorded on the **revision** a `just warm` created, not only on
+the service. Draining with `--scaling=0` and restoring `--scaling=auto` does not
+retire that revision: if it is still the traffic target, switching back to
+AUTOMATIC immediately restarts its pinned instance ("Starting new instance.
+Reason: MANUAL_OR_CUSTOMER_MIN_INSTANCE" in the logs) — billing resumes, and the
+restarted instance takes the only GPU, which starves the validation of the very
+min-0 revision that was supposed to replace it. Symptoms: `just chill` hangs and
+fails at the 11-minute probe timeout while a warm instance keeps coming back.
+
+Recovery that actually holds overnight: stay at `--scaling=0` (manual, zero
+instances — requests refuse cleanly with `502 extraction_unavailable`, nothing
+bills), and switch back to `--scaling=auto --min-instances=0 --max-instances=1
+--async` only when the next warm window starts. The ghost revision then revives
+one instance on its own, which doubles as the warm-up; it is finally cleaned up
+by the next successful roll or `tf-apply` that lands a min-0 revision as the
+traffic target.
+
 ### Prevention
 
 Output caps. The Gateway's span extractor sets `maxOutputTokens: 4096`; the Synthesis
