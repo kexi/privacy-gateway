@@ -182,6 +182,11 @@ profile lives in its own file, `~/.codex/pgw.config.toml`:
 ```toml
 model = "privacy-gateway"
 model_provider = "pgw"
+# Without these two, Codex warns "Model metadata for privacy-gateway not found.
+# Defaulting to fallback metadata": it knows no context window for an id that is
+# not an OpenAI model, so it guesses one and may truncate turns on its own.
+model_context_window = 65536      # the gateway's 256 KiB body limit is ~65k tokens
+model_max_output_tokens = 8192
 
 [model_providers.pgw]
 name = "Privacy Gateway"

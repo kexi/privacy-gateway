@@ -6,7 +6,7 @@ pseudo-terminal and asserts on the streamed output.
 
 > **Which one to run.** Day to day, run **`just codex-smoke`** only. The full
 > **`just codex-e2e`** is reserved for the **final pre-submission / pre-release
-> check** — it drives the real CLI, whose ~147 KB instruction prompt has to be
+> check** — it drives the real CLI, whose turn forwards ~58 KiB into masking (measured) and has to be
 > masked through the single GPU before the turn even starts.
 
 ```sh
@@ -15,22 +15,38 @@ just codex-e2e                              # final check: both real-CLI scenari
 just codex-e2e tests/codex/pgw-smoke.yaml   # one of them
 ```
 
-| Scenario             | Recipe        | What it guarantees                                                                                                                                                                             |
-| -------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pgw-responses.yaml` | `codex-smoke` | The Responses API contract Codex depends on: an SSE stream that opens with `response.created`, carries a per-run nonce, and terminates with `response.completed`. No CLI, so no 147 KB prompt. |
-| `pgw-smoke.yaml`     | `codex-e2e`   | Codex reaches the fleet through the Responses API and prints an answer, exiting 0.                                                                                                             |
-| `pgw-masking.yaml`   | `codex-e2e`   | A prompt containing an email address round-trips: a per-run nonce and the address both come back, so masking and rehydration are transparent to the client.                                    |
+| Scenario             | Recipe        | What it guarantees                                                                                                                                                                                        |
+| -------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pgw-responses.yaml` | `codex-smoke` | The Responses API contract Codex depends on: an SSE stream that opens with `response.created`, carries a per-run nonce, and terminates with `response.completed`. No CLI, so no large instruction prompt. |
+| `pgw-smoke.yaml`     | `codex-e2e`   | Codex reaches the fleet through the Responses API and prints an answer, exiting 0.                                                                                                                        |
+| `pgw-masking.yaml`   | `codex-e2e`   | A prompt containing an email address round-trips: a per-run nonce and the address both come back, so masking and rehydration are transparent to the client.                                               |
 
 ## The heavy path, and its known limit
 
-`codex-e2e` is a **load** test as much as a protocol test. The Codex CLI prepends
-its own instruction block — tool schemas, workspace rules, policy text, roughly
-**147 KB** — to every turn, and all of it must be scanned for unstructured PII
-before anything is sent onward. At the deployed 4 KB chunk size that is ~37 Gemma
-calls fanned out across the four llama.cpp slots of one GPU, so a **cold fleet's
-first CLI turn can exceed the 150 s request deadline**. That is a known capacity
-limit of a single-GPU deployment, not a defect in the fleet's logic: the gateway
-either answers or refuses cleanly, and never degrades its masking to go faster.
+`codex-e2e` is a **load** test as much as a protocol test. The Codex CLI sends a
+large turn — its instruction block, workspace rules, policy text, plus the tool
+schemas it declares — and what must be scanned for unstructured PII is the part
+the gateway actually forwards into masking.
+
+**Those are not the same number, and the distinction matters.** The Responses
+mapping flattens `instructions` plus the message turns into one text; the
+top-level `tools` array is accepted and **ignored**, as are `reasoning`,
+`include`, `store` and the rest. So the raw body is larger than what is masked,
+and any latency estimate has to start from the forwarded figure. The gateway logs
+both on every request, so this is measured rather than assumed:
+
+```
+jq 'select(.event=="openai.compat.responses.start")
+    | {request_id, raw_body_bytes, forwarded_text_bytes}'
+```
+
+Divide `forwarded_text_bytes` by the deployed `EXTRACTION_CHUNK_BYTES` (4000) for
+the chunk count, which fans out four at a time across the four llama.cpp slots of
+one GPU — a global cap, held across bisection too. A **cold fleet's first CLI turn
+can still exceed the 150 s request deadline**, because the scale-from-zero case
+also waits for Ollama to load `gemma4:12b`. That is a known capacity limit of a
+single-GPU deployment, not a defect in the fleet's logic: the gateway either
+answers or refuses cleanly, and never degrades its masking to go faster.
 
 Two things make repeat turns much cheaper. The gateway keeps an in-process LRU of
 already-extracted chunks, and the CLI's preamble is byte-identical between turns,
@@ -45,8 +61,11 @@ regression and a GPU capacity limit produced the same red.
 
 - **`~/.codex/pgw.config.toml`** declaring the `pgw` provider with
   `wire_api = "responses"` (Codex ≥ 0.149 rejects `wire_api = "chat"`, and
-  rejects `[profiles.*]` inside `config.toml` — hence the separate file). See
-  the Codex section of `skills/pgw-client/CLIENT.md`.
+  rejects `[profiles.*]` inside `config.toml` — hence the separate file). It must
+  also carry `model_context_window = 65536` and `model_max_output_tokens = 8192`;
+  without them Codex warns `Model metadata for privacy-gateway not found.
+Defaulting to fallback metadata` and guesses a context window for an id it does
+  not recognise. See the Codex section of `skills/pgw-client/CLIENT.md`.
 - **A logged-in `codex` CLI.** The scenarios spawn the binary on `PATH`; Codex
   still needs its own credentials to start, even though the turn itself is
   served by the gateway.
@@ -72,14 +91,19 @@ in the chain is a stand-in.
 
 ## Two traps these scenarios hit
 
-**`expect` does not expand variables.** pitty v1.2.2 interpolates `${VAR}` in
-`spawn` and `send`, but **not** inside an `expect` block: an assertion written as
-`contains: 'ACK ${PGW_NONCE}'` compares against those literal characters and can
-never match. `pgw-responses.yaml` therefore asserts on a fixed prefix
-(`"text":"ACK PGW`) while the nonce is interpolated into the _request_, which is
-where it does its work — a stale or invented answer still cannot produce a reply
-to this run's prompt. `pgw-masking.yaml` has the same shape and its nonce
-assertion is weaker than it looks for the same reason.
+**`expect` does not expand variables — so the scenarios are rendered first.**
+pitty v1.2.2 interpolates `${VAR}` in `spawn` and `send`, but **not** inside an
+`expect` block: an assertion written as `contains: 'ACK ${PGW_NONCE}'` compares
+against those literal characters and can never match. That is not a weak
+assertion, it is an impossible one, and both scenarios used to work around it —
+`pgw-responses.yaml` asserted on the fixed prefix `"text":"ACK PGW` and
+`pgw-masking.yaml` asserted on a string nothing could produce.
+
+Both now carry a `__PGW_NONCE__` marker instead, and `.just/render-scenario.sh`
+substitutes the run's actual nonce into a temp copy before pitty reads it, so the
+**whole** nonce appears on both the request side and the assertion side. What
+this proves is now what it says: the reply contains this run's nonce, so it
+cannot be a cached, replayed or invented answer.
 
 **A nonce must not look like PII.** The nonce used to be
 `PGW-$(date +%s)-$RANDOM`. That long run of digits is what a card number looks

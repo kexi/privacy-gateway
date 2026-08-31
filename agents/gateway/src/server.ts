@@ -104,6 +104,37 @@ function contextOf(req: Request): RequestContext | undefined {
 }
 
 /**
+ * Adapt an async handler to Express, which understands only synchronous ones.
+ *
+ * Why not `(req, res, next) => { void handler(req, res, next); }`, which is what
+ * every route did: `void` discards the promise along with its rejection, so a
+ * throw that escaped a handler's own try/catch became an unhandled rejection —
+ * the caller's socket left hanging and, under Node's default, the process torn
+ * down. The handlers do catch their expected failures; this covers the ones they
+ * cannot anticipate (a malformed body reaching a mapper, a downstream client
+ * throwing outside the awaited call) by routing them to Express's error
+ * middleware, which answers 500 without any exception text.
+ */
+function route(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, res, next) => {
+    // An awaited try/catch rather than `.catch(next)`: the lint rule against
+    // calling a callback inside a promise handler is guarding real
+    // callback/promise mixing, and this is Express's error channel — the one
+    // place a promise genuinely must hand off to a callback. Written as an async
+    // IIFE the handoff is ordinary control flow, which is also easier to read.
+    void (async () => {
+      try {
+        await handler(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    })();
+  };
+}
+
+/**
  * The `:id` path segment.
  *
  * Express types every path parameter as possibly absent, but a handler only runs
@@ -236,20 +267,14 @@ export function createApp(options: CreateAppOptions): express.Application {
     res.status(200).json({ status: 'ok', agent: 'gateway' });
   });
 
-  app.post('/v1/ask', (req, res, next) => {
-    void handleAsk(req, res, next);
-  });
+  app.post('/v1/ask', route(handleAsk));
 
   // Public, unauthenticated and deliberately cheap: it reads a cached timestamp
   // and never touches Gemma, so a page that polls it cannot wake a GPU. See
   // `status.ts`.
-  app.get('/v1/status', (req, res) => {
-    void handleStatus(req, res);
-  });
+  app.get('/v1/status', route(handleStatus));
 
-  app.post('/v1/warmup', (req, res) => {
-    void handleWarmup(req, res);
-  });
+  app.post('/v1/warmup', route(handleWarmup));
 
   // The OpenAI-compatible façade. Same gates, same vault discipline; only the
   // request and response shapes differ. See `openai_compat.ts` for the mapping.
@@ -257,28 +282,24 @@ export function createApp(options: CreateAppOptions): express.Application {
     handleModels(req, res, now);
   });
 
-  app.post('/v1/chat/completions', (req, res, next) => {
-    void handleChatCompletions(req, res, next);
-  });
+  app.post('/v1/chat/completions', route(handleChatCompletions));
 
   // The Responses API surface. Codex CLI >= 0.149 dropped chat/completions for
   // custom providers, so a `wire_api = "responses"` client reaches only this.
   // Same gates, same vault discipline; see `responses_compat.ts`.
-  app.post('/v1/responses', (req, res, next) => {
-    void handleResponses(req, res, next);
-  });
+  app.post('/v1/responses', route(handleResponses));
 
-  app.get('/v1/requests/:id', (req, res, next) => {
-    void handleEvidence(req, res, next);
-  });
+  app.get('/v1/requests/:id', route(handleEvidence));
 
-  app.get('/v1/requests/:id/masked-prompt.md', (req, res, next) => {
-    void handleArtifact(req, res, next, 'masked-prompt.md');
-  });
+  app.get(
+    '/v1/requests/:id/masked-prompt.md',
+    route((req, res, next) => handleArtifact(req, res, next, 'masked-prompt.md')),
+  );
 
-  app.get('/v1/requests/:id/core-response.md', (req, res, next) => {
-    void handleArtifact(req, res, next, 'core-response.md');
-  });
+  app.get(
+    '/v1/requests/:id/core-response.md',
+    route((req, res, next) => handleArtifact(req, res, next, 'core-response.md')),
+  );
 
   // The audit view exists only when a token is configured. Registering the
   // routes conditionally — rather than registering them and checking inside —
@@ -304,9 +325,7 @@ export function createApp(options: CreateAppOptions): express.Application {
       return false;
     };
 
-    app.get('/v1/audit', (req, res, next) => {
-      void handleAuditList(req, res, next);
-    });
+    app.get('/v1/audit', route(handleAuditList));
 
     /** Newest-first evidence metadata. Never any document bodies. */
     async function handleAuditList(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -478,12 +497,15 @@ export function createApp(options: CreateAppOptions): express.Application {
                 coreActor,
                 extractSpans:
                   options.extractSpans ??
-                  (async (spanText) => {
+                  (async (spanText, spanSignal) => {
                     const spans = await extractUnstructured(spanText, {
                       logger: scoped,
                       model: config.GEMMA_MODEL,
                       baseUrl: config.GEMMA_BASE_URL,
                       apiKey: config.GEMMA_API_KEY,
+                      // The deadline controller reaches the extractor, so once the
+                      // request is answered 504 no further chunk is dequeued.
+                      ...(spanSignal === undefined ? {} : { signal: spanSignal }),
                       ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
                     });
                     // Stamped only on success, and only after the call returned:
@@ -624,7 +646,12 @@ export function createApp(options: CreateAppOptions): express.Application {
       return;
     }
 
-    logResponsesStart(context.logger, parsed.stream);
+    logResponsesStart(context.logger, parsed.stream, {
+      forwardedTextBytes: Buffer.byteLength(parsed.text, 'utf8'),
+      // Re-serialized rather than read from a header: `content-length` is absent
+      // on a chunked upload, and this is a diagnostic size, not an accounting.
+      rawBodyBytes: Buffer.byteLength(JSON.stringify(req.body ?? null), 'utf8'),
+    });
 
     try {
       const result = await runAsk(

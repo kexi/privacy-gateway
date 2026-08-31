@@ -17,6 +17,23 @@
  *
  * Prints, per chunk, whether the answer parsed and — when it did not — the raw
  * text the model returned, so a failure can be classified rather than guessed at.
+ *
+ * ## This is a stress fixture, not a wire capture
+ *
+ * The payload is **synthetic and deliberately worst-case**, and it does not go
+ * through the Responses projection. It embeds JSON tool schemas directly in the
+ * text, whereas a real `/v1/responses` request carries its `tools` in a
+ * top-level field that `flattenResponsesInput` accepts and **drops** — only
+ * `instructions` plus the message turns are forwarded into masking. So the bytes
+ * this harness extracts are not the bytes a Codex turn extracts, and its chunk
+ * count must never be quoted as one.
+ *
+ * That is on purpose: the job here is to provoke the JSON-contract failure with
+ * the densest brace-heavy content available, which is a different job from
+ * measuring what a real request costs. The real figure is measured on the live
+ * path instead — the Gateway logs `forwarded_text_bytes` and `raw_body_bytes` on
+ * `openai.compat.responses.start`, and the gap between them is exactly what the
+ * projection drops. Capacity and latency claims cite those, never this file.
  */
 
 import {

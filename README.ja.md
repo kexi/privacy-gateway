@@ -615,6 +615,11 @@ Codex 0.149 以降はカスタムプロバイダ向けの `chat/completions` を
 ```toml
 model = "privacy-gateway"
 model_provider = "pgw"
+# この 2 つがないと Codex は "Model metadata for privacy-gateway not found.
+# Defaulting to fallback metadata" と警告する。OpenAI のモデルでない ID の
+# コンテキスト長を Codex は知らないため、独自の推測値でターンを切り詰めうる。
+model_context_window = 65536      # gateway の 256 KiB ボディ上限は約 65k tokens
+model_max_output_tokens = 8192
 
 [model_providers.pgw]
 name = "Privacy Gateway"

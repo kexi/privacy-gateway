@@ -55,6 +55,34 @@ import { buildAnswerStore, type AnswerStore, type EvidenceRecord } from './store
 /** Cloud Run injects PORT. Locally 8083 follows gateway (8081) and core (8082). */
 const DEFAULT_PORT = 8083;
 
+/**
+ * Adapt an async handler to Express, which understands only synchronous ones.
+ *
+ * Why not `void handler(...)`, which is what these routes did: `void` discards
+ * the promise along with its rejection, so anything escaping a handler's own
+ * try/catch became an unhandled rejection — the caller's socket hanging and,
+ * under Node's default, the process torn down. Routing it to Express's error
+ * middleware answers 500 instead, with no exception text in the body.
+ */
+function route(
+  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, res, next) => {
+    // An awaited try/catch rather than `.catch(next)`: the lint rule against
+    // calling a callback inside a promise handler is guarding real
+    // callback/promise mixing, and this is Express's error channel — the one
+    // place a promise genuinely must hand off to a callback. Written as an async
+    // IIFE the handoff is ordinary control flow, which is also easier to read.
+    void (async () => {
+      try {
+        await handler(req, res, next);
+      } catch (error) {
+        next(error);
+      }
+    })();
+  };
+}
+
 export interface CreateAppOptions {
   readonly config: Config;
   readonly logger: Logger;
@@ -74,7 +102,10 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
   const judge = options.judge;
 
   const app = express();
-  app.use(express.json({ limit: config.maxBodyBytes }));
+  // Not `config.maxBodyBytes`: that is what the *Gateway* accepts from a caller,
+  // and this body carries a whole prompt of that size plus a whole Core answer.
+  // See `synthesisMaxBodyBytes` for why the two must be derived from each other.
+  app.use(express.json({ limit: config.synthesisMaxBodyBytes }));
 
   app.use((req, res, next) => {
     const requestId = resolveRequestId(req.headers[REQUEST_ID_HEADER]);
@@ -104,21 +135,19 @@ export async function createApp(options: CreateAppOptions): Promise<express.Appl
     });
   });
 
-  app.post('/v1/synthesize', (req, res, next) => {
-    void handleSynthesize(req, res, next);
-  });
+  app.post('/v1/synthesize', route(handleSynthesize));
 
-  app.get('/v1/requests/:id/evidence', (req, res, next) => {
-    void handleEvidence(req, res, next);
-  });
+  app.get('/v1/requests/:id/evidence', route(handleEvidence));
 
-  app.get('/v1/requests/:id/masked-prompt.md', (req, res, next) => {
-    void handleArtifact(req, res, next, 'maskedPrompt');
-  });
+  app.get(
+    '/v1/requests/:id/masked-prompt.md',
+    route((req, res, next) => handleArtifact(req, res, next, 'maskedPrompt')),
+  );
 
-  app.get('/v1/requests/:id/core-response.md', (req, res, next) => {
-    void handleArtifact(req, res, next, 'coreResponse');
-  });
+  app.get(
+    '/v1/requests/:id/core-response.md',
+    route((req, res, next) => handleArtifact(req, res, next, 'coreResponse')),
+  );
 
   /**
    * Persist the masked evidence. Called on release and on refusal alike.

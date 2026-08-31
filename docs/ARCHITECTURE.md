@@ -91,8 +91,18 @@ and that cap is not negotiable: without it a ~147 KB prompt from a coding agent 
 Gemma generate until the context was exhausted, pinning the project's single Cloud Run
 GPU for 15+ minutes — the generating instance never idled out, so the service could
 neither serve nor accept a new revision (recovery runbook in `skills/pgw-logs/LOGS.md`).
-But a span list for 147 KB of input does not fit in 4096 tokens either, so a single
+But a span list for that much input does not fit in 4096 tokens either, so a single
 call truncated mid-JSON and every large request refused with `extraction_unavailable`.
+
+**What is actually masked is measured, not assumed.** A real Codex CLI turn was
+recorded on the deployed gateway (`openai.compat.responses.start`, 2026-08-31):
+`raw_body_bytes` **141,396** but `forwarded_text_bytes` **59,576** — only ~42% of the
+body reaches masking. The Responses mapping flattens `instructions` plus the message
+turns and **drops the top-level `tools` array** along with `reasoning`, `include`,
+`store` and the other knobs, and the declared tool schemas are the bulk of the
+difference. So the extraction cost of a CLI turn is ~58 KiB, which at the deployed
+4 KB chunk size is roughly **15 chunks, not the ~37 an estimate from the raw body
+gives**. Latency math cites the forwarded figure; the raw body is not the workload.
 Input above `EXTRACTION_CHUNK_BYTES` (default 12000 characters) is therefore split on
 the safest available boundary — paragraph, then line, then a hard cut — with a 200-character
 overlap so an entity straddling a boundary is still seen whole by one chunk. Chunks are
@@ -312,27 +322,39 @@ has no Firestore role. Gateway and Synthesis import the package entry point.
 
 ## 7. API surface
 
-| Route                               | Method | Purpose                                                                                                                                                                                                                                                                                                            |
-| ----------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/v1/ask`                           | POST   | `{text}` plus the optional `rehydrate_allow` (§9) and `mask_terms` (§3). Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`). |
-| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                                                                                 |
-| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                                                                                     |
-| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                                                                             |
-| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.                                                              |
-| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                                                                              |
-| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                                                                          |
+| Route                               | Method | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ----------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/v1/ask`                           | POST   | `{text}` plus the optional `rehydrate_allow` (§9) and `mask_terms` (§3). Returns the rehydrated answer, the OKF markdown, `trust_tier`, `status`, the four `dimensions`, `attestation`, `consistency` and `stats`. `400` if the body carries `session_id` (or any other unknown field — the schema is `strict()`).                                                                                                                                                                                                                        |
+| `/v1/requests/:id`                  | GET    | The masked OKF evidence document for that request.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `/v1/requests/:id/masked-prompt.md` | GET    | The masked prompt as sent to Core (an OKF `sources[]` target).                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `/v1/requests/:id/core-response.md` | GET    | Core's tokenized response (an OKF `sources[]` target).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `/v1/chat/completions`              | POST   | OpenAI-compatible façade over the same pipeline and the same gates. `system`/`user` contents are concatenated, `assistant` turns dropped; privacy facts travel in `x_privacy_gateway`; refusals keep their status rather than becoming a 200 apology.                                                                                                                                                                                                                                                                                     |
+| `/v1/responses`                     | POST   | OpenAI **Responses API** façade over the same pipeline and the same gates — the only wire Codex CLI ≥ 0.149 speaks to a custom provider. `instructions` plus the message turns are flattened into one masked text; `assistant` turns and replayed `reasoning` / `function_call` items are dropped; declared `tools` are accepted and ignored. Codex hard-codes `stream: true`, so the reply is SSE: one delta, then `output_item.done`, then `response.completed`. A refusal after the 200 is a terminal `response.failed`, never a turn. |
+| `/v1/models`                        | GET    | OpenAI-compatible model list. Exactly one id, `privacy-gateway`: a caller selects the fleet, not the model behind it.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `/healthz`                          | GET    | Liveness.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 There is no approval route, no tier-lookup route and no session-scoped answer route:
 `POST /v1/sessions/:id/approve`, `GET /v1/sessions/:id/tier` and
 `GET /v1/sessions/:id/answer` do not exist in this design (see §2 — sessions and human
 approval are both gone). Every route above is keyed by `request_id`.
 
-Request limits: body size is capped at 64 KB (`MAX_BODY_BYTES`), the whole
-gateway → Core → Synthesis chain has a 60 s deadline (`REQUEST_DEADLINE_SECONDS`), and
-a per-IP demo rate limit applies (`RATE_LIMIT_PER_MINUTE`, default 20 requests/minute,
-`0` disables it). These are demo-grade: the public gateway authenticates nobody, and
-one request drives two Gemma calls plus a Gemini call, so an unbounded endpoint is a
-cost incident waiting to happen.
+**Request limits, as compiled in and as deployed.** The two differ on purpose, and
+confusing them makes a capacity incident unreadable:
+
+| Limit                      | Code default (`packages/common/src/config.ts`) | Deployed (`infra/terraform/locals.tf`) | Why the override                                                                                                                                      |
+| -------------------------- | ---------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MAX_BODY_BYTES` (gateway) | 64 KiB                                         | 256 KiB                                | Codex CLI turns carry an instruction block far past 64 KiB. Cost stays bounded by the rate limit, the deadline, one GPU instance and the kill switch. |
+| `SYNTHESIS_MAX_BODY_BYTES` | `MAX_BODY_BYTES × 2 + 64 KiB` (192 KiB)        | 576 KiB                                | Synthesis receives a whole masked prompt **plus** a whole Core answer in one body, so its limit must be derived from the gateway's, never copied.     |
+| `REQUEST_DEADLINE_SECONDS` | 60 s                                           | 150 s                                  | 60 s is right once Gemma is warm. A scale-from-zero request also waits for Ollama to load `gemma4:12b` (~8 GB); measured worst case from cold ~90 s.  |
+| `EXTRACTION_CHUNK_BYTES`   | 12000                                          | 4000                                   | Per-chunk Gemma latency falls superlinearly with size, so many small parallel chunks beat few large ones on a single GPU.                             |
+| `EXTRACTION_CONCURRENCY`   | 4                                              | 4                                      | All four llama.cpp slots. No slot is reserved: the Synthesis judge runs _after_ masking, not beside it.                                               |
+| `RATE_LIMIT_PER_MINUTE`    | 20                                             | 20                                     | Demo-grade per-IP quota; `0` disables it.                                                                                                             |
+
+These are demo-grade: the public gateway authenticates nobody, and one request drives
+two Gemma calls plus a Gemini call, so an unbounded endpoint is a cost incident waiting
+to happen. The extraction concurrency is a **global** cap — one semaphore shared across
+chunking and every level of the bisection recursion, not a per-level width — so a
+request whose chunks all fail at once cannot multiply its own fan-out.
 
 ## 8. Persistence and the vault
 

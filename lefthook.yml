@@ -61,6 +61,16 @@ pre-commit:
         - '.just/*.just'
       run: just check-recipe-docs
 
+    - name: okf-tags
+      glob:
+        - 'knowledge/**'
+        - 'packages/common/src/okf.ts'
+      # The controlled vocabulary is only controlled if something enforces it.
+      # Checks every document against knowledge/tags.yml at once rather than the
+      # staged subset: a commit that *removes* a tag from the vocabulary breaks
+      # documents it does not touch.
+      run: just lint-okf-tags
+
     - name: actionlint
       glob: '.github/workflows/*.{yml,yaml}'
       run: actionlint {staged_files}

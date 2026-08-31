@@ -223,7 +223,12 @@ codex-smoke:
       --format='value(status.url)')}"
     export PGW_BASE_URL
     echo "gateway: ${PGW_BASE_URL}"
-    nix run github:kexi/pitty/v1.2.2 -- run tests/codex/pgw-responses.yaml
+    # Rendered first so the `expect` carries the literal nonce: pitty does not
+    # expand variables inside an assertion. See .just/render-scenario.sh.
+    render_dir=$(mktemp -d)
+    trap 'rm -rf "$render_dir"' EXIT
+    rendered=$(./.just/render-scenario.sh tests/codex/pgw-responses.yaml "$render_dir")
+    nix run github:kexi/pitty/v1.2.2 -- run "$rendered"
 
 # Smoke-test the deployed Gateway end to end with a fixed PII sample
 smoke:

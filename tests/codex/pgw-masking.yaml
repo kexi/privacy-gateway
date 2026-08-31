@@ -13,9 +13,14 @@
 # asserting on the placeholder here would assert on a leak.
 #
 # The nonce is what makes this a real round trip rather than a plausible
-# hallucination: PGW_NONCE is minted per run by the `codex-e2e` recipe and
-# resolved through pitty's parent-environment ${var} fallback, so a cached or
-# invented answer cannot contain it.
+# hallucination: PGW_NONCE is minted per run by the `codex-e2e` recipe, and this
+# file is **rendered** before pitty ever reads it — every `__PGW_NONCE__` marker
+# below is replaced with the run's actual value, and pitty runs the rendered
+# copy. Why rendering rather than pitty's ${var} interpolation: pitty v1.2.2
+# expands variables in `spawn` and `send` but **not** inside an `expect` block,
+# so an `expect` naming the variable compared against those literal characters
+# and could never match — not weak, impossible. Rendering
+# puts the literal nonce on both sides, so the assertion tests what it claims to.
 name: pgw-masking
 env:
   TERM: dumb
@@ -36,10 +41,11 @@ steps:
   # echoes every sent line back, so any assertion on a string present in the
   # command line would match the echo rather than the answer. The prompt sends
   # the nonce and the address, but only the model emits them after "ACK ", so
-  # `ACK <nonce>` can only come from a real round trip.
-  - send: "exec codex exec --skip-git-repo-check --profile pgw 'Acknowledge this record. Reply with one line: the letters A C K with no spaces, then a space, then ${PGW_NONCE}, then a space, then test@example.com. Output nothing else.'"
+  # `ACK <nonce>` can only come from a real round trip. Both sides carry the
+  # rendered literal, so this is a full-nonce match, not a prefix one.
+  - send: "exec codex exec --skip-git-repo-check --profile pgw 'Acknowledge this record. Reply with one line: the letters A C K with no spaces, then a space, then __PGW_NONCE__, then a space, then test@example.com. Output nothing else.'"
   - expect:
-      contains: 'ACK ${PGW_NONCE}'
+      contains: 'ACK __PGW_NONCE__'
       timeout: 240s
   # The address itself must survive the round trip. EMAIL is a rehydrated
   # category, so a placeholder reaching the client would be a rehydration bug.

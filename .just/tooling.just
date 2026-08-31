@@ -130,9 +130,15 @@ codex-e2e *scenarios:
     # CLI at all. `pitty run` takes one path per invocation, so they are looped
     # rather than passed together.
     targets=({{ if scenarios == '' { 'tests/codex/pgw-smoke.yaml tests/codex/pgw-masking.yaml' } else { scenarios } }})
+    # Each scenario is rendered with the nonce substituted before pitty sees it:
+    # pitty does not expand variables inside an `expect`, so only a rendered file
+    # can carry the literal nonce on the assertion side. See render-scenario.sh.
+    render_dir=$(mktemp -d)
+    trap 'rm -rf "$render_dir"' EXIT
     for scenario in "${targets[@]}"; do
       echo "==> ${scenario}"
-      nix run github:kexi/pitty/v1.2.2 -- run "$scenario"
+      rendered=$(./.just/render-scenario.sh "$scenario" "$render_dir")
+      nix run github:kexi/pitty/v1.2.2 -- run "$rendered"
     done
 
 # Lint the TypeScript workspace with oxlint
@@ -165,7 +171,7 @@ fmt: fmt-ts fmt-just fmt-nix fmt-python tf-fmt
 fmt-check: fmt-ts-check fmt-just-check fmt-nix-check fmt-python-check tf-fmt-check
 
 # Run the full local check suite (equivalent to CI)
-check: fmt-check check-recipe-docs lint tf-validate typecheck pin-verify secrets-scan test
+check: fmt-check check-recipe-docs lint lint-okf-tags tf-validate typecheck pin-verify secrets-scan test
 
 # Run the pre-commit hooks against all files
 check-hooks:

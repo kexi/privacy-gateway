@@ -79,6 +79,14 @@ locals {
       env = {
         GEMMA_BASE_URL = local.gemma_base_url
         GEMMA_AUTH     = "iam"
+        # Derived from the Gateway's deployed MAX_BODY_BYTES, not from the code
+        # default: this body carries a whole 256 KiB-class masked prompt plus a
+        # whole Core answer plus the JSON envelope, and the code's derivation
+        # (input*2 + 64 KiB envelope) only sees this service's own env. Left at
+        # the compile-time default, a large request paid for extraction and the
+        # Core call and *then* got a 413 here. Keep in step with the Gateway's
+        # MAX_BODY_BYTES below: 262144*2 + 65536.
+        SYNTHESIS_MAX_BODY_BYTES = "589824"
       }
     }
     "gateway-agent" = {

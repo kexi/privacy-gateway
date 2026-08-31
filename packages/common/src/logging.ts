@@ -89,6 +89,17 @@ const ALLOWED_FIELDS: Readonly<Record<string, FieldKind>> = {
   // How many pieces a large input was split into for span extraction. A count of
   // model calls, saying nothing about what any chunk contained.
   chunk_count: 'number',
+  // How many bytes of text a compat request actually forwards into masking,
+  // after `instructions` and the message turns are flattened. A size, never
+  // content. It exists because the capacity narrative — "Codex sends ~147 KB, so
+  // ~37 Gemma calls" — was reasoning from the raw body, and the Responses
+  // mapping forwards neither `tools` nor the other declared knobs. Measuring the
+  // number the extractor is actually handed is what makes the latency math
+  // checkable instead of assumed.
+  forwarded_text_bytes: 'number',
+  // The raw request body, for the same reason: the gap between it and
+  // `forwarded_text_bytes` is exactly what the projection drops.
+  raw_body_bytes: 'number',
   // How deep the bisection fallback had to go before a chunk became readable.
   // Bounded by log2(chunk_bytes / min_chunk_bytes); a level count, not content.
   depth: 'number',

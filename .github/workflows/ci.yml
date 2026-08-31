@@ -123,6 +123,13 @@ jobs:
       - name: just check-recipe-docs
         run: just check-recipe-docs
 
+      # The OKF tag vocabulary is a judge-facing claim ("tags are mechanically
+      # enforced"), so it needs a gate rather than a lint that must be run by
+      # hand. It lives in this job because the script is pure bash/awk/grep and
+      # needs no toolchain the other jobs install.
+      - name: just lint-okf-tags
+        run: just lint-okf-tags
+
       - name: just --list
         run: just --list
 

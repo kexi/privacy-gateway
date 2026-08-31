@@ -742,7 +742,14 @@ export type OpenAiResponsesInputMessage = z.infer<typeof OpenAiResponsesInputMes
  */
 export const OpenAiResponsesInputItemSchema = z.union([
   OpenAiResponsesInputMessageSchema,
-  z.object({ type: z.string() }).passthrough(),
+  // The generic branch explicitly excludes `message`. Why not leave it open, as
+  // it was: a malformed message — `content: 123`, a role the enum does not know,
+  // no `content` at all — failed the message schema and was then accepted here
+  // as an opaque tagged item. It reached the flattener, which recognises it as a
+  // message by `type` and calls `.map()` on a number. A request that names
+  // itself a message is held to the message contract; anything else it claims to
+  // be is what the passthrough is for.
+  z.object({ type: z.string().refine((type) => type !== 'message') }).passthrough(),
 ]);
 
 /**

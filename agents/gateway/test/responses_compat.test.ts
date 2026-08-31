@@ -272,6 +272,90 @@ describe('POST /v1/responses', () => {
     expect(body.output[0]?.content[0]?.text.length).toBeGreaterThan(0);
   });
 
+  /**
+   * A message must satisfy the message contract, never the opaque-item one.
+   *
+   * The union's generic `{type: string}` branch exists for the replayed items
+   * Codex sends — `reasoning`, `function_call` — which are dropped. It used to
+   * also swallow a *malformed message*: `content: 123` failed the message schema
+   * and was accepted as an opaque item, reached the flattener (which recognises
+   * a message by `type`) and called `.map()` on a number. Because the route
+   * launched the handler with `void`, that threw into an unhandled rejection
+   * rather than a 400.
+   */
+  describe('a malformed message is refused, not treated as an opaque item', () => {
+    const cases: readonly (readonly [string, unknown])[] = [
+      ['scalar content', { type: 'message', role: 'user', content: 123 }],
+      ['null content', { type: 'message', role: 'user', content: null }],
+      ['object content', { type: 'message', role: 'user', content: { text: 'hi' } }],
+      ['missing content', { type: 'message', role: 'user' }],
+      ['unknown role', { type: 'message', role: 'moderator', content: 'hi' }],
+      ['non-string role', { type: 'message', role: 7, content: 'hi' }],
+      ['untagged scalar content', { role: 'user', content: 123 }],
+      ['untagged unknown role', { role: 'moderator', content: 'hi' }],
+    ];
+
+    for (const [name, item] of cases) {
+      it(`refuses ${name} with a 400`, async () => {
+        await startFleet();
+        const response = await responses({ model: OPENAI_MODEL_ID, input: [item] });
+
+        expect(response.status).toBe(400);
+        const body = (await response.json()) as { error: { type: string; code: string } };
+        expect(body.error.type).toBe('invalid_request_error');
+        expect(body.error.code).toBe('invalid_request');
+      });
+    }
+
+    it('still accepts the replayed non-message items Codex sends', async () => {
+      // The tolerance that must survive: dropping a `reasoning` item the caller
+      // replayed loses nothing, because this fleet never produced one.
+      await startFleet();
+      const response = await responses({
+        model: OPENAI_MODEL_ID,
+        input: [
+          { type: 'reasoning', id: 'rs_1', summary: [] },
+          { type: 'function_call_output', call_id: 'c1', output: 'ok' },
+          { type: 'message', role: 'user', content: CUSTOMER_EMAIL },
+        ],
+      });
+
+      expect(response.status).toBe(200);
+    });
+  });
+
+  /**
+   * A prompt larger than the *code default* body limit reaches Synthesis.
+   *
+   * The defect this pins: the Gateway is deployed at 256 KiB but Synthesis's
+   * JSON limit was `config.maxBodyBytes`, i.e. the 64 KiB compile-time default.
+   * The Gateway forwards the whole masked prompt plus the whole Core answer in
+   * one body, so a large request paid for the full extraction and the Core call
+   * and *then* collected a 413 from the last hop. Synthesis here is the real app
+   * with the real `express.json` limit — the assertion is worthless against a
+   * mock, because the mock has no limit to violate.
+   */
+  it('carries an input past the 64 KiB code default through the real Synthesis parser', async () => {
+    await startFleet(echoingCore, { MAX_BODY_BYTES: '262144' });
+
+    // Comfortably over 64 KiB after masking, so the synthesize body (prompt +
+    // answer + envelope) is far past what the old limit accepted.
+    const bulk = 'The quarterly reconciliation notes continue here. '.repeat(1800);
+    const response = await responses({
+      model: OPENAI_MODEL_ID,
+      input: `${CUSTOMER_EMAIL}\n\n${bulk}`,
+    });
+
+    expect(bulk.length).toBeGreaterThan(64 * 1024);
+    expect(response.status).toBe(200);
+
+    const body = OpenAiResponsesObjectSchema.parse(await response.json());
+    expect(body.status).toBe('completed');
+    // A real answer, not a refusal rendered as one: the Synthesis hop succeeded.
+    expect(body.output[0]?.content[0]?.text.length).toBeGreaterThan(0);
+    expect(body.x_privacy_gateway.trust_tier).toBe('machine-confirmed');
+  });
+
   it('binds the response id to the request id, so the evidence stays reachable', async () => {
     await startFleet();
     const body = (await (

@@ -40,6 +40,39 @@ export const DEFAULT_VAULT_TTL_SECONDS = 3600;
  * request drive two Gemma calls plus a Gemini call over a megabyte of input.
  */
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+
+/**
+ * Headroom for the JSON envelope Gateway → Synthesis rides in.
+ *
+ * The synthesize body is not two bare strings: it also carries `request_id`, the
+ * `known_tokens` list (one entry per distinct placeholder), `mask_terms`,
+ * `generated_by`, and the JSON escaping of both documents — a masked prompt full
+ * of quotes and newlines inflates measurably once escaped. 64 KiB is generous
+ * against a token list that is bounded by the number of distinct PII values in
+ * one prompt.
+ */
+export const SYNTHESIS_ENVELOPE_BYTES = 64 * 1024;
+
+/**
+ * What Synthesis must accept, derived from what the Gateway accepts.
+ *
+ * Why derived rather than a second constant: the Gateway forwards the *whole*
+ * masked prompt plus the *whole* Core answer in one JSON body, so any limit
+ * below `gateway input + core output + envelope` turns a large request into a
+ * 413 — and it arrives only after the expensive extraction and the Core call
+ * have already been paid for, which is the worst possible place to discover a
+ * size limit. Hardcoding 64 KiB in two places is exactly how the two drifted:
+ * the deployed Gateway was raised to 256 KiB and Synthesis silently stayed at
+ * the compile-time default.
+ *
+ * The Core answer is bounded by the same limit as the input rather than by a
+ * separate figure: Core is asked to answer a prompt, and an answer longer than
+ * the prompt it answers is possible but not the case this sizing must survive —
+ * doubling the input allowance covers it with room left over.
+ */
+export function synthesisMaxBodyBytes(gatewayMaxBodyBytes: number): number {
+  return gatewayMaxBodyBytes * 2 + SYNTHESIS_ENVELOPE_BYTES;
+}
 /** One deadline for the whole chain, so a hung hop cannot pin a worker. */
 export const DEFAULT_REQUEST_DEADLINE_SECONDS = 60;
 /** Demo-grade per-IP quota. The public gateway has no authenticated principal. */
@@ -135,6 +168,15 @@ export const EnvSchema = z.object({
   // --- request limits ---
   /** Maximum request body. A prompt is text; 64 KB is far past any real one. */
   MAX_BODY_BYTES: IntFromEnv,
+  /**
+   * Synthesis's own body limit.
+   *
+   * Separate from `MAX_BODY_BYTES` because Synthesis receives a body built from
+   * a whole Gateway-sized input *plus* a whole Core answer, so the two limits are
+   * not the same number. Left unset it is derived from `MAX_BODY_BYTES`, which
+   * is what keeps the pair from drifting apart.
+   */
+  SYNTHESIS_MAX_BODY_BYTES: IntFromEnv,
   /** One deadline for the whole gateway → core → synthesis chain. */
   REQUEST_DEADLINE_SECONDS: IntFromEnv,
   /** Demo-grade per-IP quota; 0 disables it. */
@@ -203,6 +245,8 @@ export interface Config extends Env {
   readonly requestTimeoutMs: number;
   /** Body limit with its default applied. */
   readonly maxBodyBytes: number;
+  /** Synthesis's body limit, derived from `maxBodyBytes` unless overridden. */
+  readonly synthesisMaxBodyBytes: number;
   /** End-to-end deadline for one `/v1/ask`, in milliseconds. */
   readonly requestDeadlineMs: number;
   /** Per-IP requests per minute; 0 disables the limiter. */
@@ -258,6 +302,9 @@ export function loadConfig(options: LoadConfigOptions): Config {
     vaultTtlSeconds: env.VAULT_TTL_SECONDS ?? DEFAULT_VAULT_TTL_SECONDS,
     requestTimeoutMs: (env.A2A_TIMEOUT_SECONDS ?? 120) * 1000,
     maxBodyBytes: env.MAX_BODY_BYTES ?? DEFAULT_MAX_BODY_BYTES,
+    synthesisMaxBodyBytes:
+      env.SYNTHESIS_MAX_BODY_BYTES ??
+      synthesisMaxBodyBytes(env.MAX_BODY_BYTES ?? DEFAULT_MAX_BODY_BYTES),
     requestDeadlineMs: (env.REQUEST_DEADLINE_SECONDS ?? DEFAULT_REQUEST_DEADLINE_SECONDS) * 1000,
     rateLimitPerMinute: env.RATE_LIMIT_PER_MINUTE ?? DEFAULT_RATE_LIMIT_PER_MINUTE,
   };

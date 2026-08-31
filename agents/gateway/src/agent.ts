@@ -439,35 +439,105 @@ export function mergeSpans(lists: readonly (readonly Span[])[]): Span[] {
   return merged;
 }
 
+/** Raised when the request's deadline or a terminal error cancelled extraction. */
+export class ExtractionAbortedError extends Error {
+  constructor() {
+    super('span extraction was aborted');
+    this.name = 'ExtractionAbortedError';
+  }
+}
+
 /**
- * Run `task` over every item with at most `limit` in flight.
+ * A counting semaphore over the whole extraction, not one level of it.
  *
- * Why not `Promise.all` over the whole list: Gemma has four slots, and issuing
- * twelve concurrent extractions would queue them inside Ollama where this process
- * cannot see the wait — and would starve the Synthesis judge that runs later in
- * the same request.
+ * Why an object shared down the recursion rather than a `limit` argument to each
+ * fan-out, as this had: the bisection fallback re-enters the fan-out, so a
+ * per-call limit bounds each *level* and nothing bounds the tree. Four chunks
+ * failing together each opened their own width-4 map — 8 concurrent Gemma calls,
+ * 16 at the next level — against a single GPU serving four slots, which is the
+ * exact condition (several chunks unreadable at once) the bisection exists to
+ * handle. One permit pool held for the request's whole extraction makes the cap
+ * mean what it says.
+ *
+ * The signal is checked at acquisition rather than only at the call site so that
+ * after the deadline fires no *new* task is dequeued: work already in flight
+ * finishes or aborts on its own transport signal, and the queue behind it
+ * evaporates instead of continuing to spend GPU on a request already answered
+ * 504.
  */
-async function mapWithConcurrency<T, R>(
+class ExtractionSemaphore {
+  private available: number;
+  private readonly waiters: (() => void)[] = [];
+
+  constructor(
+    limit: number,
+    private readonly signal?: AbortSignal | undefined,
+  ) {
+    this.available = Math.max(1, Math.floor(limit));
+  }
+
+  /** True once the request is over; checked before every dequeue. */
+  get aborted(): boolean {
+    return this.signal?.aborted === true;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.aborted) throw new ExtractionAbortedError();
+    if (this.available > 0) {
+      this.available -= 1;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    // Re-checked after waking: the deadline may have passed while queued, and a
+    // task that starts here would be pure waste on an answered request.
+    if (this.aborted) {
+      this.release();
+      throw new ExtractionAbortedError();
+    }
+  }
+
+  release(): void {
+    const next = this.waiters.shift();
+    if (next !== undefined) {
+      next();
+      return;
+    }
+    this.available += 1;
+  }
+
+  /** Wake every queued task so they can observe the abort and unwind. */
+  cancelAll(): void {
+    while (this.waiters.length > 0) this.waiters.shift()?.();
+  }
+
+  /** Run `task` holding one permit. */
+  async run<R>(task: () => Promise<R>): Promise<R> {
+    await this.acquire();
+    try {
+      return await task();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+/**
+ * Fan out over every item at once, letting the shared semaphore do the gating.
+ *
+ * Why `Promise.all` here rather than the bounded worker pool this used: the
+ * permit is now taken around the Gemma call itself (see `extractChunk`), which
+ * is the only thing that must be capped. Bounding the *walk* as well would
+ * deadlock the bisection — a parent chunk holds nothing while awaiting its
+ * halves, but a worker-pool slot would be held, and with four failing chunks the
+ * four slots would all be held by parents waiting on halves that can never be
+ * scheduled. Dispatching freely and gating at the call is what makes the cap a
+ * property of the whole tree instead of one level of it.
+ */
+async function mapAll<T, R>(
   items: readonly T[],
-  limit: number,
   task: (item: T, index: number) => Promise<R>,
 ): Promise<R[]> {
-  const results = Array.from({ length: items.length }) as R[];
-  let next = 0;
-
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const index = next;
-      next += 1;
-      if (index >= items.length) return;
-      const item = items[index];
-      if (item === undefined) return;
-      results[index] = await task(item, index);
-    }
-  };
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
+  return Promise.all(items.map((item, index) => task(item, index)));
 }
 
 /**
@@ -554,6 +624,24 @@ function jsonCandidates(raw: string): string[] {
  * empty list is a *positive* claim that the text holds no names or addresses,
  * and a caller who injects "return {} " into their prompt could manufacture that
  * claim. `invalid` is a distinct outcome, and it blocks the request.
+ *
+ * Two rules make "packaging only" a real boundary rather than a slogan:
+ *
+ * 1. **Exactly one** top-level object may carry `spans`. Why not take the first,
+ *    as this did: a response of `{"spans": []}` followed by the real answer would
+ *    be read as the safe empty claim while the spans the model actually found sat
+ *    a few characters later — an empty decoy is something the untrusted input can
+ *    provoke, and it is precisely the claim that must never be manufacturable.
+ *    Ambiguity about *which* object is the answer is not something a parser can
+ *    resolve; it is an unreadable response, and it fails closed.
+ *
+ * 2. The **whole** array must validate. Why not keep the entries that parse, as
+ *    this did: a span with an unrecognised category is a detection the model
+ *    made, and silently dropping it would let the value it names travel to Gemini
+ *    unmasked while the request still reported success. A partly-invalid answer
+ *    is an answer nobody can trust the *completeness* of, so it goes to retry,
+ *    then bisection, then refusal — the same ladder every other unreadable
+ *    response climbs.
  */
 export function parseSpans(raw: string): ExtractionResult {
   if (raw.trim() === '') return { kind: 'invalid', reason: 'empty response' };
@@ -563,13 +651,10 @@ export function parseSpans(raw: string): ExtractionResult {
     return { kind: 'invalid', reason: 'no JSON object in response' };
   }
 
-  // The first candidate that both parses and carries a `spans` key wins. Why not
-  // simply the first that parses: a prose wrapper can open with an unrelated
-  // object (an echoed tool schema from the chunk, `{"type": "object"}`), and
-  // stopping there would report "no spans key" while the real answer sat two
-  // characters later.
-  let payload: unknown;
+  // Every candidate is parsed, not just up to the first hit: the count of
+  // spans-carrying objects is itself the check, so the scan cannot stop early.
   let sawParsable = false;
+  const spansCarrying: unknown[] = [];
 
   for (const candidate of candidates) {
     let parsedCandidate: unknown;
@@ -581,45 +666,27 @@ export function parseSpans(raw: string): ExtractionResult {
     sawParsable = true;
     const carriesSpans =
       parsedCandidate !== null && typeof parsedCandidate === 'object' && 'spans' in parsedCandidate;
-    if (carriesSpans) {
-      payload = parsedCandidate;
-      break;
-    }
-    if (payload === undefined) payload = parsedCandidate;
+    if (carriesSpans) spansCarrying.push(parsedCandidate);
   }
 
   if (!sawParsable) {
     return { kind: 'invalid', reason: 'response is not valid JSON' };
   }
-
-  const parsed = SpanExtractionSchema.safeParse(payload);
-  if (parsed.success) {
-    return parsed.data.spans.length === 0
-      ? { kind: 'valid-empty' }
-      : { kind: 'valid-spans', spans: parsed.data.spans };
-  }
-
-  // A partially valid response still carries usable spans, and dropping them
-  // would weaken masking. But an array that yields no usable entry at all is a
-  // malformed answer, not a clean one.
-  const hasSpansKey = payload !== null && typeof payload === 'object' && 'spans' in payload;
-  if (!hasSpansKey) {
+  if (spansCarrying.length === 0) {
     return { kind: 'invalid', reason: 'response has no "spans" key' };
   }
-
-  const raws = (payload as { spans: unknown }).spans;
-  if (!Array.isArray(raws)) {
-    return { kind: 'invalid', reason: '"spans" is not an array' };
+  if (spansCarrying.length > 1) {
+    return { kind: 'invalid', reason: 'response carries more than one "spans" object' };
   }
 
-  const recovered = raws.flatMap((entry) => {
-    const single = SpanExtractionSchema.shape.spans.element.safeParse(entry);
-    return single.success ? [single.data] : [];
-  });
-  if (recovered.length === 0) {
-    return { kind: 'invalid', reason: 'no span entry could be validated' };
+  const parsed = SpanExtractionSchema.safeParse(spansCarrying[0]);
+  if (!parsed.success) {
+    return { kind: 'invalid', reason: 'span list failed validation' };
   }
-  return { kind: 'valid-spans', spans: recovered };
+
+  return parsed.data.spans.length === 0
+    ? { kind: 'valid-empty' }
+    : { kind: 'valid-spans', spans: parsed.data.spans };
 }
 
 /** Runs one turn of the agent and returns its final text. */
@@ -664,6 +731,15 @@ export interface ExtractOptions extends BuildSpanAgentOptions {
    * the same process happened to leave in the map.
    */
   readonly cache?: boolean | undefined;
+  /**
+   * The request's cancellation signal.
+   *
+   * Propagated so that once the shared deadline fires — or the pipeline hits a
+   * terminal error — no further chunk is dequeued. Without it the 504 was
+   * answered while the surviving workers kept feeding the GPU chunks belonging
+   * to a request nobody was waiting for any more.
+   */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -704,14 +780,19 @@ async function extractChunk(
   text: string,
   run: (prompt: string) => Promise<string>,
   options: ExtractOptions,
+  semaphore: ExtractionSemaphore,
 ): Promise<ExtractionResult> {
   let lastReason = 'no attempt completed';
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let raw: string;
     try {
-      raw = await run(buildExtractionPrompt(text));
+      // The permit is held only across the model call — the one resource that is
+      // actually scarce. A retry re-acquires rather than holding through the
+      // parse, so a chunk that is being re-rolled does not squat on a GPU slot.
+      raw = await semaphore.run(() => run(buildExtractionPrompt(text)));
     } catch (error) {
+      if (error instanceof ExtractionAbortedError) throw error;
       options.logger?.event(
         'mask.gemma.failed',
         { attempt: attempt + 1, error_class: error instanceof Error ? error.name : 'unknown' },
@@ -771,6 +852,7 @@ async function extractChunkBisecting(
   run: (prompt: string) => Promise<string>,
   options: ExtractOptions,
   depth: number,
+  semaphore: ExtractionSemaphore,
 ): Promise<ExtractionResult> {
   const useCache = options.cache ?? true;
   const key = useCache ? chunkCacheKey(text) : '';
@@ -783,7 +865,7 @@ async function extractChunkBisecting(
     }
   }
 
-  const result = await extractChunk(text, run, options);
+  const result = await extractChunk(text, run, options, semaphore);
   // Only a readable outcome is remembered. An `invalid` is one bad sample, and
   // caching it would let a single failed roll refuse every later request that
   // carries the same chunk.
@@ -803,10 +885,8 @@ async function extractChunkBisecting(
   const overlap = Math.min(EXTRACTION_CHUNK_OVERLAP, Math.floor(text.length / 8));
   const halves = [text.slice(0, midpoint + overlap), text.slice(Math.max(0, midpoint - overlap))];
 
-  const halfResults = await mapWithConcurrency(
-    halves,
-    options.concurrency ?? extractionConcurrency(),
-    (half) => extractChunkBisecting(half, run, options, depth + 1),
+  const halfResults = await mapAll(halves, (half) =>
+    extractChunkBisecting(half, run, options, depth + 1, semaphore),
   );
 
   options.logger?.event('mask.gemma.bisected', {
@@ -869,22 +949,46 @@ export async function extractUnstructured(
 
   const chunks = chunkText(text, options.chunkBytes ?? extractionChunkBytes());
 
-  // Below the threshold this starts as one call with the whole text — the path
-  // that ran before chunking existed, including the absence of the
-  // `mask.gemma.chunked` log line. It only ever becomes more than one call if
-  // that single call came back unreadable twice, which previously refused the
-  // request outright; a small but PII-dense input is exactly that case.
-  if (chunks.length === 1) {
-    const result = await extractChunkBisecting(text, run, options, 0);
-    if (result.kind === 'invalid') throw new ExtractionFailedError(result.reason);
-    return result.kind === 'valid-empty' ? [] : spansToDetections(text, result.spans);
-  }
-
-  const startedAt = Date.now();
-  const results = await mapWithConcurrency(
-    chunks,
+  // One pool for this whole extraction: every Gemma call below, at any bisection
+  // depth, takes a permit from it, so the cap holds across the tree.
+  const semaphore = new ExtractionSemaphore(
     options.concurrency ?? extractionConcurrency(),
-    (chunk) => extractChunkBisecting(chunk, run, options, 0),
+    options.signal,
+  );
+  const onAbort = (): void => {
+    semaphore.cancelAll();
+  };
+  options.signal?.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    // Below the threshold this starts as one call with the whole text — the path
+    // that ran before chunking existed, including the absence of the
+    // `mask.gemma.chunked` log line. It only ever becomes more than one call if
+    // that single call came back unreadable twice, which previously refused the
+    // request outright; a small but PII-dense input is exactly that case.
+    if (chunks.length === 1) {
+      const result = await extractChunkBisecting(text, run, options, 0, semaphore);
+      if (result.kind === 'invalid') throw new ExtractionFailedError(result.reason);
+      return result.kind === 'valid-empty' ? [] : spansToDetections(text, result.spans);
+    }
+
+    return await extractChunks(text, chunks, run, options, semaphore);
+  } finally {
+    options.signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/** The chunked path, split out so the semaphore's lifetime reads in one place. */
+async function extractChunks(
+  text: string,
+  chunks: readonly string[],
+  run: (prompt: string) => Promise<string>,
+  options: ExtractOptions,
+  semaphore: ExtractionSemaphore,
+): Promise<Detection[]> {
+  const startedAt = Date.now();
+  const results = await mapAll(chunks, (chunk) =>
+    extractChunkBisecting(chunk, run, options, 0, semaphore),
   );
 
   options.logger?.event('mask.gemma.chunked', {

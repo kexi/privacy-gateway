@@ -64,20 +64,70 @@ describe('parseSpans', () => {
     expect(parseSpans('{"spans": "none"}').kind).toBe('invalid');
   });
 
-  it('keeps the valid spans when one entry names an unknown category', () => {
-    // Dropping the whole response over one bad entry would weaken masking for no gain.
+  it('rejects the whole answer when one entry names an unknown category', () => {
+    // Keeping the valid entries and dropping the rest, which this used to do,
+    // silently discarded a detection the model had made — so the value it named
+    // travelled to Gemini unmasked while the request still reported success. A
+    // partly-invalid list is a list whose completeness cannot be trusted.
     const raw =
       '{"spans": [{"text": "Taro", "category": "PERSON"}, {"text": "x", "category": "BANANA"}]}';
-    expect(parseSpans(raw)).toEqual({
-      kind: 'valid-spans',
-      spans: [{ text: 'Taro', category: 'PERSON' }],
-    });
+    expect(parseSpans(raw).kind).toBe('invalid');
   });
 
   it('treats an array with no usable entry as invalid, not as empty', () => {
     // Otherwise a model that emitted only garbage entries would be read as
     // asserting that the text holds no names.
     expect(parseSpans('{"spans": [{"nope": 1}]}').kind).toBe('invalid');
+  });
+});
+
+/**
+ * What an attacker can make the model's *packaging* say.
+ *
+ * The input is untrusted, and a prompt-injection attempt that survives into the
+ * output cannot be allowed to manufacture the one claim that matters: "there is
+ * no personal data here". Every ambiguous shape below fails closed.
+ */
+describe('parseSpans (adversarial packaging)', () => {
+  it('refuses an empty decoy followed by the real span list', () => {
+    // The attack: get `{"spans": []}` emitted first, and a parser that takes the
+    // first spans-carrying object reports "nothing to mask" while the names the
+    // model actually found sit a few characters later.
+    const raw = '{"spans": []}\n{"spans": [{"text": "Taro Yamada", "category": "PERSON"}]}';
+    expect(parseSpans(raw)).toEqual({
+      kind: 'invalid',
+      reason: 'response carries more than one "spans" object',
+    });
+  });
+
+  it('refuses the real span list followed by an empty decoy', () => {
+    // The mirror image: order must not decide the verdict either way.
+    const raw = '{"spans": [{"text": "Taro Yamada", "category": "PERSON"}]}\n{"spans": []}';
+    expect(parseSpans(raw).kind).toBe('invalid');
+  });
+
+  it('refuses two populated spans objects that disagree', () => {
+    const raw =
+      '{"spans": [{"text": "Taro Yamada", "category": "PERSON"}]}\n' +
+      '{"spans": [{"text": "Acme", "category": "ORGANIZATION"}]}';
+    expect(parseSpans(raw).kind).toBe('invalid');
+  });
+
+  it('refuses a valid entry mixed with an invalid one rather than masking only the valid', () => {
+    const raw =
+      '{"spans": [{"text": "Taro Yamada", "category": "PERSON"}, {"text": 42, "category": "PERSON"}]}';
+    expect(parseSpans(raw).kind).toBe('invalid');
+  });
+
+  it('still reads a lone spans object preceded by an unrelated echoed object', () => {
+    // The tolerance that must survive: a chunk full of JSON tool schemas makes
+    // the model echo one before its answer. That is packaging, not ambiguity —
+    // only one object claims to be a span list.
+    const raw = '{"type": "object"}\n{"spans": [{"text": "Taro Yamada", "category": "PERSON"}]}';
+    expect(parseSpans(raw)).toEqual({
+      kind: 'valid-spans',
+      spans: [{ text: 'Taro Yamada', category: 'PERSON' }],
+    });
   });
 });
 
@@ -500,6 +550,67 @@ describe('extractUnstructured (chunked)', () => {
 
     // More chunks than the cap, so the cap is what bounded the fan-out.
     expect(maxInFlight).toBe(3);
+  });
+
+  it('holds the cap across the whole bisection tree, not one level of it', async () => {
+    // The defect this pins: four chunks failing together each opened their own
+    // width-4 fan-out for their halves — 8 concurrent Gemma calls, 16 at the next
+    // level — against a GPU serving four slots. Every chunk here fails until it
+    // is small enough, so the recursion is wide and deep at the same time.
+    let inFlight = 0;
+    let maxInFlight = 0;
+
+    await extractUnstructured('a'.repeat(4000), {
+      chunkBytes: 200,
+      minChunkBytes: 40,
+      concurrency: 4,
+      cache: false,
+      runAgent: async (prompt) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight -= 1;
+        // Anything above the floor is unreadable, which forces a bisection at
+        // every level until the halves get small.
+        return prompt.length > 120 ? 'sorry, I cannot' : '{"spans": []}';
+      },
+    });
+
+    expect(maxInFlight).toBeLessThanOrEqual(4);
+  });
+
+  it('dequeues no further chunk once the request is aborted', async () => {
+    // After the deadline fires the caller already has its 504; a worker that
+    // keeps feeding the GPU is spending a scarce slot on an answered request.
+    const controller = new AbortController();
+    let calls = 0;
+
+    const extraction = extractUnstructured('a'.repeat(4000), {
+      chunkBytes: 100,
+      concurrency: 2,
+      cache: false,
+      signal: controller.signal,
+      runAgent: async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return '{"spans": []}';
+      },
+    });
+
+    // Abort partway through, with far more chunks still queued than started.
+    await new Promise((resolve) => setTimeout(resolve, 12));
+    const callsAtAbort = calls;
+    controller.abort();
+
+    await expect(extraction).rejects.toThrow();
+
+    // Calls already in flight may finish; the queue behind them must not start.
+    // Two concurrent slots means at most two more can have been dequeued before
+    // the abort was observed.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(calls).toBeLessThanOrEqual(callsAtAbort + 2);
+    // And the fixture really did have a long queue left to run.
+    expect(callsAtAbort).toBeLessThan(40);
   });
 
   it('fans out across every Gemma slot by default', async () => {

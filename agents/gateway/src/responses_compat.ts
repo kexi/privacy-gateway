@@ -376,12 +376,29 @@ export function responsesError(
   };
 }
 
-/** Logs the shape of a Responses request without any of its text. */
-export function logResponsesStart(logger: Logger, stream: boolean): void {
+/**
+ * Logs the shape of a Responses request without any of its text.
+ *
+ * `forwarded_text_bytes` is what the extractor is actually handed, and
+ * `raw_body_bytes` is what arrived. Both are sizes, never content. The pair
+ * exists because the capacity narrative used to reason from the raw body — "the
+ * CLI sends ~147 KB, so masking it is ~37 Gemma calls" — while this mapping
+ * forwards only `instructions` plus the message turns: `tools`, `reasoning`,
+ * `include` and the rest are accepted and dropped. Which of the two numbers
+ * drives the deadline is a measurable fact, and now it is measured rather than
+ * assumed.
+ */
+export function logResponsesStart(
+  logger: Logger,
+  stream: boolean,
+  sizes: { readonly forwardedTextBytes: number; readonly rawBodyBytes: number },
+): void {
   logger.event('openai.compat.responses.start', {
     method: 'POST',
     path: '/v1/responses',
     // Whether the caller asked to stream, as a fact about framing only.
     ok: stream,
+    forwarded_text_bytes: sizes.forwardedTextBytes,
+    raw_body_bytes: sizes.rawBodyBytes,
   });
 }

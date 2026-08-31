@@ -6,6 +6,12 @@
 # result streams back as the SSE event sequence Codex parses. A per-run nonce
 # makes it a genuine round trip rather than a plausible cached answer.
 #
+# This file is **rendered** before pitty reads it: `__PGW_NONCE__` is replaced
+# with the run's actual nonce and pitty runs the rendered copy. Why: pitty v1.2.2
+# expands `${var}` in `spawn` and `send` but not inside an `expect`, so an
+# assertion naming the variable could never match. Rendering puts the literal
+# nonce on both sides.
+#
 # Why not drive the real `codex` binary here: the CLI prepends its own ~147 KB
 # instruction block — tool schemas, workspace rules, policy text — to every turn,
 # and on the single-GPU deployment masking that much input dominates the request.
@@ -33,25 +39,20 @@ steps:
   # the request body would match the echo rather than the fleet's answer. Only
   # the model joins "ACK" to the nonce.
   #
-  # Why the body is double-quoted rather than single-quoted: bash performs no
-  # expansion inside single quotes, so a single-quoted body would send the four
-  # literal characters `${PGW_NONCE}` to the fleet while pitty compared the
-  # reply against the *expanded* value — a mismatch that looks like the fleet
-  # answering wrongly. The inner JSON quotes are backslash-escaped instead.
+  # The nonce reaches the body as a rendered literal, so no shell expansion is
+  # involved in it. `${PGW_BASE_URL}` is still pitty-interpolated, which is why
+  # the body stays double-quoted; the inner JSON quotes are backslash-escaped.
   - send: >-
       exec curl -sS -N -X POST "${PGW_BASE_URL}/v1/responses"
       -H "Content-Type: application/json"
-      -d "{\"model\":\"privacy-gateway\",\"stream\":true,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Acknowledge this record for Taro Yamada at taro@example.com. Reply with one line: the letters A C K with no spaces, then a space, then ${PGW_NONCE}. Output nothing else.\"}]}]}"
+      -d "{\"model\":\"privacy-gateway\",\"stream\":true,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Acknowledge this record for Taro Yamada at taro@example.com. Reply with one line: the letters A C K with no spaces, then a space, then __PGW_NONCE__. Output nothing else.\"}]}]}"
   # The generated answer.
   #
-  # Why the assertion is `"text":"ACK PGW` and not the whole nonce: **pitty
-  # v1.2.2 does not expand `${VAR}` inside an `expect` block** — only `spawn` and
-  # `send` are interpolated — so an assertion naming the variable compares
-  # against the four literal characters `${PGW_NONCE}` and can never match. The
-  # nonce still does its job: it is interpolated into the request, so the reply
-  # can only contain `ACK PGW…` if the fleet generated a fresh answer to *this*
-  # run's prompt, and the JSON `"text":` prefix ties the match to the output item
-  # rather than to the masked prompt echoed back in `response.created`.
+  # The assertion carries the **whole** nonce, not the `ACK PGW` prefix it used
+  # to: rendering substitutes the literal value here as well as in the request,
+  # so a reply that merely starts with the right prefix no longer passes. The
+  # JSON `"text":` prefix ties the match to the output item rather than to the
+  # masked prompt echoed back in `response.created`.
   #
   # Why this is the first assertion rather than following a `response.created`
   # one: pitty matches forward from a cursor that only advances, and asserting on
@@ -59,7 +60,7 @@ steps:
   # the answer text. Matching the answer implies the stream opened correctly, so
   # the earlier assertion bought nothing and cost the later match.
   - expect:
-      contains: '"text":"ACK PGW'
+      contains: '"text":"ACK __PGW_NONCE__'
       timeout: 240s
   # The terminal event. Codex treats a stream without it as a failed turn, so its
   # presence is what makes this a complete response rather than a truncated one.
