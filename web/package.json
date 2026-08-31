@@ -23,7 +23,7 @@
     "@playwright/test": "1.61.1",
     "@privacy-gateway/gateway": "workspace:*",
     "@privacy-gateway/synthesis": "workspace:*",
-    "tsx": "^4.19.2",
+    "tsx": "^4.23.13",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"
   }
