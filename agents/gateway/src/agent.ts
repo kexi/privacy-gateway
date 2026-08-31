@@ -92,25 +92,43 @@ export function buildExtractionPrompt(text: string): string {
 export const SPAN_AGENT_NAME = 'gateway_pii_agent';
 
 /**
+ * The most spans one generation may list before the answer reads as saturated.
+ *
+ * The grammar closes the array here no matter how much more the model wanted to
+ * emit, so a saturated answer may have been cut mid-coverage. `extractChunk`
+ * therefore treats exactly-at-the-cap as `invalid`, which sends the chunk into
+ * bisection — halves carry fewer distinct entities — instead of accepting a
+ * span list with an unknown remainder. Fail closed, as ever.
+ */
+export const SPAN_LIST_LIMIT = 64;
+
+/**
  * The JSON Schema the extractor's generation is constrained to.
  *
  * Sent to Ollama as a structured-output grammar (`response_format:
  * json_schema`), not merely validated after the fact: on tool-schema-dense
- * Codex chunks, JSON *mode* alone still let the model spend its whole
- * 4096-token budget on non-conforming output, fail `parseSpans`, and drag the
- * request through bisection to a refusal. A grammar makes that output
- * unrepresentable. The zod parse downstream stays — this schema shapes
- * generation, zod remains the boundary that decides acceptance.
+ * Codex chunks, JSON *mode* alone let the model spend its whole 4096-token
+ * budget on non-conforming output; a shape-only grammar then let it spend the
+ * same budget enumerating schema-valid junk spans until the JSON truncated
+ * mid-array (measured live: every call a uniform ~55 s ≈ 4096 tokens at
+ * 79 tok/s). `maxItems` and `maxLength` bound the *length* of what the grammar
+ * admits, so generation must terminate well inside the budget. The zod parse
+ * downstream stays — this schema shapes generation, zod remains the boundary
+ * that decides acceptance.
  */
 export const SPAN_RESPONSE_JSON_SCHEMA = {
   type: 'object',
   properties: {
     spans: {
       type: 'array',
+      maxItems: SPAN_LIST_LIMIT,
       items: {
         type: 'object',
         properties: {
-          text: { type: 'string' },
+          // A real name, address or organization fits well inside 256
+          // characters; without the bound a single span could absorb the whole
+          // output budget.
+          text: { type: 'string', maxLength: 256 },
           category: { type: 'string', enum: [...UNSTRUCTURED_CATEGORIES] },
         },
         required: ['text', 'category'],
@@ -890,6 +908,16 @@ async function extractChunk(
     }
 
     const result = parseSpans(raw);
+    // A span list that fills the grammar's cap may have been cut mid-coverage:
+    // the grammar closes the array at SPAN_LIST_LIMIT however much more the
+    // model wanted to say, and accepting it would mask only the spans that fit.
+    // Saturation is treated exactly like an unreadable answer — bisection gives
+    // each half a fresh budget, and a chunk that saturates all the way down to
+    // the floor refuses the request.
+    if (result.kind === 'valid-spans' && result.spans.length >= SPAN_LIST_LIMIT) {
+      options.logger?.event('mask.gemma.saturated', { attempt: attempt + 1 }, 'WARNING');
+      return { kind: 'invalid', reason: 'span list saturated the grammar cap' };
+    }
     if (result.kind !== 'invalid') return result;
 
     lastReason = result.reason;

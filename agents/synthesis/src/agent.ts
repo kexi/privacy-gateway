@@ -276,7 +276,14 @@ export function createLeakJudge(
                 type: 'object',
                 properties: {
                   leak: { type: 'boolean' },
-                  categories: { type: 'array', items: { type: 'string' } },
+                  // Bounded so a drifting judge cannot spend its budget
+                  // enumerating; anything past the known category names is
+                  // dropped by the zod filter downstream anyway.
+                  categories: {
+                    type: 'array',
+                    maxItems: 16,
+                    items: { type: 'string', maxLength: 64 },
+                  },
                 },
                 required: ['leak'],
                 additionalProperties: false,

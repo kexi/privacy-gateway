@@ -22,6 +22,7 @@ import {
   looksTruncated,
   mergeSpans,
   parseSpans,
+  SPAN_LIST_LIMIT,
   SPAN_RESPONSE_JSON_SCHEMA,
   spansToDetections,
   UNSTRUCTURED_CATEGORIES,
@@ -718,6 +719,54 @@ describe('extractUnstructured (chunked)', () => {
     expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.items.properties.category.enum).toEqual([
       ...UNSTRUCTURED_CATEGORIES,
     ]);
+    // Length is bounded too: a shape-only grammar still let the model spend its
+    // whole output budget enumerating junk spans until the JSON truncated.
+    expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.maxItems).toBe(SPAN_LIST_LIMIT);
+    expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.items.properties.text.maxLength).toBe(256);
+  });
+
+  it('treats a span list that saturates the grammar cap as unreadable', async () => {
+    // The grammar closes the array at the cap however much more the model
+    // wanted to emit, so exactly-at-the-cap may be cut mid-coverage. Accepting
+    // it would mask only the spans that fit; bisection or refusal is the only
+    // fail-closed reading.
+    const saturated = JSON.stringify({
+      spans: Array.from({ length: SPAN_LIST_LIMIT }, (_, index) => ({
+        text: `Person ${index}`,
+        category: 'PERSON',
+      })),
+    });
+
+    await expect(
+      extractUnstructured('short text', {
+        cache: false,
+        minChunkBytes: 1000,
+        runAgent: () => Promise.resolve(saturated),
+      }),
+    ).rejects.toThrow(ExtractionFailedError);
+  });
+
+  it('bisects a saturating chunk instead of refusing it outright', async () => {
+    // A long chunk that saturates gets halved; halves that answer under the cap
+    // are accepted, so density is handled by splitting, not by giving up.
+    const text = 'a'.repeat(2400);
+    const saturated = JSON.stringify({
+      spans: Array.from({ length: SPAN_LIST_LIMIT }, (_, index) => ({
+        text: `Person ${index}`,
+        category: 'PERSON',
+      })),
+    });
+
+    const detections = await extractUnstructured(text, {
+      cache: false,
+      chunkBytes: 12000,
+      minChunkBytes: 1000,
+      runAgent: (prompt) =>
+        // The whole chunk saturates; anything shorter answers cleanly.
+        Promise.resolve(prompt.length > 2000 ? saturated : '{"spans": []}'),
+    });
+
+    expect(detections).toEqual([]);
   });
 
   it('still masks every occurrence when the model names a value only once', async () => {
