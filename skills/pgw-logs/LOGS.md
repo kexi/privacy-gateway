@@ -246,13 +246,24 @@ restarted instance takes the only GPU, which starves the validation of the very
 min-0 revision that was supposed to replace it. Symptoms: `just chill` hangs and
 fails at the 11-minute probe timeout while a warm instance keeps coming back.
 
-Recovery that actually holds overnight: stay at `--scaling=0` (manual, zero
-instances — requests refuse cleanly with `502 extraction_unavailable`, nothing
-bills), and switch back to `--scaling=auto --min-instances=0 --max-instances=1
---async` only when the next warm window starts. The ghost revision then revives
-one instance on its own, which doubles as the warm-up; it is finally cleaned up
-by the next successful roll or `tf-apply` that lands a min-0 revision as the
-traffic target.
+The actual fix (verified 2026-08-31): drain with `--scaling=0`, then **delete
+the ghost revision itself** — Cloud Run allows it because traffic points at
+"latest ready", not at the revision by name:
+
+```bash
+gcloud run revisions delete gemma-serving-<ghost> \
+  --region us-central1 --project all-thinkgs --quiet
+gcloud beta run services update gemma-serving \
+  --region us-central1 --project all-thinkgs \
+  --scaling=auto --min-instances=0 --max-instances=1 --async
+```
+
+With the GPU free and the ghost gone, the min-0 revision validates in a few
+minutes (model load included), becomes the traffic target, and the service is
+back to genuine scale-to-zero. If deletion is ever refused, the fallback is to
+stay at `--scaling=0` (manual, zero instances — requests refuse cleanly with
+`502 extraction_unavailable`, nothing bills) until a warm window justifies
+letting the ghost revive.
 
 ### Prevention
 
