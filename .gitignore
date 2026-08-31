@@ -13,6 +13,7 @@ __pycache__/
 coverage/
 web/test-results/
 web/playwright-report/
+artifacts/demo/
 
 # --- env / secrets ---
 .env

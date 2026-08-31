@@ -77,6 +77,38 @@ web-e2e *args:
 web-e2e-report:
     pnpm -C web exec playwright show-report
 
+# Record the deterministic English browser demo at 1920x1080
+demo-video-web:
+    ./.just/record-demo.sh web
+
+# Render narration and captions onto the existing browser recording
+demo-video-web-render:
+    ./.just/record-demo.sh web-render
+
+# Record and combine the English browser and Codex demos into one 1920x1080 submission video
+demo-video:
+    ./.just/record-demo.sh submission
+
+# Combine existing narrated browser and Codex recordings
+demo-video-combine:
+    ./.just/record-demo.sh combine
+
+# Capture Codex CLI against the local production-path fleet and render an English 1920x1080 video
+demo-video-codex:
+    ./.just/record-demo.sh codex
+
+# Capture only the local Codex PTY session
+demo-video-codex-capture:
+    ./.just/record-demo.sh codex-capture
+
+# Capture Codex against the deployed fleet (sends local CLI context and may incur GPU cost)
+demo-video-codex-live-capture:
+    ./.just/record-demo.sh codex-live-capture
+
+# Render the existing Codex PTY capture without calling the deployed fleet
+demo-video-codex-render:
+    ./.just/record-demo.sh codex-render
+
 # --- clients ----------------------------------------------------------------
 
 # Send a request through the Python client example

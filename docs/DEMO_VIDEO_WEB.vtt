@@ -1,0 +1,37 @@
+WEBVTT
+
+00:00.600 --> 00:03.750
+This gateway protects sensitive data before cloud reasoning begins.
+
+00:03.800 --> 00:06.950
+We enter identity, payment, and private project details.
+
+00:07.000 --> 00:10.150
+Shape detection and explicit terms protect every sensitive value.
+
+00:10.200 --> 00:13.250
+High-risk values remain withheld unless disclosure is explicit.
+
+00:13.300 --> 00:16.700
+The fail-closed gateway pseudonymizes the request before Gemini sees it.
+
+00:16.800 --> 00:19.400
+Four independent dimensions explain the release decision.
+
+00:19.500 --> 00:21.800
+This is pseudonymization, not anonymization.
+
+00:23.100 --> 00:25.600
+The masked pane shows exactly what Gemini received.
+
+00:27.800 --> 00:30.600
+A click traces one protected value across the workflow.
+
+00:31.200 --> 00:34.350
+Safe values return once, while card data remains withheld.
+
+00:35.800 --> 00:39.300
+The OKF record preserves provenance and deterministic leak-check evidence.
+
+00:40.800 --> 00:44.650
+The result is useful, inspectable, and never released through an unsafe fallback.

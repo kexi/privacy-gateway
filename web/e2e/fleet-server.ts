@@ -21,6 +21,7 @@ const CORE_BASE_URL = 'http://core.test';
 const GATEWAY_PORT = Number(process.env['E2E_GATEWAY_PORT'] ?? 8181);
 const SYNTHESIS_PORT = Number(process.env['E2E_SYNTHESIS_PORT'] ?? 8183);
 const SYNTHESIS_URL = `http://127.0.0.1:${SYNTHESIS_PORT}`;
+const DEMO_CORE_DELAY_MS = Number(process.env['E2E_DEMO_CORE_DELAY_MS'] ?? 0);
 
 /**
  * Markers a spec can put in its request text to select a misbehaving Core.
@@ -85,17 +86,23 @@ function fleetFetch(): typeof fetch {
       };
       const prompt = body.params.message.parts.map((part) => part.text ?? '').join('');
 
-      return Promise.resolve(
-        Response.json({
-          jsonrpc: '2.0',
-          id: body.id,
-          result: {
-            role: 'agent',
-            parts: [{ kind: 'text', text: coreReply(prompt) }],
-            messageId: 'reply-1',
-          },
-        }),
-      );
+      const response = Response.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: {
+          role: 'agent',
+          parts: [{ kind: 'text', text: coreReply(prompt) }],
+          messageId: 'reply-1',
+        },
+      });
+
+      if (DEMO_CORE_DELAY_MS <= 0) return Promise.resolve(response);
+
+      // Why not delay normal E2E runs: only the filming process needs enough
+      // time for Codex's in-progress TUI state to be visible to a reviewer.
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(response), DEMO_CORE_DELAY_MS);
+      });
     }
 
     // Mock Gemma: always finds the demo customer's name.
