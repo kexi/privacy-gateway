@@ -2,7 +2,7 @@
 type: Attested Computation
 title: Leak check on a gateway response
 description: Sanctioned deterministic check that a core agent's tokenized response carries no raw PII or secrets before it is released, per the repository PII masking policy.
-tags: [pii, security, attested]
+tags: [pii, attested]
 status: stable
 runtime: typescript
 parameters:

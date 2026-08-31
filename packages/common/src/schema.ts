@@ -694,6 +694,129 @@ export const OpenAiChatCompletionResponseSchema = z.object({
 });
 export type OpenAiChatCompletionResponse = z.infer<typeof OpenAiChatCompletionResponseSchema>;
 
+/**
+ * One part of a Responses-API `input` message's content array.
+ *
+ * The Responses API renames the text kinds: an input turn carries `input_text`,
+ * an assistant turn carries `output_text`. Everything else — `input_image`,
+ * `input_audio`, `input_file` — is non-text and is refused by name at the
+ * endpoint for exactly the reason the chat surface refuses `image_url`: this
+ * fleet masks text with regexes and a text model, and cannot redact a face or a
+ * spoken name. `text` is optional because a non-text part has none, and the
+ * union is discriminated by `type` alone.
+ */
+export const OpenAiResponsesContentPartSchema = z
+  .object({
+    type: z.string(),
+    text: z.string().optional(),
+  })
+  .passthrough();
+
+/** The text part kinds a Responses `input` message may carry. */
+export const RESPONSES_TEXT_PART_TYPES: readonly string[] = ['input_text', 'output_text', 'text'];
+
+/**
+ * One message of a Responses-API `input` array.
+ *
+ * `role` is widened past the chat surface's three: Codex sends `developer`
+ * turns for its base instructions, and rejecting them would make the CLI
+ * unusable. A `developer` turn is treated as a system turn by the flattener.
+ */
+export const OpenAiResponsesInputMessageSchema = z
+  .object({
+    type: z.literal('message').optional(),
+    role: z.enum(['system', 'developer', 'user', 'assistant']),
+    content: z.union([z.string(), z.array(OpenAiResponsesContentPartSchema)]),
+  })
+  .strip();
+export type OpenAiResponsesInputMessage = z.infer<typeof OpenAiResponsesInputMessageSchema>;
+
+/**
+ * One element of a Responses `input` array.
+ *
+ * Codex's `ResponseItem` is a tagged union far wider than `message`: reasoning
+ * items, function calls, tool outputs. Only `message` carries text this fleet
+ * can mask, so the rest are matched as opaque tagged objects and dropped by the
+ * flattener — dropping a `reasoning` item the caller replayed loses nothing,
+ * because this fleet never produced one.
+ */
+export const OpenAiResponsesInputItemSchema = z.union([
+  OpenAiResponsesInputMessageSchema,
+  z.object({ type: z.string() }).passthrough(),
+]);
+
+/**
+ * `POST /v1/responses`.
+ *
+ * Codex CLI ≥ 0.149 dropped `chat/completions` for custom providers, so this is
+ * the only wire a `wire_api = "responses"` provider can speak.
+ *
+ * Like the chat schema this is deliberately not `strict()`, and for a stronger
+ * reason: Codex sends `reasoning`, `include`, `store`, `prompt_cache_key`,
+ * `service_tier`, `text`, `parallel_tool_calls`, `tool_choice` and
+ * `client_metadata` on every turn. Stripping them is honest — this fleet
+ * forwards no sampling knob, caches no prompt and stores nothing keyed by a
+ * caller-supplied id — and rejecting them would make the CLI unusable.
+ *
+ * `tools` is accepted and ignored. Why not reject a request that declares
+ * tools: Codex always declares its shell toolset, so rejecting would refuse
+ * every request. Why not emit tool calls: the fleet has no sandbox to run them
+ * in and fabricating a call the model never made would be a lie the caller
+ * would execute. The honest behaviour is to answer in text and never emit a
+ * `function_call` item, which Codex reads as a turn that chose not to use a
+ * tool.
+ */
+export const OpenAiResponsesRequestSchema = z
+  .object({
+    model: z.string().min(1),
+    /** Codex sends its base prompt here rather than as a `system` turn. */
+    instructions: z.string().optional(),
+    input: z.union([z.string(), z.array(OpenAiResponsesInputItemSchema)]),
+    stream: z.boolean().optional(),
+    x_privacy_gateway: z
+      .object({
+        rehydrate_allow: RehydrateAllowSchema.optional(),
+        mask_terms: MaskTermsSchema.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strip();
+export type OpenAiResponsesRequest = z.infer<typeof OpenAiResponsesRequestSchema>;
+
+/**
+ * The `response` object, in the shape Codex's SSE parser deserializes.
+ *
+ * `id` is required by Codex's `ResponseCompleted` struct: a `response.completed`
+ * event without one fails the stream. `usage` is optional there but sent as
+ * zeros here for the same reason the chat surface does — this fleet bills no
+ * tokens, and omitting the field entirely makes a client's cost display read as
+ * missing data rather than nothing spent.
+ */
+export const OpenAiResponsesObjectSchema = z.object({
+  id: z.string(),
+  object: z.literal('response'),
+  created_at: z.number(),
+  status: z.enum(['completed', 'failed']),
+  model: z.string(),
+  output: z.array(
+    z.object({
+      type: z.literal('message'),
+      id: z.string(),
+      status: z.literal('completed'),
+      role: z.literal('assistant'),
+      content: z.array(z.object({ type: z.literal('output_text'), text: z.string() })),
+    }),
+  ),
+  usage: z.object({
+    input_tokens: z.number(),
+    output_tokens: z.number(),
+    total_tokens: z.number(),
+  }),
+  x_privacy_gateway: OpenAiPrivacyExtensionSchema,
+});
+export type OpenAiResponsesObject = z.infer<typeof OpenAiResponsesObjectSchema>;
+
 export const OpenAiModelSchema = z.object({
   id: z.string(),
   object: z.literal('model'),

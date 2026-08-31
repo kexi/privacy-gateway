@@ -43,3 +43,7 @@ title: Privacy gateway bundle history
   instructions at `references/skills/run-leak-check.md`.
 - The attester re-derives its findings from the response text rather than trusting the
   runner's `findings` list, so an under-reporting runner fails rather than passes.
+
+## 2026-08-31
+
+- **Update**: Pruned the tag vocabulary to [tags.yml](/tags.yml) — dropped `security` (applied uniformly, so it carried no signal); documents now carry only discriminating tags.

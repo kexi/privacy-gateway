@@ -2,7 +2,7 @@
 type: Skill
 title: Run the leak check
 description: Run instructions for the leak-check Attested Computation. Produces the receipt the deterministic attester inspects.
-tags: [pii, security, executor]
+tags: [pii, executor]
 status: stable
 generated: { by: gateway_fleet/bootstrap, at: 2026-08-24T00:00:00Z }
 ---

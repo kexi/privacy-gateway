@@ -1,0 +1,11 @@
+# Controlled vocabulary for OKF frontmatter `tags` in this bundle and in
+# runtime-generated Gateway Answer documents (packages/common/src/okf.ts).
+# Add a tag here, with a description, BEFORE using it in a document;
+# `just lint-okf-tags` (also in `just check`) fails on any tag absent from
+# this list.
+tags:
+  attested: Carries or references an Attested Computation (OKF §10).
+  executor: Run instructions an Attested Computation's executor points at.
+  gateway: Produced by the gateway fleet at request time (runtime documents).
+  pii: Concerns detection, masking or disclosure of personal data.
+  policy: A human-authored rule the fleet enforces.

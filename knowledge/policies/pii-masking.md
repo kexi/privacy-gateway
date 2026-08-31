@@ -2,7 +2,7 @@
 type: Policy
 title: PII masking policy
 description: What the gateway must mask before any text crosses the trust boundary, and what a response must satisfy before it is presented to a user.
-tags: [pii, security, policy]
+tags: [pii, policy]
 status: stable
 generated: { by: claude_fleet_agent/opus-4, at: 2026-08-31T17:00:00Z }
 verified:

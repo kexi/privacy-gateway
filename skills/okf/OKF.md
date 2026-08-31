@@ -85,6 +85,12 @@ attester:
 - `executor.receipt` の宣言と `verify()` が要求するフィールドは **同一の 5 つ** にする（`request_id`, `masked_prompt_hash`, `response_hash`, `findings`, `response`）。attester が `RECEIPT_FIELDS` として export し、テストで一致を保証する。宣言外のフィールドを要求する attester は第三者に実行できない。
 - README / ARCHITECTURE で OKF に触れる際は「v0.2」「trust signals」「Attested Computation」の語を正確に使い、spec URL `https://github.com/GoogleCloudPlatform/open-knowledge-format` を参照する。
 
+### タグの統制語彙
+
+- `tags` に使ってよい値は **`knowledge/tags.yml` に列挙されたものだけ**。新しいタグは説明付きで tags.yml に追加してから使う。
+- ランタイム生成文書（`packages/common/src/okf.ts` の Gateway Answer）も同じ語彙に従う。
+- `just lint-okf-tags`（`just check` に含まれる）が違反を検出する。
+
 ## 5. 参考ファイル（`references/`）
 
 - `SPEC.md` — 仕様全文

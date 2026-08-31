@@ -135,3 +135,7 @@ check: fmt-check check-recipe-docs lint tf-validate typecheck pin-verify secrets
 # Run the pre-commit hooks against all files
 check-hooks:
     lefthook run pre-commit --all-files
+
+# Verify OKF tags against the controlled vocabulary in knowledge/tags.yml
+lint-okf-tags:
+    ./.just/check-okf-tags.sh
