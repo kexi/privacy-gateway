@@ -6,6 +6,16 @@
 このリポジトリの開発環境は **Nix flake の devShell** で完結する。
 Homebrew や各種バージョンマネージャは使わない。必要なツールはすべて `flake.nix` に書く。
 
+## 0. 前提ツール
+
+- **Nix** — [公式ダウンロードページ](https://nixos.org/download/)か、flakes が
+  最初から有効になる [Determinate Systems インストーラ](https://install.determinate.systems/)で
+  インストールする。公式インストーラを使う場合は `~/.config/nix/nix.conf` に
+  `experimental-features = nix-command flakes` を追記して flakes を有効化する。
+- **direnv**（任意・推奨）—
+  [インストールガイド](https://direnv.net/docs/installation.html)を参照し、
+  [シェルへの hook 設定](https://direnv.net/docs/hook.html)も忘れずに。
+
 ## 1. シェルに入る
 
 ### direnv を使う（推奨）

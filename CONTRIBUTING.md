@@ -6,6 +6,17 @@ The development environment is fully described by a **Nix flake devShell**.
 Homebrew and per-language version managers are not used: every tool belongs in
 `flake.nix`.
 
+## 0. Prerequisites
+
+- **Nix** — install it from the [official download page](https://nixos.org/download/)
+  or with the [Determinate Systems installer](https://install.determinate.systems/),
+  which enables flakes out of the box. With the official installer, enable flakes
+  yourself by adding `experimental-features = nix-command flakes` to
+  `~/.config/nix/nix.conf`.
+- **direnv** (optional, recommended) — see the
+  [installation guide](https://direnv.net/docs/installation.html), and remember
+  to [hook it into your shell](https://direnv.net/docs/hook.html).
+
 ## 1. Entering the shell
 
 ### With direnv (recommended)

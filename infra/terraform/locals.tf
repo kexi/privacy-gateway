@@ -80,13 +80,13 @@ locals {
         GEMMA_BASE_URL = local.gemma_base_url
         GEMMA_AUTH     = "iam"
         # Derived from the Gateway's deployed MAX_BODY_BYTES, not from the code
-        # default: this body carries a whole 256 KiB-class masked prompt plus a
+        # default: this body carries a whole 512 KiB-class masked prompt plus a
         # whole Core answer plus the JSON envelope, and the code's derivation
         # (input*2 + 64 KiB envelope) only sees this service's own env. Left at
         # the compile-time default, a large request paid for extraction and the
         # Core call and *then* got a 413 here. Keep in step with the Gateway's
-        # MAX_BODY_BYTES below: 262144*2 + 65536.
-        SYNTHESIS_MAX_BODY_BYTES = "589824"
+        # MAX_BODY_BYTES below: 524288*2 + 65536.
+        SYNTHESIS_MAX_BODY_BYTES = "1114112"
       }
     }
     "gateway-agent" = {
@@ -96,11 +96,13 @@ locals {
       vpc_egress = true
       env = {
         GEMMA_AUTH = "iam"
-        # 256 KiB, up from the 64 KiB code default: Codex CLI's Responses API
-        # requests carry ~147 KB of instructions/tool context. Cost exposure
-        # stays bounded by the per-IP rate limit, the request deadline, one GPU
-        # instance and the billing kill switch.
-        MAX_BODY_BYTES = "262144"
+        # 512 KiB, up from the 64 KiB code default: Codex CLI's Responses API
+        # requests carry ~147 KB of instructions/tool context bare, and a CLI
+        # with its skill catalogue loaded exceeded 256 KiB. Cost exposure stays
+        # bounded by the per-IP rate limit, the request deadline, one GPU
+        # instance and the billing kill switch; the no-thinking grammar-bound
+        # extractor clears a 512 KiB-class turn well inside the 240 s deadline.
+        MAX_BODY_BYTES = "524288"
         # ~4 KB chunks: per-chunk Gemma latency falls superlinearly with size
         # (5.7 KB answered in 9 s while 12 KB took ~120 s), so many small
         # parallel chunks beat few large ones on the single GPU.
