@@ -273,15 +273,89 @@ warm:
     echo "==> gemma-serving min-instances=1; the GPU is now warm and billing."
     echo "    Send one 'just smoke' to force the model load before you record."
 
-# Release the pinned gemma-serving instance and stop the idle GPU billing
+# Release the pinned gemma-serving instance, delete ghost revisions, restore scale-to-zero
 chill:
     #!/usr/bin/env bash
     set -euo pipefail
-    gcloud run services update gemma-serving \
+    svc=gemma-serving
+    describe() {
+      gcloud run services describe "$svc" \
+        --project "{{ project_id }}" --region "{{ region }}" "$@"
+    }
+    # Idempotence first: when the serving revision is already a min-0 revision
+    # under AUTOMATIC scaling and nothing pins instances, there is nothing to
+    # drain — re-running the full path would only mint another revision whose
+    # validation instance costs a pointless GPU start.
+    mode=$(describe --format 'value(metadata.annotations."run.googleapis.com/scalingMode")')
+    pinned=$(gcloud run revisions list --service "$svc" \
       --project "{{ project_id }}" --region "{{ region }}" \
-      --min-instances=0 --quiet >/dev/null
-    echo "==> gemma-serving min-instances=0; it scales to zero and stops billing."
-    echo "    The next request pays the ~90 s cold start again."
+      --format 'value(metadata.annotations."autoscaling.knative.dev/minScale")' \
+      | grep -cv '^0*$' || true)
+    if [ "${mode:-automatic}" != "manual" ] && [ "${pinned:-0}" -eq 0 ]; then
+      # Failed rollouts are deletable without a drain; sweep them for tidiness.
+      gcloud run revisions list --service "$svc" \
+        --project "{{ project_id }}" --region "{{ region }}" \
+        --format 'value(metadata.name, status.conditions[0].status)' \
+        | while IFS=$'\t' read -r name ready; do
+          [ "${ready:-}" = "False" ] || continue
+          # The latest-created revision is undeletable by API design; keep it.
+          if gcloud run revisions delete "$name" \
+            --project "{{ project_id }}" --region "{{ region }}" --quiet >/dev/null 2>&1; then
+            echo "==> deleted failed revision $name"
+          else
+            echo "==> kept revision $name (Cloud Run refuses to delete the latest created)"
+          fi
+        done
+      echo "==> gemma-serving is already at scale-to-zero; nothing to drain."
+      exit 0
+    fi
+    # Why not a plain `--min-instances=0` update, which is what this recipe was:
+    # min-instances lives on the revision `just warm` created, and with GPU
+    # quota 1 the update's new revision cannot pass its startup probe while the
+    # warm instance still holds the GPU — the command hangs 11 minutes and the
+    # warm revision keeps billing (skills/pgw-logs/LOGS.md §8, observed
+    # 2026-08-31). So: drain hard, delete the revisions that pin instances,
+    # then restore genuine scale-to-zero on a free GPU.
+    echo "==> draining (manual scaling, 0 instances)"
+    gcloud beta run services update "$svc" \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --scaling=0 --async --quiet >/dev/null
+    sleep 20
+    # Traffic binds to "latest ready", never to a revision by name, so even the
+    # serving revision is deletable; ghosts and failed rollouts both go.
+    gcloud run revisions list --service "$svc" \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --format 'value(metadata.name, metadata.annotations."autoscaling.knative.dev/minScale", status.conditions[0].status)' \
+      | while IFS=$'\t' read -r name min ready; do
+        if { [ -n "${min:-}" ] && [ "$min" != "0" ]; } || [ "${ready:-}" = "False" ]; then
+          if gcloud run revisions delete "$name" \
+            --project "{{ project_id }}" --region "{{ region }}" --quiet >/dev/null 2>&1; then
+            echo "==> deleted revision $name (min-instances=${min:-none}, ready=${ready:-unknown})"
+          else
+            echo "==> kept revision $name (Cloud Run refuses to delete the latest created)"
+          fi
+        fi
+      done
+    echo "==> restoring autoscaling (min 0 / max 1)"
+    gcloud beta run services update "$svc" \
+      --project "{{ project_id }}" --region "{{ region }}" \
+      --scaling=auto --min-instances=0 --max-instances=1 --async --quiet >/dev/null
+    # The fresh min-0 revision must validate once (image + model load, a few
+    # minutes); after that the validation instance idles back to zero.
+    # 80 x 10 s: the startup probe alone is allowed 11 minutes, and an idling
+    # validation instance from a previous rollout can delay the GPU handover.
+    for _ in $(seq 1 80); do
+      ready=$(describe --format 'value(status.conditions[0].status)')
+      [ "$ready" = "True" ] && break
+      sleep 10
+    done
+    if [ "${ready:-}" != "True" ]; then
+      echo "!! gemma-serving did not report ready within 13 minutes." >&2
+      echo "!! See skills/pgw-logs/LOGS.md §8 for the recovery runbook." >&2
+      exit 1
+    fi
+    echo "==> gemma-serving is back to scale-to-zero: idle bills nothing,"
+    echo "    the next request pays the ~90 s cold start again."
 
 # --- GPU quota ---------------------------------------------------------------
 
