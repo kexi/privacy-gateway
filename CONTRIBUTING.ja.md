@@ -1,6 +1,6 @@
 # 開発環境
 
-> English version: [DEVELOPMENT.md](DEVELOPMENT.md)
+> English version: [CONTRIBUTING.md](CONTRIBUTING.md)
 > この文書は英語版の日本語訳です。内容が食い違う場合は英語版が正となります。
 
 このリポジトリの開発環境は **Nix flake の devShell** で完結する。
@@ -305,3 +305,20 @@ Action を足したり dependabot が更新したりしたあとは、次を実�
 just pin
 just pin-verify
 ```
+
+### パッケージマネージャ方針（README から移設）
+
+Node.js 22 + pnpm workspace。`pnpm-workspace.yaml` で `minimumReleaseAge: 1440` を設定して
+おり、公開から 24 時間未満のバージョンは拒否される（侵害されたリリースに対する cooldown）。
+postinstall スクリプトは既定で禁止し、`allowBuilds` で本当に必要なもの（esbuild）だけを許可
+している。ビルドスクリプトはインストール時の任意コード実行なので、既定の答えは「否」。pnpm
+自体は `packageManager` フィールドで corepack 向けに固定。
+TypeScript の lint / フォーマットは **oxlint**（1.79.0、型を見るルール用に
+`oxlint-tsgolint` を併用）と **oxfmt**（0.64.0）であって eslint/prettier ではない。設定は
+リポジトリルートの `.oxlintrc.json` と `.oxfmtrc.json` に 1 か所だけ置く。型検査は独立した
+ステップのまま（`just typecheck`）で、oxlint は `tsc --noEmit` を置き換えない。
+Python は standalone の PEP 723 スクリプト（`clients/python/pgw.py`）としてのみ残っており、
+`uv run` で実行し、ルートの最小限の `ruff.toml` で **ruff** をかける。`pyproject.toml` も
+`uv.lock` も `uv sync` もない。インストールすべき Python パッケージが存在しない以上、依存
+解決のステップは、自分の依存をインラインで宣言しているスクリプトの周りに lockfile の儀式を
+足すだけになるため。

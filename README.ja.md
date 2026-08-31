@@ -893,19 +893,7 @@ Cloud Run の manual scaling で `gemma-serving` をインスタンス数 0 に�
 
 ## ツールチェーンとサプライチェーン対策
 
-Node.js 22 + pnpm workspace。`pnpm-workspace.yaml` で `minimumReleaseAge: 1440` を設定して
-おり、公開から 24 時間未満のバージョンは拒否される（侵害されたリリースに対する cooldown）。
-postinstall スクリプトは既定で禁止し、`allowBuilds` で本当に必要なもの（esbuild）だけを許可
-している。ビルドスクリプトはインストール時の任意コード実行なので、既定の答えは「否」。pnpm
-自体は `packageManager` フィールドで corepack 向けに固定。
-
-TypeScript の lint / フォーマットは **oxlint**（1.79.0、型を見るルール用に
-`oxlint-tsgolint` を併用）と **oxfmt**（0.64.0）であって eslint/prettier ではない。設定は
-リポジトリルートの `.oxlintrc.json` と `.oxfmtrc.json` に 1 か所だけ置く。型検査は独立した
-ステップのまま（`just typecheck`）で、oxlint は `tsc --noEmit` を置き換えない。
-
-Python は standalone の PEP 723 スクリプト（`clients/python/pgw.py`）としてのみ残っており、
-`uv run` で実行し、ルートの最小限の `ruff.toml` で **ruff** をかける。`pyproject.toml` も
-`uv.lock` も `uv sync` もない。インストールすべき Python パッケージが存在しない以上、依存
-解決のステップは、自分の依存をインラインで宣言しているスクリプトの周りに lockfile の儀式を
-足すだけになるため。
+開発環境のセットアップ、pre-commit / CI の全ゲート、サプライチェーン方針
+（pnpm `minimumReleaseAge`、postinstall 既定ブロック、Actions の SHA 固定、
+ベースイメージのダイジェスト固定）は
+[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md) を参照。

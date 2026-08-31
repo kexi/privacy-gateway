@@ -1,6 +1,6 @@
 # Development
 
-> 日本語版: [DEVELOPMENT.ja.md](DEVELOPMENT.ja.md)
+> 日本語版: [CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)
 
 The development environment is fully described by a **Nix flake devShell**.
 Homebrew and per-language version managers are not used: every tool belongs in
@@ -309,3 +309,20 @@ letting dependabot bump one, re-pin:
 just pin
 just pin-verify
 ```
+
+### Package-manager policy (moved from README)
+
+Node.js 22 with a pnpm workspace. `pnpm-workspace.yaml` sets `minimumReleaseAge: 1440`, so a
+package version published less than 24 hours ago is refused — a cooldown against compromised
+releases. Postinstall scripts are blocked by default and `allowBuilds` re-enables only the
+one that genuinely needs it (esbuild); a build script is arbitrary code execution at install
+time, so the default answer is "no". pnpm itself is pinned via `packageManager` for corepack.
+TypeScript lint and formatting are **oxlint** (1.79.0, with `oxlint-tsgolint` for type-aware
+rules) and **oxfmt** (0.64.0) — not eslint/prettier — configured once at the repository root
+in `.oxlintrc.json` and `.oxfmtrc.json`. Type checking stays a separate step (`just
+typecheck`); oxlint does not replace `tsc --noEmit`.
+Python survives only as standalone PEP 723 scripts (`clients/python/pgw.py`), run with
+`uv run` and linted by **ruff** through a minimal root `ruff.toml`. There is no
+`pyproject.toml`, no `uv.lock` and no `uv sync`: with no Python package to install, a
+dependency-resolution step would only be lockfile ceremony around a script that declares its
+own dependencies inline.

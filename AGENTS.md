@@ -7,7 +7,7 @@ Instructions for AI coding agents (Codex, Claude Code, others) working in this r
 
 Privacy-preserving multi-agent gateway for the All Things Agentic Hackathon (Devpost).
 Deadline: **2026-08-31 17:00 PDT**. Category: Fortified Enterprise Fleet.
-Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. Dev setup: `docs/DEVELOPMENT.md`.
+Design of record: `docs/ARCHITECTURE.md`. Deployment runbook: `docs/DEPLOY.md`. Dev setup and supply-chain policy: `CONTRIBUTING.md`.
 
 - All three agents are **ADK TypeScript** (`@google/adk` 2.x): Gateway (Gemma via `OllamaLlm`) → **A2A** → Core (Gemini 3.5 on Vertex AI, `gemini-3.5-flash`) → **authenticated HTTP** → Synthesis (Gemma). Only the Gateway → Core hop uses A2A; Synthesis is reached over HTTP on purpose, because the OKF document is an audit artifact and must be retrieved without an LLM rephrasing it. Do not claim the fleet is all-A2A. A single-file Python client (`clients/python/pgw.py`, PEP 723) demonstrates language-agnostic consumption.
 - Token Vault: Firestore, **one entry per request** keyed by a server-generated UUIDv7. There are no sessions and no caller-supplied ids: a caller who can name a vault key can make the fleet resolve someone else's placeholders. Core has **no** Firestore access — enforced by IAM (Core's service account holds no Firestore role), not by the package graph; never grant it.

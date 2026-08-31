@@ -3,13 +3,13 @@
 Reviewer: Codex (gpt-5.6-sol, ultra). Coder: Claude (Opus executors, Fable orchestration).
 Loop: review → fix → redeploy → re-review, until VERDICT: CONVERGED.
 
-| Round | Findings | Nature | Fixed at |
-|---|---|---|---|
-| 3 | 4 | veto retry, ?key= in logs, GPU cap ineffective, stale proofs | 90a9bd8 |
-| 4 | 6 | shim image drop, vault overclaim, positional verify, Gemma4 stragglers, DEVPOST wording, diagram | 90ddfc9 |
-| 5 | 4 | documentation sync only | 019201f |
-| 6 | 4 | doc/string sync only | 9cd9b47 |
-| 7 | 0 | **VERDICT: CONVERGED** | — |
+| Round | Findings | Nature                                                                                           | Fixed at |
+| ----- | -------- | ------------------------------------------------------------------------------------------------ | -------- |
+| 3     | 4        | veto retry, ?key= in logs, GPU cap ineffective, stale proofs                                     | 90a9bd8  |
+| 4     | 6        | shim image drop, vault overclaim, positional verify, Gemma4 stragglers, DEVPOST wording, diagram | 90ddfc9  |
+| 5     | 4        | documentation sync only                                                                          | 019201f  |
+| 6     | 4        | doc/string sync only                                                                             | 9cd9b47  |
+| 7     | 0        | **VERDICT: CONVERGED**                                                                           | —        |
 
 ## Round 4
 
@@ -114,4 +114,3 @@ VERDICT: 4 FINDINGS
 現行ツリーを再確認し、material な correctness/security defect または審査資料との矛盾は見つかりませんでした。Round 6 の4修正も実装・UI・英日文書・CI定義で整合しています。
 
 VERDICT: CONVERGED
-
