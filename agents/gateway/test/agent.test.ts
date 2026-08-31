@@ -722,7 +722,7 @@ describe('extractUnstructured (chunked)', () => {
     // Length is bounded too: a shape-only grammar still let the model spend its
     // whole output budget enumerating junk spans until the JSON truncated.
     expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.maxItems).toBe(SPAN_LIST_LIMIT);
-    expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.items.properties.text.maxLength).toBe(256);
+    expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.items.properties.text.maxLength).toBe(96);
   });
 
   it('treats a span list that saturates the grammar cap as unreadable', async () => {

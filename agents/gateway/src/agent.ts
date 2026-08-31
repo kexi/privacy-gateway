@@ -99,8 +99,18 @@ export const SPAN_AGENT_NAME = 'gateway_pii_agent';
  * therefore treats exactly-at-the-cap as `invalid`, which sends the chunk into
  * bisection — halves carry fewer distinct entities — instead of accepting a
  * span list with an unknown remainder. Fail closed, as ever.
+ *
+ * Why 24 and 96 and not the 64 and 256 this shipped with first: the bound has
+ * to hold in *tokens*, and degenerate output tokenizes at up to ~1 token per
+ * character. 64 items x (256-char text + syntax) admits ~18,000 characters —
+ * measured live, the constrained model filled its whole 4096-token budget
+ * inside that grammar and the JSON still truncated mid-array. 24 x (96 + ~30)
+ * is ~3,000 characters, inside the budget even at worst-case tokenization, so
+ * a generation must now reach the closing brace. Real names, addresses and
+ * organization names fit 96 characters; a chunk with more than 24 distinct
+ * entities saturates and bisects.
  */
-export const SPAN_LIST_LIMIT = 64;
+export const SPAN_LIST_LIMIT = 24;
 
 /**
  * The JSON Schema the extractor's generation is constrained to.
@@ -125,10 +135,10 @@ export const SPAN_RESPONSE_JSON_SCHEMA = {
       items: {
         type: 'object',
         properties: {
-          // A real name, address or organization fits well inside 256
+          // A real name, address or organization fits well inside 96
           // characters; without the bound a single span could absorb the whole
-          // output budget.
-          text: { type: 'string', maxLength: 256 },
+          // output budget (see SPAN_LIST_LIMIT for the token arithmetic).
+          text: { type: 'string', maxLength: 96 },
           category: { type: 'string', enum: [...UNSTRUCTURED_CATEGORIES] },
         },
         required: ['text', 'category'],
