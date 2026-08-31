@@ -145,7 +145,11 @@ resource "google_cloud_run_v2_service" "agents" {
 
     scaling {
       min_instance_count = 0
-      max_instance_count = 3
+      # Gateway pinned to one instance: the extraction span cache is
+      # in-process, and a Codex retry that lands on a cache-less sibling pays
+      # the full extraction again — with three instances a heavy first call
+      # never converges. One instance at concurrency 40 is ample for the demo.
+      max_instance_count = each.key == "gateway-agent" ? 1 : 3
     }
 
     max_instance_request_concurrency = 40
