@@ -180,3 +180,14 @@ check-hooks:
 # Verify OKF tags against the controlled vocabulary in knowledge/tags.yml
 lint-okf-tags:
     ./.just/check-okf-tags.sh
+
+# Sync the judging Basic-auth secret from 1Password into the macOS keychain
+sync-judge-secret:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 1Password is the durable home; the keychain is what operator commands
+    # read (gcloud env injection, curl checks), so the secret never lands in a
+    # file or in this repository. Requires `op signin` first.
+    pw="$(op item get 'Privacy Gateway Judge Access' --fields password --reveal)"
+    security add-generic-password -a judge -s privacy-gateway-basic-auth -w "$pw" -U
+    echo "==> keychain updated (service=privacy-gateway-basic-auth, account=judge)"

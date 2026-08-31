@@ -46,6 +46,7 @@ import {
   type TokenVault,
 } from '@privacy-gateway/common';
 import express, { type NextFunction, type Request, type Response } from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -266,6 +267,30 @@ export function createApp(options: CreateAppOptions): express.Application {
   app.get('/healthz', (_req, res) => {
     res.status(200).json({ status: 'ok', agent: 'gateway' });
   });
+
+  // Optional shared-secret gate for the judging window. Unset, the gateway is
+  // exactly as public as before; set, every surface except the liveness probe
+  // demands the credential, and the judges read it from the submission form's
+  // testing instructions (the Devpost-sanctioned pattern for gated demos).
+  // Why HTTP Basic and not a login page: the browser supplies the whole UX,
+  // every API client can send it (curl -u, a user:pass base_url), and there is
+  // no session state to invent on a gateway that deliberately has none.
+  const basicAuth = basicAuthCredentialsFromEnv();
+  if (basicAuth !== undefined) {
+    app.use((req, res, next) => {
+      if (req.path === '/healthz' || req.path === '/healthz/') {
+        next();
+        return;
+      }
+      const header = req.headers.authorization ?? '';
+      if (basicAuthMatches(header, basicAuth)) {
+        next();
+        return;
+      }
+      res.setHeader('WWW-Authenticate', 'Basic realm="privacy-gateway", charset="UTF-8"');
+      res.status(401).json({ error: 'unauthorized', message: 'credentials required' });
+    });
+  }
 
   app.post('/v1/ask', route(handleAsk));
 
@@ -1244,6 +1269,35 @@ export class GpuBusyError extends Error {
     super('a large request is already occupying the GPU');
     this.name = 'GpuBusyError';
   }
+}
+
+/**
+ * Read the optional Basic-auth credential from the environment.
+ *
+ * `BASIC_AUTH_CREDENTIALS="user:pass"` gates every surface but the liveness
+ * probe; unset or empty leaves the gateway public. A set-but-malformed value
+ * (no colon) fails closed: the gate turns on and nothing can match it, which
+ * is the safe reading of a credential that was clearly intended but mistyped.
+ */
+export function basicAuthCredentialsFromEnv(): string | undefined {
+  const raw = process.env['BASIC_AUTH_CREDENTIALS'];
+  if (raw === undefined || raw === '') return undefined;
+  return raw;
+}
+
+/** Constant-time comparison of an Authorization header against the credential. */
+export function basicAuthMatches(header: string, credentials: string): boolean {
+  if (!header.startsWith('Basic ')) return false;
+  if (!credentials.includes(':')) return false;
+  let presented: Buffer;
+  try {
+    presented = Buffer.from(header.slice('Basic '.length).trim(), 'base64');
+  } catch {
+    return false;
+  }
+  const expected = Buffer.from(credentials, 'utf8');
+  if (presented.length !== expected.length) return false;
+  return timingSafeEqual(presented, expected);
 }
 
 /** Above this many body bytes a request counts as heavy for admission control. */

@@ -766,6 +766,92 @@ describe('the deadline cancels the work, not only the wait (P1)', () => {
   });
 });
 
+async function getWithAuth(
+  app: ReturnType<typeof createGatewayApp>,
+  path: string,
+  auth?: string,
+): Promise<Response> {
+  const listener = app.listen(0);
+  const address = listener.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+    headers: auth === undefined ? {} : { authorization: auth },
+  });
+  listener.close();
+  return response;
+}
+
+describe('the shared-secret gate', () => {
+  const ENV = 'BASIC_AUTH_CREDENTIALS';
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env[ENV];
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+  });
+
+  function bareApp() {
+    return createGatewayApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      extractSpans: () => Promise.resolve([]),
+      callCore: () => Promise.resolve('Reply to nobody.'),
+      callSynthesis: () => Promise.reject(new Error('stop here')),
+    });
+  }
+
+  it('stays public when no credential is configured', async () => {
+    delete process.env[ENV];
+    const response = await getWithAuth(bareApp(), '/v1/status');
+    expect(response.status).not.toBe(401);
+  });
+
+  it('demands and verifies the credential on every surface but the probe', async () => {
+    process.env[ENV] = 'judge:sesame';
+    const app = bareApp();
+
+    const denied = await getWithAuth(app, '/v1/status');
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get('www-authenticate')).toContain('Basic');
+
+    const wrong = await getWithAuth(
+      app,
+      '/v1/status',
+      `Basic ${Buffer.from('judge:wrong').toString('base64')}`,
+    );
+    expect(wrong.status).toBe(401);
+
+    const granted = await getWithAuth(
+      app,
+      '/v1/status',
+      `Basic ${Buffer.from('judge:sesame').toString('base64')}`,
+    );
+    expect(granted.status).not.toBe(401);
+
+    // The liveness probe stays open: an authenticated health check would read
+    // as an outage to anything that monitors it.
+    const probe = await getWithAuth(app, '/healthz');
+    expect(probe.status).toBe(200);
+  });
+
+  it('fails closed on a malformed credential', async () => {
+    // A value without a colon was clearly intended to gate; letting it match
+    // nothing is safer than silently running open.
+    process.env[ENV] = 'nocolon';
+    const response = await getWithAuth(
+      bareApp(),
+      '/v1/status',
+      `Basic ${Buffer.from('nocolon').toString('base64')}`,
+    );
+    expect(response.status).toBe(401);
+  });
+});
+
 describe('GPU admission control', () => {
   let savedThreshold: string | undefined;
 
