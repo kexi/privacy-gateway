@@ -130,7 +130,10 @@ locals {
         # gateway. Why not min-instances=1 instead: an idle GPU instance bills
         # continuously; `just warm` buys that trade deliberately for a filming
         # window, and `just chill` gives it back.
-        REQUEST_DEADLINE_SECONDS = "150"
+        # 240s: a warm Codex-scale extraction is ~15 chunks at 4-way
+        # concurrency on one shared GPU — 150s fits only one to two waves and
+        # retries never converged. 240s is the honest interactive ceiling.
+        REQUEST_DEADLINE_SECONDS = "240"
 
         # The read-only audit view's capability token. Empty means the routes
         # are never registered, so the feature is genuinely absent rather than
