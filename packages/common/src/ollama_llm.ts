@@ -131,6 +131,18 @@ export class OllamaLlm extends BaseLlm {
       stream,
     };
 
+    // Thinking is disabled unconditionally. Gemma 4 is a reasoning model, and on
+    // tool-schema-dense chunks it deliberated for the entire output budget —
+    // 4096 tokens of thinking, an empty content field, and a refused request —
+    // while the JSON grammar sat idle, because a grammar constrains content and
+    // never thinking. Every call this class makes is a deterministic JSON task
+    // (span extraction, leak judging); none of them wants deliberation. Why
+    // `reasoning_effort` and not `think: false`: the latter is the native
+    // /api/chat switch and is ignored on the OpenAI-compatible surface this
+    // class speaks (measured: think:false ran away for 15k thinking chars,
+    // reasoning_effort:"none" answered in 3 s).
+    body['reasoning_effort'] = 'none';
+
     const temperature = llmRequest.config?.temperature;
     if (temperature !== undefined) body['temperature'] = temperature;
     const maxTokens = llmRequest.config?.maxOutputTokens;

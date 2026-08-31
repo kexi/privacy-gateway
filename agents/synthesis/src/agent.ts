@@ -295,6 +295,11 @@ export function createLeakJudge(
           // same body must not pass on one call and block on the next.
           temperature: 0,
           top_p: 1,
+          // Gemma 4 thinks by default and a hard text can absorb the whole
+          // budget in deliberation, leaving no verdict at all; the judge's job
+          // is a schema-constrained yes/no, not an essay. `think: false` is the
+          // native-API switch and is ignored on this OpenAI-compatible surface.
+          reasoning_effort: 'none',
           // The verdict object is tiny; the cap exists so a confused judge can
           // never pin a GPU slot with runaway generation.
           max_tokens: 1024,

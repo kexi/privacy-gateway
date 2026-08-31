@@ -153,6 +153,19 @@ describe('JSON mode', () => {
   });
 });
 
+describe('thinking', () => {
+  it('disables reasoning on every call', async () => {
+    // Gemma 4 deliberating on a hard chunk consumed the whole output budget as
+    // thinking and returned empty content; every call here is a deterministic
+    // JSON task, so reasoning is always off.
+    const { impl, calls } = stubFetch(completion('{}'));
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
+
+    await collect(llm.generateContentAsync(request()));
+    expect(bodyOf(calls[0]?.init ?? {})['reasoning_effort']).toBe('none');
+  });
+});
+
 describe('message conversion', () => {
   it('puts the system instruction first', () => {
     const messages = toChatMessages(

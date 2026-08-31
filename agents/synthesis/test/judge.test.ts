@@ -134,10 +134,14 @@ describe('stripping does not weaken the judge', () => {
     const body = bodies()[0] as unknown as {
       response_format: { type: string; json_schema: { schema: { required: string[] } } };
       max_tokens: number;
+      reasoning_effort: string;
     };
     expect(body.response_format.type).toBe('json_schema');
     expect(body.response_format.json_schema.schema.required).toEqual(['leak']);
     expect(body.max_tokens).toBe(1024);
+    // A judge that deliberates can spend its whole budget thinking and deliver
+    // no verdict; reasoning is off so the budget goes to the verdict itself.
+    expect(body.reasoning_effort).toBe('none');
   });
 });
 
