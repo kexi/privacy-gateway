@@ -766,6 +766,87 @@ describe('the deadline cancels the work, not only the wait (P1)', () => {
   });
 });
 
+describe('GPU admission control', () => {
+  let savedThreshold: string | undefined;
+
+  beforeEach(() => {
+    savedThreshold = process.env['HEAVY_REQUEST_BYTES'];
+    process.env['HEAVY_REQUEST_BYTES'] = '10';
+  });
+
+  afterEach(() => {
+    if (savedThreshold === undefined) {
+      delete process.env['HEAVY_REQUEST_BYTES'];
+    } else {
+      process.env['HEAVY_REQUEST_BYTES'] = savedThreshold;
+    }
+  });
+
+  /** A gateway whose extraction blocks until the test releases it. */
+  function gatedApp() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const app = createGatewayApp({
+      config: testConfig(),
+      logger: createLogger({ agent: 'gateway', write: () => undefined }),
+      vault: new InMemoryTokenVault(),
+      extractSpans: async (text) => {
+        // Only the heavy fixtures block; the light request must flow through
+        // the very extraction the heavy one is still occupying.
+        if (text.includes('heavy')) await gate;
+        return [];
+      },
+      callCore: () => Promise.resolve('Reply to nobody.'),
+      callSynthesis: () => Promise.reject(new Error('stop here')),
+    });
+    return { app, release };
+  }
+
+  it('refuses a second heavy request while one holds the GPU, and only then', async () => {
+    const { app, release } = gatedApp();
+    const listener = app.listen(0);
+    const address = listener.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    const post = (text: string): Promise<Response> =>
+      fetch(`http://127.0.0.1:${port}/v1/ask`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+
+    try {
+      // Both bodies exceed the 10-byte threshold; the first occupies extraction.
+      const first = post('a heavy request well over the threshold');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const second = await post('another heavy request over the threshold');
+      expect(second.status).toBe(503);
+      expect(((await second.json()) as { error: string }).error).toBe('gpu_busy');
+      // Machine-readable back-off: the client is told when to come back rather
+      // than left to hammer a gateway that cannot admit it.
+      expect(second.headers.get('retry-after')).toBe('30');
+
+      // A light request is not gated: it costs one or two Gemma calls, which the
+      // scheduler absorbs without threatening the heavy request's deadline.
+      const light = await post('short');
+      expect(light.status).not.toBe(503);
+
+      release();
+      await first;
+
+      // The slot is released even though the first request failed downstream, so
+      // the next heavy request is admitted again.
+      const third = await post('a third heavy request over the threshold');
+      expect(third.status).not.toBe(503);
+    } finally {
+      release();
+      listener.close();
+    }
+  });
+});
+
 describe('the per-request disclosure opt-in', () => {
   beforeEach(() => startFleet());
 

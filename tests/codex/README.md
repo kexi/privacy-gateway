@@ -43,7 +43,7 @@ jq 'select(.event=="openai.compat.responses.start")
 Divide `forwarded_text_bytes` by the deployed `EXTRACTION_CHUNK_BYTES` (4000) for
 the chunk count, which fans out four at a time across the four llama.cpp slots of
 one GPU — a global cap, held across bisection too. A **cold fleet's first CLI turn
-can still exceed the 150 s request deadline**, because the scale-from-zero case
+can still exceed the 240 s request deadline**, because the scale-from-zero case
 also waits for Ollama to load `gemma4:12b`. That is a known capacity limit of a
 single-GPU deployment, not a defect in the fleet's logic: the gateway either
 answers or refuses cleanly, and never degrades its masking to go faster.

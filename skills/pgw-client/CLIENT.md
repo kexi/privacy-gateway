@@ -202,7 +202,7 @@ payload straight to `/v1/responses` and asserts the SSE contract (`response.crea
 → nonce → `response.completed`), so it catches a wire-format regression in
 seconds. `just codex-e2e` drives the real `codex exec` in a PTY and is for the
 **final pre-submission check only** — the CLI prepends ~147 KB of instructions to
-every turn, and masking that on the single GPU can exceed the 150 s deadline on a
+every turn, and masking that on the single GPU can exceed the 240 s deadline on a
 cold fleet (a known capacity limit, not a bug). See `tests/codex/README.md` for
 the prerequisites and why neither is in CI.
 

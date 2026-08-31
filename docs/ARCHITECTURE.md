@@ -168,6 +168,7 @@ only masked artifacts are persisted (`status: draft`, `verified` omitted).
 | A non-text content part on the OpenAI-compatible endpoint         | `400 multimodal_unsupported` (see §9a); nothing is sent                                |
 | `rehydrate_allow` names a category outside the withheld set       | `400 invalid_request`; nothing is sent                                                 |
 | The rehydration did not match the disclosure policy               | `500 rehydration_incomplete` (see §9b) — our bug, so 5xx; the body is still withheld   |
+| A second heavy request while one already occupies the GPU         | `503 gpu_busy` with `Retry-After: 30` — refused before any GPU work is spent           |
 | Per-IP demo rate limit exceeded                                   | `429`                                                                                  |
 | Body over `MAX_BODY_BYTES`                                        | `413`                                                                                  |
 | End-to-end deadline exceeded                                      | `504`                                                                                  |
@@ -318,7 +319,7 @@ has no Firestore role. Gateway and Synthesis import the package entry point.
 - **Why A2A for Gateway → Core but plain HTTP for Gateway → Synthesis?** Core's job is reasoning, so A2A's LLM-oriented protocol fits. Synthesis's HTTP routes return an audit artifact (the OKF document, the masked prompt, Core's tokenized response) that must come back byte-for-byte, not as something an LLM has rephrased — so the route the Gateway actually uses is plain authenticated HTTP even though Synthesis also exposes an A2A surface that acknowledges the exchange.
 - **Why separate services at all instead of in-process sub-agents?** The boundary is the product. Separate services with separate IAM identities make "Core cannot reach Firestore" a deployable guarantee enforced by IAM, not a code convention — see the note on the dependency graph in §5.
 
-**Not adopted (and why).** A `gemma:g26b` image exists in Artifact Registry from an experiment in raising the extractor to `gemma4:26b`, on the theory that a larger model breaks the JSON-only contract less often. It is not deployed: measurement showed `gemma4:12b` already returning clean JSON on Codex-shaped chunks, so the contract was not the bottleneck — per-chunk latency was — and a larger model generates more slowly, which makes that worse. Raising `REQUEST_DEADLINE_SECONDS` past 150 was rejected for the same reason: it hides a capacity limit instead of removing one, and the chunk cache addresses the repeat-turn case that actually matters.
+**Not adopted (and why).** A `gemma:g26b` image exists in Artifact Registry from an experiment in raising the extractor to `gemma4:26b`, on the theory that a larger model breaks the JSON-only contract less often. It is not deployed: measurement showed `gemma4:12b` already returning clean JSON on Codex-shaped chunks, so the contract was not the bottleneck — per-chunk latency was — and a larger model generates more slowly, which makes that worse. `REQUEST_DEADLINE_SECONDS` was raised once, from 150 s to 240 s, after measuring a real Codex CLI turn (59,576 forwarded text bytes → 15 chunks): the extra window covers a warm Codex-scale turn. It does **not** make the full cold Codex CLI path fit on a single GPU, and raising it further was rejected — past this point a longer deadline hides the capacity limit instead of removing it, and the chunk cache addresses the repeat-turn case that actually matters.
 
 ## 7. API surface
 
@@ -341,20 +342,26 @@ approval are both gone). Every route above is keyed by `request_id`.
 **Request limits, as compiled in and as deployed.** The two differ on purpose, and
 confusing them makes a capacity incident unreadable:
 
-| Limit                      | Code default (`packages/common/src/config.ts`) | Deployed (`infra/terraform/locals.tf`) | Why the override                                                                                                                                      |
-| -------------------------- | ---------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MAX_BODY_BYTES` (gateway) | 64 KiB                                         | 256 KiB                                | Codex CLI turns carry an instruction block far past 64 KiB. Cost stays bounded by the rate limit, the deadline, one GPU instance and the kill switch. |
-| `SYNTHESIS_MAX_BODY_BYTES` | `MAX_BODY_BYTES × 2 + 64 KiB` (192 KiB)        | 576 KiB                                | Synthesis receives a whole masked prompt **plus** a whole Core answer in one body, so its limit must be derived from the gateway's, never copied.     |
-| `REQUEST_DEADLINE_SECONDS` | 60 s                                           | 150 s                                  | 60 s is right once Gemma is warm. A scale-from-zero request also waits for Ollama to load `gemma4:12b` (~8 GB); measured worst case from cold ~90 s.  |
-| `EXTRACTION_CHUNK_BYTES`   | 12000                                          | 4000                                   | Per-chunk Gemma latency falls superlinearly with size, so many small parallel chunks beat few large ones on a single GPU.                             |
-| `EXTRACTION_CONCURRENCY`   | 4                                              | 4                                      | All four llama.cpp slots. No slot is reserved: the Synthesis judge runs _after_ masking, not beside it.                                               |
-| `RATE_LIMIT_PER_MINUTE`    | 20                                             | 20                                     | Demo-grade per-IP quota; `0` disables it.                                                                                                             |
+| Limit                      | Code default (`packages/common/src/config.ts`) | Deployed (`infra/terraform/locals.tf`) | Why the override                                                                                                                                                                                                                                                        |
+| -------------------------- | ---------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MAX_BODY_BYTES` (gateway) | 64 KiB                                         | 256 KiB                                | Codex CLI turns carry an instruction block far past 64 KiB. Cost stays bounded by the rate limit, the deadline, one GPU instance and the kill switch.                                                                                                                   |
+| `SYNTHESIS_MAX_BODY_BYTES` | `MAX_BODY_BYTES × 2 + 64 KiB` (192 KiB)        | 576 KiB                                | Synthesis receives a whole masked prompt **plus** a whole Core answer in one body, so its limit must be derived from the gateway's, never copied.                                                                                                                       |
+| `REQUEST_DEADLINE_SECONDS` | 60 s                                           | 240 s                                  | 60 s is right once Gemma is warm. A scale-from-zero request also waits for Ollama to load `gemma4:12b` (~8 GB; worst case from cold ~90 s), and a measured Codex-scale turn masks 15 chunks. 240 s covers those; the full cold Codex CLI path still does not fit (§9a). |
+| `EXTRACTION_CHUNK_BYTES`   | 12000                                          | 4000                                   | Per-chunk Gemma latency falls superlinearly with size, so many small parallel chunks beat few large ones on a single GPU.                                                                                                                                               |
+| `EXTRACTION_CONCURRENCY`   | 4                                              | 4                                      | All four llama.cpp slots. No slot is reserved: the Synthesis judge runs _after_ masking, not beside it.                                                                                                                                                                 |
+| `RATE_LIMIT_PER_MINUTE`    | 20                                             | 20                                     | Demo-grade per-IP quota; `0` disables it.                                                                                                                                                                                                                               |
 
 These are demo-grade: the public gateway authenticates nobody, and one request drives
 two Gemma calls plus a Gemini call, so an unbounded endpoint is a cost incident waiting
 to happen. The extraction concurrency is a **global** cap — one semaphore shared across
-chunking and every level of the bisection recursion, not a per-level width — so a
-request whose chunks all fail at once cannot multiply its own fan-out.
+chunking, every level of the bisection recursion **and every concurrent request in
+the process** (the gateway is pinned to one instance, so the process sees the whole
+GPU) — so neither a request whose chunks all fail at once nor two requests arriving
+together can multiply the fan-out past four. On top of the permit pool sits an
+admission gate: only one _heavy_ request (body text above `HEAVY_REQUEST_BYTES`,
+default 16 KiB) runs at a time, and a second one is refused up front with
+`503 gpu_busy` and a `Retry-After` header rather than being admitted and then
+failed at its deadline after burning GPU time.
 
 ## 8. Persistence and the vault
 

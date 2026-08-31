@@ -426,6 +426,13 @@ export function createApp(options: CreateAppOptions): express.Application {
     return true;
   }
 
+  // One in-flight heavy request per gateway instance (the instance count is
+  // pinned to one, so this is fleet-global). Not a queue on purpose: a queued
+  // heavy request would sit against its own deadline; an immediate 503 with
+  // Retry-After lets the client decide and costs no GPU seconds.
+  let heavyInFlight = false;
+  const heavyRequestBytes = heavyRequestBytesFromEnv();
+
   /**
    * Run one request through the pipeline under the shared deadline.
    *
@@ -448,6 +455,18 @@ export function createApp(options: CreateAppOptions): express.Application {
     // routes rather than interpolated from whatever the caller requested.
     const COMPAT_ROUTES = ['/v1/chat/completions', '/v1/responses'];
     const routePath = COMPAT_ROUTES.includes(req.path) ? req.path : '/v1/ask';
+
+    // Admission control for the single GPU: at most one heavy extraction at a
+    // time. Two Codex-scale requests sharing the GPU each run at half speed,
+    // both miss the deadline, and both clients retry — paying the extraction
+    // twice for zero answers. A cheap 503 with Retry-After breaks that spiral.
+    const heavy = Buffer.byteLength(text, 'utf8') > heavyRequestBytes;
+    if (heavy) {
+      if (heavyInFlight) {
+        throw new GpuBusyError();
+      }
+      heavyInFlight = true;
+    }
 
     // One deadline for the whole chain, expressed as a real cancellation.
     //
@@ -531,6 +550,9 @@ export function createApp(options: CreateAppOptions): express.Application {
         deadline,
       ]);
     } finally {
+      if (heavy) {
+        heavyInFlight = false;
+      }
       // Releases the timer and, on the success path, cancels anything still in
       // flight behind the response that was already sent.
       clearTimeout(timer);
@@ -601,6 +623,9 @@ export function createApp(options: CreateAppOptions): express.Application {
    */
   function handleChatError(error: unknown, res: Response, context: RequestContext): void {
     const classified = classifyAskError(error);
+    if (classified.retryAfterSeconds !== undefined && !res.headersSent) {
+      res.setHeader('Retry-After', String(classified.retryAfterSeconds));
+    }
     context.logger.event(
       'openai.compat.chat.refused',
       {
@@ -694,6 +719,9 @@ export function createApp(options: CreateAppOptions): express.Application {
     stream: boolean,
   ): void {
     const classified = classifyAskError(error);
+    if (classified.retryAfterSeconds !== undefined && !res.headersSent) {
+      res.setHeader('Retry-After', String(classified.retryAfterSeconds));
+    }
     context.logger.event(
       'openai.compat.responses.refused',
       {
@@ -870,6 +898,9 @@ export function createApp(options: CreateAppOptions): express.Application {
       send('result', toPayload(result));
     } catch (error) {
       const classified = classifyAskError(error);
+      if (classified.retryAfterSeconds !== undefined && !res.headersSent) {
+        res.setHeader('Retry-After', String(classified.retryAfterSeconds));
+      }
 
       context.logger.event(
         classified.event,
@@ -908,6 +939,9 @@ export function createApp(options: CreateAppOptions): express.Application {
    */
   function handleAskError(error: unknown, res: Response, context: RequestContext): void {
     const classified = classifyAskError(error);
+    if (classified.retryAfterSeconds !== undefined && !res.headersSent) {
+      res.setHeader('Retry-After', String(classified.retryAfterSeconds));
+    }
 
     context.logger.event(
       classified.event,
@@ -1048,6 +1082,8 @@ interface ClassifiedAskError {
   readonly refusal?: string;
   readonly errorCode?: string;
   readonly errorClass?: string;
+  /** When set, responses carry a Retry-After header with this many seconds. */
+  readonly retryAfterSeconds?: number;
 }
 
 /**
@@ -1110,6 +1146,20 @@ function classifyAskError(error: unknown): ClassifiedAskError {
       event: 'request.refused',
       severity: 'ERROR',
       refusal: error.kind,
+    };
+  }
+
+  if (error instanceof GpuBusyError) {
+    return {
+      status: 503,
+      code: 'gpu_busy',
+      message: 'a large request is already occupying the GPU; retry shortly',
+      exposeMessage: true,
+      categories: [],
+      event: 'request.failed',
+      severity: 'WARNING',
+      errorCode: 'gpu_busy',
+      retryAfterSeconds: 30,
     };
   }
 
@@ -1178,6 +1228,36 @@ export class DeadlineExceededError extends Error {
     super('request deadline exceeded');
     this.name = 'DeadlineExceededError';
   }
+}
+
+/**
+ * A second heavy request arrived while one already holds the GPU.
+ *
+ * One RTX PRO 6000 serves the whole fleet; two Codex-scale extractions run at
+ * half speed each and BOTH blow the deadline, after which their clients retry
+ * and pay the whole extraction again. Refusing the second request up front
+ * with Retry-After turns that spiral into one cheap 503 — admission control
+ * is cheaper than contention (docs/design/extraction-at-codex-scale.md §5).
+ */
+export class GpuBusyError extends Error {
+  constructor() {
+    super('a large request is already occupying the GPU');
+    this.name = 'GpuBusyError';
+  }
+}
+
+/** Above this many body bytes a request counts as heavy for admission control. */
+export const DEFAULT_HEAVY_REQUEST_BYTES = 16 * 1024;
+
+/** Read the heavy-request threshold from the environment, falling back to the default. */
+export function heavyRequestBytesFromEnv(): number {
+  const raw = process.env['HEAVY_REQUEST_BYTES'];
+  if (raw === undefined || raw.trim() === '') return DEFAULT_HEAVY_REQUEST_BYTES;
+  const parsed = Number(raw);
+  // A non-positive value would classify every request as heavy and serialize the
+  // whole gateway, which is a worse reading of a misconfigured variable than
+  // ignoring it.
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_HEAVY_REQUEST_BYTES;
 }
 
 /**

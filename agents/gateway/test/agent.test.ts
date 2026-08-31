@@ -613,6 +613,88 @@ describe('extractUnstructured (chunked)', () => {
     expect(callsAtAbort).toBeLessThan(40);
   });
 
+  it('caps concurrent Gemma calls across requests, not per request', async () => {
+    // Two requests arriving together must share one permit pool: a private
+    // width-4 pool per request put 8 calls on the same four GPU slots.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const runAgent = async (): Promise<string> => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 3));
+      inFlight -= 1;
+      return '{"spans": []}';
+    };
+
+    await Promise.all([
+      extractUnstructured('a'.repeat(1500), { chunkBytes: 100, cache: false, runAgent }),
+      extractUnstructured('b'.repeat(1500), { chunkBytes: 100, cache: false, runAgent }),
+    ]);
+
+    expect(maxInFlight).toBeLessThanOrEqual(DEFAULT_EXTRACTION_CONCURRENCY);
+  });
+
+  it('aborts the Gemma call already in flight, not only the queue', async () => {
+    // The deadline used to evaporate only the waiters; the call on the GPU ran
+    // to completion for a request already answered 504. The signal must reach
+    // the model call itself.
+    const controller = new AbortController();
+    let sawAbort = false;
+
+    const extraction = extractUnstructured('Contact Taro Yamada', {
+      cache: false,
+      signal: controller.signal,
+      runAgent: (_prompt, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            sawAbort = true;
+            reject(new Error('fetch aborted'));
+          });
+        }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+
+    await expect(extraction).rejects.toThrow();
+    expect(sawAbort).toBe(true);
+  });
+
+  it("cancels only the aborted request's work, never its neighbour's", async () => {
+    // The pool is process-wide, so cancellation has to be per waiter: one
+    // request's deadline must not evict another request's place in line.
+    const controller = new AbortController();
+    let survivorCalls = 0;
+
+    const doomed = extractUnstructured('a'.repeat(1500), {
+      chunkBytes: 100,
+      cache: false,
+      signal: controller.signal,
+      runAgent: async (_prompt, signal) => {
+        await new Promise((resolve) => setTimeout(resolve, 3));
+        if (signal?.aborted === true) throw new Error('fetch aborted');
+        return '{"spans": []}';
+      },
+    });
+    const survivor = extractUnstructured('b'.repeat(1500), {
+      chunkBytes: 100,
+      cache: false,
+      runAgent: async () => {
+        survivorCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 3));
+        return '{"spans": []}';
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 6));
+    controller.abort();
+
+    await expect(doomed).rejects.toThrow();
+    await expect(survivor).resolves.toEqual([]);
+    // Every one of the survivor's chunks ran despite its neighbour's abort.
+    expect(survivorCalls).toBeGreaterThanOrEqual(15);
+  });
+
   it('fans out across every Gemma slot by default', async () => {
     // All four, not three: the judge that the fourth was reserved for runs after
     // masking, so holding a slot back cost a quarter of the fan-out during the

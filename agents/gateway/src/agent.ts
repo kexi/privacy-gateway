@@ -447,8 +447,14 @@ export class ExtractionAbortedError extends Error {
   }
 }
 
+/** A queued acquisition: granted a permit, or rejected by its own abort signal. */
+interface SemaphoreWaiter {
+  grant: () => void;
+  abort: () => void;
+}
+
 /**
- * A counting semaphore over the whole extraction, not one level of it.
+ * A counting semaphore over every extraction in the process, not one request.
  *
  * Why an object shared down the recursion rather than a `limit` argument to each
  * fan-out, as this had: the bisection fallback re-enters the fan-out, so a
@@ -456,69 +462,84 @@ export class ExtractionAbortedError extends Error {
  * failing together each opened their own width-4 map — 8 concurrent Gemma calls,
  * 16 at the next level — against a single GPU serving four slots, which is the
  * exact condition (several chunks unreadable at once) the bisection exists to
- * handle. One permit pool held for the request's whole extraction makes the cap
- * mean what it says.
+ * handle.
  *
- * The signal is checked at acquisition rather than only at the call site so that
- * after the deadline fires no *new* task is dequeued: work already in flight
- * finishes or aborts on its own transport signal, and the queue behind it
- * evaporates instead of continuing to spend GPU on a request already answered
- * 504.
+ * Why one pool for the process rather than one per request, as this then had:
+ * two concurrent requests each holding a private width-4 pool put 8 calls on
+ * the same four GPU slots — the identical arithmetic one level up. The permit
+ * pool has to sit at the level of the resource it models, and the resource is
+ * the GPU, of which the process (pinned to one instance) sees exactly one.
+ *
+ * Because the pool now outlives any single request, cancellation is carried by
+ * each waiter's own signal instead of one signal owned by the pool: a deadline
+ * firing removes that request's queued tasks and rejects them, and every other
+ * request's place in line is untouched.
  */
 class ExtractionSemaphore {
   private available: number;
-  private readonly waiters: (() => void)[] = [];
+  private readonly waiters: SemaphoreWaiter[] = [];
 
-  constructor(
-    limit: number,
-    private readonly signal?: AbortSignal | undefined,
-  ) {
+  constructor(limit: number) {
     this.available = Math.max(1, Math.floor(limit));
   }
 
-  /** True once the request is over; checked before every dequeue. */
-  get aborted(): boolean {
-    return this.signal?.aborted === true;
-  }
-
-  async acquire(): Promise<void> {
-    if (this.aborted) throw new ExtractionAbortedError();
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted === true) throw new ExtractionAbortedError();
     if (this.available > 0) {
       this.available -= 1;
       return;
     }
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
-    // Re-checked after waking: the deadline may have passed while queued, and a
-    // task that starts here would be pure waste on an answered request.
-    if (this.aborted) {
-      this.release();
-      throw new ExtractionAbortedError();
-    }
+    await new Promise<void>((resolve, reject) => {
+      const waiter: SemaphoreWaiter = {
+        grant: () => {
+          signal?.removeEventListener('abort', waiter.abort);
+          resolve();
+        },
+        abort: () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          reject(new ExtractionAbortedError());
+        },
+      };
+      signal?.addEventListener('abort', waiter.abort, { once: true });
+      this.waiters.push(waiter);
+    });
   }
 
   release(): void {
     const next = this.waiters.shift();
     if (next !== undefined) {
-      next();
+      next.grant();
       return;
     }
     this.available += 1;
   }
 
-  /** Wake every queued task so they can observe the abort and unwind. */
-  cancelAll(): void {
-    while (this.waiters.length > 0) this.waiters.shift()?.();
-  }
-
-  /** Run `task` holding one permit. */
-  async run<R>(task: () => Promise<R>): Promise<R> {
-    await this.acquire();
+  /** Run `task` holding one permit; `signal` cancels only this waiter. */
+  async run<R>(task: () => Promise<R>, signal?: AbortSignal): Promise<R> {
+    await this.acquire(signal);
     try {
+      // Re-checked once granted: the deadline may have passed while queued, and
+      // a task that starts here would be pure waste on an answered request.
+      if (signal?.aborted === true) throw new ExtractionAbortedError();
       return await task();
     } finally {
       this.release();
     }
   }
+}
+
+/**
+ * The one pool every extraction draws from, sized once from the environment.
+ *
+ * Lazy so that tests which tune `EXTRACTION_CONCURRENCY` before first use are
+ * honoured; a test that needs a different width entirely passes
+ * `options.concurrency` and gets a private pool instead.
+ */
+let processSemaphore: ExtractionSemaphore | undefined;
+function sharedExtractionSemaphore(): ExtractionSemaphore {
+  processSemaphore ??= new ExtractionSemaphore(extractionConcurrency());
+  return processSemaphore;
 }
 
 /**
@@ -689,29 +710,61 @@ export function parseSpans(raw: string): ExtractionResult {
     : { kind: 'valid-spans', spans: parsed.data.spans };
 }
 
-/** Runs one turn of the agent and returns its final text. */
-async function runAgentText(agent: LlmAgent, prompt: string): Promise<string> {
+/**
+ * Runs one turn of the agent and returns its final text.
+ *
+ * Sessions are managed by hand rather than via `runEphemeral` because that
+ * wrapper accepts no abort signal: a deadline that fired mid-generation left
+ * the Ollama call running to completion, holding a GPU slot for a request
+ * already answered 504. `runAsync` threads the signal through the invocation
+ * context into the model's fetch, so aborting here actually stops the work.
+ */
+async function runAgentText(
+  agent: LlmAgent,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const runner = new InMemoryRunner({ agent, appName: 'gateway_pii' });
+  const session = await runner.sessionService.createSession({
+    appName: 'gateway_pii',
+    userId: 'gateway',
+  });
   const chunks: string[] = [];
 
-  for await (const event of runner.runEphemeral({
-    userId: 'gateway',
-    newMessage: { role: 'user', parts: [{ text: prompt }] },
-  })) {
-    // Only the final response is taken; intermediate reasoning never leaves the
-    // boundary and is not part of the extraction contract.
-    if (event.content?.parts === undefined) continue;
-    for (const part of event.content.parts) {
-      if (typeof part.text === 'string') chunks.push(part.text);
+  try {
+    for await (const event of runner.runAsync({
+      userId: 'gateway',
+      sessionId: session.id,
+      newMessage: { role: 'user', parts: [{ text: prompt }] },
+      ...(signal === undefined ? {} : { abortSignal: signal }),
+    })) {
+      // Only the final response is taken; intermediate reasoning never leaves
+      // the boundary and is not part of the extraction contract.
+      if (event.content?.parts === undefined) continue;
+      for (const part of event.content.parts) {
+        if (typeof part.text === 'string') chunks.push(part.text);
+      }
     }
+  } finally {
+    await runner.sessionService.deleteSession({
+      appName: 'gateway_pii',
+      userId: 'gateway',
+      sessionId: session.id,
+    });
   }
   return chunks.join('').trim();
 }
 
 export interface ExtractOptions extends BuildSpanAgentOptions {
   readonly logger?: Logger | undefined;
-  /** Injectable so the pipeline can be tested without a model at all. */
-  readonly runAgent?: ((prompt: string) => Promise<string>) | undefined;
+  /**
+   * Injectable so the pipeline can be tested without a model at all.
+   *
+   * The signal is the request's cancellation signal, forwarded so a fake model
+   * can assert that an abort reaches the call in flight — the real
+   * implementation threads it into the Ollama fetch.
+   */
+  readonly runAgent?: ((prompt: string, signal?: AbortSignal) => Promise<string>) | undefined;
   /**
    * Chunk threshold override, in characters.
    *
@@ -778,7 +831,7 @@ export function looksTruncated(raw: string): boolean {
  */
 async function extractChunk(
   text: string,
-  run: (prompt: string) => Promise<string>,
+  run: (prompt: string, signal?: AbortSignal) => Promise<string>,
   options: ExtractOptions,
   semaphore: ExtractionSemaphore,
 ): Promise<ExtractionResult> {
@@ -790,7 +843,10 @@ async function extractChunk(
       // The permit is held only across the model call — the one resource that is
       // actually scarce. A retry re-acquires rather than holding through the
       // parse, so a chunk that is being re-rolled does not squat on a GPU slot.
-      raw = await semaphore.run(() => run(buildExtractionPrompt(text)));
+      raw = await semaphore.run(
+        () => run(buildExtractionPrompt(text), options.signal),
+        options.signal,
+      );
     } catch (error) {
       if (error instanceof ExtractionAbortedError) throw error;
       options.logger?.event(
@@ -849,7 +905,7 @@ async function extractChunk(
  */
 async function extractChunkBisecting(
   text: string,
-  run: (prompt: string) => Promise<string>,
+  run: (prompt: string, signal?: AbortSignal) => Promise<string>,
   options: ExtractOptions,
   depth: number,
   semaphore: ExtractionSemaphore,
@@ -945,44 +1001,40 @@ export async function extractUnstructured(
   options: ExtractOptions = {},
 ): Promise<Detection[]> {
   const run =
-    options.runAgent ?? ((prompt: string) => runAgentText(buildSpanAgent(options), prompt));
+    options.runAgent ??
+    ((prompt: string, signal?: AbortSignal) =>
+      runAgentText(buildSpanAgent(options), prompt, signal));
 
   const chunks = chunkText(text, options.chunkBytes ?? extractionChunkBytes());
 
-  // One pool for this whole extraction: every Gemma call below, at any bisection
-  // depth, takes a permit from it, so the cap holds across the tree.
-  const semaphore = new ExtractionSemaphore(
-    options.concurrency ?? extractionConcurrency(),
-    options.signal,
-  );
-  const onAbort = (): void => {
-    semaphore.cancelAll();
-  };
-  options.signal?.addEventListener('abort', onAbort, { once: true });
+  // Every Gemma call below, at any bisection depth and in any concurrent
+  // request, takes a permit from the same process-wide pool — the cap models
+  // the GPU, not the request. An explicit `concurrency` gets a private pool so
+  // a test can assert its own cap without racing the rest of the suite.
+  const semaphore =
+    options.concurrency === undefined
+      ? sharedExtractionSemaphore()
+      : new ExtractionSemaphore(options.concurrency);
 
-  try {
-    // Below the threshold this starts as one call with the whole text — the path
-    // that ran before chunking existed, including the absence of the
-    // `mask.gemma.chunked` log line. It only ever becomes more than one call if
-    // that single call came back unreadable twice, which previously refused the
-    // request outright; a small but PII-dense input is exactly that case.
-    if (chunks.length === 1) {
-      const result = await extractChunkBisecting(text, run, options, 0, semaphore);
-      if (result.kind === 'invalid') throw new ExtractionFailedError(result.reason);
-      return result.kind === 'valid-empty' ? [] : spansToDetections(text, result.spans);
-    }
-
-    return await extractChunks(text, chunks, run, options, semaphore);
-  } finally {
-    options.signal?.removeEventListener('abort', onAbort);
+  // Below the threshold this starts as one call with the whole text — the path
+  // that ran before chunking existed, including the absence of the
+  // `mask.gemma.chunked` log line. It only ever becomes more than one call if
+  // that single call came back unreadable twice, which previously refused the
+  // request outright; a small but PII-dense input is exactly that case.
+  if (chunks.length === 1) {
+    const result = await extractChunkBisecting(text, run, options, 0, semaphore);
+    if (result.kind === 'invalid') throw new ExtractionFailedError(result.reason);
+    return result.kind === 'valid-empty' ? [] : spansToDetections(text, result.spans);
   }
+
+  return await extractChunks(text, chunks, run, options, semaphore);
 }
 
 /** The chunked path, split out so the semaphore's lifetime reads in one place. */
 async function extractChunks(
   text: string,
   chunks: readonly string[],
-  run: (prompt: string) => Promise<string>,
+  run: (prompt: string, signal?: AbortSignal) => Promise<string>,
   options: ExtractOptions,
   semaphore: ExtractionSemaphore,
 ): Promise<Detection[]> {
