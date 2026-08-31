@@ -52,6 +52,9 @@
           yq-go
           shellcheck
           nixfmt
+          asciinema
+          agg
+          tmux
 
           # Infrastructure is declared in Terraform under infra/terraform/.
           terraform

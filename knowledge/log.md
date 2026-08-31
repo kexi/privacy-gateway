@@ -5,6 +5,16 @@ title: Privacy gateway bundle history
 
 # Bundle history
 
+## 2026-08-31
+
+- **Codex CLI 0.151 request shape.** Recorded a draft operational finding: this host's
+  default-feature request exceeded the Gateway's 256 KiB body limit in a local PTY run,
+  while the same request passed after host-only features were disabled. Exact size fields
+  still need measurement on the current CLI.
+- **Tag vocabulary.** Pruned [tags.yml](/tags.yml) by dropping `security`, which was
+  applied uniformly and therefore carried no signal; documents now carry only
+  discriminating tags.
+
 ## 2026-08-24
 
 - **Fail-closed release, and evidence that can be replayed.** Answering the Codex design
@@ -43,7 +53,3 @@ title: Privacy gateway bundle history
   instructions at `references/skills/run-leak-check.md`.
 - The attester re-derives its findings from the response text rather than trusting the
   runner's `findings` list, so an under-reporting runner fails rather than passes.
-
-## 2026-08-31
-
-- **Update**: Pruned the tag vocabulary to [tags.yml](/tags.yml) — dropped `security` (applied uniformly, so it carried no signal); documents now carry only discriminating tags.
