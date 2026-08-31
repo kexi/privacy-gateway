@@ -123,6 +123,34 @@ describe('JSON mode', () => {
   it('detects a response schema as a JSON request', () => {
     expect(wantsJson(request({ config: { responseSchema: { type: 'OBJECT' } } }))).toBe(true);
   });
+
+  it('constrains generation to a JSON Schema when the request carries one', async () => {
+    // Structured outputs: the schema travels as a grammar, so non-conforming
+    // output is unrepresentable rather than parsed-and-rejected downstream.
+    const schema = {
+      type: 'object',
+      properties: { spans: { type: 'array' } },
+      required: ['spans'],
+    };
+    const { impl, calls } = stubFetch(completion('{"spans": []}'));
+    const llm = new OllamaLlm({ model: 'ollama/gemma4:12b', fetchImpl: impl });
+
+    await collect(
+      llm.generateContentAsync(
+        request({
+          config: { responseMimeType: 'application/json', responseJsonSchema: schema },
+        }),
+      ),
+    );
+    expect(bodyOf(calls[0]?.init ?? {})['response_format']).toEqual({
+      type: 'json_schema',
+      json_schema: { name: 'response', schema, strict: true },
+    });
+  });
+
+  it('detects a plain JSON Schema as a JSON request', () => {
+    expect(wantsJson(request({ config: { responseJsonSchema: { type: 'object' } } }))).toBe(true);
+  });
 });
 
 describe('message conversion', () => {

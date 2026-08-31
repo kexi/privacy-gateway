@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { Logger } from '@privacy-gateway/common';
 import {
   buildExtractionPrompt,
+  buildSpanAgent,
   chunkText,
   clearExtractionCache,
   DEFAULT_EXTRACTION_CHUNK_BYTES,
@@ -21,7 +22,9 @@ import {
   looksTruncated,
   mergeSpans,
   parseSpans,
+  SPAN_RESPONSE_JSON_SCHEMA,
   spansToDetections,
+  UNSTRUCTURED_CATEGORIES,
 } from '../src/agent.ts';
 
 // The chunk cache outlives a single test, so a fixture reused by two tests would
@@ -704,6 +707,17 @@ describe('extractUnstructured (chunked)', () => {
 
   it('asks the model for each distinct value exactly once', () => {
     expect(INSTRUCTION).toContain('EXACTLY ONCE');
+  });
+
+  it('constrains generation to the span schema, not merely JSON mode', () => {
+    // Structured outputs: the grammar makes a non-conforming answer
+    // unrepresentable, which is what JSON mode alone failed to guarantee on
+    // tool-schema-dense chunks.
+    const config = buildSpanAgent().generateContentConfig;
+    expect(config?.responseJsonSchema).toBe(SPAN_RESPONSE_JSON_SCHEMA);
+    expect(SPAN_RESPONSE_JSON_SCHEMA.properties.spans.items.properties.category.enum).toEqual([
+      ...UNSTRUCTURED_CATEGORIES,
+    ]);
   });
 
   it('still masks every occurrence when the model names a value only once', async () => {

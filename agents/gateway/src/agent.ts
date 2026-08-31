@@ -91,6 +91,37 @@ export function buildExtractionPrompt(text: string): string {
 
 export const SPAN_AGENT_NAME = 'gateway_pii_agent';
 
+/**
+ * The JSON Schema the extractor's generation is constrained to.
+ *
+ * Sent to Ollama as a structured-output grammar (`response_format:
+ * json_schema`), not merely validated after the fact: on tool-schema-dense
+ * Codex chunks, JSON *mode* alone still let the model spend its whole
+ * 4096-token budget on non-conforming output, fail `parseSpans`, and drag the
+ * request through bisection to a refusal. A grammar makes that output
+ * unrepresentable. The zod parse downstream stays — this schema shapes
+ * generation, zod remains the boundary that decides acceptance.
+ */
+export const SPAN_RESPONSE_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    spans: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          text: { type: 'string' },
+          category: { type: 'string', enum: [...UNSTRUCTURED_CATEGORIES] },
+        },
+        required: ['text', 'category'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['spans'],
+  additionalProperties: false,
+} as const;
+
 export interface BuildSpanAgentOptions {
   readonly model?: string | undefined;
   /**
@@ -138,6 +169,7 @@ export function buildSpanAgent(options: BuildSpanAgentOptions = {}): LlmAgent {
     // was exhausted, pinning a GPU slot for 15+ minutes and wedging the fleet.
     generateContentConfig: {
       responseMimeType: 'application/json',
+      responseJsonSchema: SPAN_RESPONSE_JSON_SCHEMA,
       temperature: 0,
       topP: 1,
       maxOutputTokens: 4096,

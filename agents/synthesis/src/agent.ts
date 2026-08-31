@@ -264,11 +264,33 @@ export function createLeakJudge(
             { role: 'system', content: JUDGE_PROMPT },
             { role: 'user', content: userMessage },
           ],
-          response_format: { type: 'json_object' },
+          // A grammar, not just JSON mode: the verdict is generated inside this
+          // schema, so a judge drifting into prose or an unexpected shape is
+          // unrepresentable instead of being mapped to `leak: null` after the
+          // fact. The zod parse downstream still decides acceptance.
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'verdict',
+              schema: {
+                type: 'object',
+                properties: {
+                  leak: { type: 'boolean' },
+                  categories: { type: 'array', items: { type: 'string' } },
+                },
+                required: ['leak'],
+                additionalProperties: false,
+              },
+              strict: true,
+            },
+          },
           // Deterministic generation. The verdict can block a release, so the
           // same body must not pass on one call and block on the next.
           temperature: 0,
           top_p: 1,
+          // The verdict object is tiny; the cap exists so a confused judge can
+          // never pin a GPU slot with runaway generation.
+          max_tokens: 1024,
           stream: false,
         }),
         signal: controller.signal,

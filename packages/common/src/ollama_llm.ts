@@ -138,8 +138,19 @@ export class OllamaLlm extends BaseLlm {
 
     // JSON mode. Gemma is only ever asked for structured output, so honouring
     // this is what makes the zod parse on the other side reliable.
+    //
+    // When the agent also carries a plain JSON Schema, the generation is
+    // constrained to it grammar-level (Ollama structured outputs). `json_object`
+    // alone only promises syntactic JSON: on tool-schema-dense Codex chunks the
+    // model still generated thousands of tokens of non-conforming output and
+    // exhausted its budget — a schema makes that output unrepresentable rather
+    // than merely discouraged.
     if (wantsJson(llmRequest)) {
-      body['response_format'] = { type: 'json_object' };
+      const schema = llmRequest.config?.responseJsonSchema;
+      body['response_format'] =
+        schema === undefined
+          ? { type: 'json_object' }
+          : { type: 'json_schema', json_schema: { name: 'response', schema, strict: true } };
     }
 
     const controller = new AbortController();
@@ -312,7 +323,7 @@ export function wantsJson(llmRequest: LlmRequest): boolean {
   const config = llmRequest.config;
   if (config === undefined) return false;
   if (config.responseMimeType === 'application/json') return true;
-  return config.responseSchema !== undefined;
+  return config.responseSchema !== undefined || config.responseJsonSchema !== undefined;
 }
 
 /**

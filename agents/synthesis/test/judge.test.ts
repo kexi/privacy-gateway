@@ -123,6 +123,22 @@ describe('stripping does not weaken the judge', () => {
 
     expect(await judge(MASKED_ANSWER)).toEqual({ leak: null });
   });
+
+  it('constrains the verdict to a schema and caps its budget on the wire', async () => {
+    // Structured outputs plus max_tokens: a drifting judge can neither answer
+    // in prose nor pin a GPU slot with runaway generation.
+    const { fetchImpl, bodies } = recordingFetch({ leak: false });
+    const judge = createLeakJudge({ baseUrl: 'http://gemma.test/v1', auth: 'none', fetchImpl });
+    await judge(MASKED_ANSWER);
+
+    const body = bodies()[0] as unknown as {
+      response_format: { type: string; json_schema: { schema: { required: string[] } } };
+      max_tokens: number;
+    };
+    expect(body.response_format.type).toBe('json_schema');
+    expect(body.response_format.json_schema.schema.required).toEqual(['leak']);
+    expect(body.max_tokens).toBe(1024);
+  });
 });
 
 describe('the judge is given context, not a text in a vacuum', () => {
