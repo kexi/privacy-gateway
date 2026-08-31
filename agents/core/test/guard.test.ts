@@ -70,6 +70,19 @@ describe('inspect', () => {
     expect(inspect('Send to ⟦EMAIL_1⟧ and ⟦EMAIL_2⟧.').ok).toBe(true);
   });
 
+  it('does not read an ISO date and hour as a phone number', () => {
+    // The repo's own AGENTS.md ("Deadline: 2026-08-31 17:00 PDT") satisfied the
+    // phone shape — four digit groups, ten digits — and blocked every prompt
+    // that quoted it. A date is prose, not an identifier.
+    expect(inspect('Deadline: 2026-08-31 17:00 PDT.').ok).toBe(true);
+    expect(inspect('shipped on 2026-01-02 09:30:15').ok).toBe(true);
+  });
+
+  it('still reads a real phone number as a phone number', () => {
+    expect(inspect('call +81 90-1234-5678 now').ok).toBe(false);
+    expect(inspect('dial 03-1234-5678 22 today').ok).toBe(false);
+  });
+
   it('does not double-count a card span as a phone number', () => {
     const result = inspect('4111 1111 1111 1111');
     expect(result.findings.filter((f) => f.kind === 'PHONE')).toHaveLength(0);

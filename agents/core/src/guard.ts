@@ -81,6 +81,17 @@ const SECRET_RES: readonly RegExp[] = [
 const PHONE_MIN_DIGITS = 10;
 const PHONE_MAX_DIGITS = 15;
 
+/**
+ * A calendar date, optionally trailed by an hour group, is not a phone number.
+ *
+ * `2026-08-31 17` — a deadline written in prose — satisfies PHONE_RE (four
+ * separator-joined digit groups, ten digits), and this guard rejecting it
+ * blocked every request whose prompt carried the project's own AGENTS.md.
+ * The gateway's detector does not read dates as phones, so the mismatch turned
+ * ordinary dated text into a guaranteed refusal at this hop alone.
+ */
+const DATE_TIME_LIKE = /^\d{4}-\d{2}-\d{2}(?:[\s-]\d{2,4}(?::\d{2}){0,2})?$/u;
+
 /** Blanks out placeholders so their contents cannot trip the detectors. */
 function stripPlaceholders(text: string): string {
   return text.replace(PLACEHOLDER_PATTERN, ' ');
@@ -125,6 +136,7 @@ export function inspect(text: string): GuardResult {
     const raw = match[0];
     const digits = raw.replace(/\D/gu, '');
     if (digits.length < PHONE_MIN_DIGITS || digits.length > PHONE_MAX_DIGITS) continue;
+    if (DATE_TIME_LIKE.test(raw.trim())) continue;
     // A span already reported as a card must not be double-counted as a phone.
     const start = match.index ?? 0;
     const end = start + raw.length;
