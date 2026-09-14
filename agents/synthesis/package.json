@@ -22,9 +22,9 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@opentelemetry/sdk-trace-base": "^2.0.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@types/express": "^5.0.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^22.20.2",
     "tsx": "^4.23.13",
     "typescript": "^5.7.2",
     "vitest": "^3.0.0"

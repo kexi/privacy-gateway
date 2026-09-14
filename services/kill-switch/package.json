@@ -14,7 +14,7 @@
     "fmt:check": "oxfmt --check"
   },
   "dependencies": {
-    "@google-cloud/run": "^4.0.0",
+    "@google-cloud/run": "^4.1.0",
     "@privacy-gateway/common": "workspace:*",
     "express": "^5.1.0",
     "google-auth-library": "^9.15.0",
@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^22.20.2",
     "tsx": "^4.23.13",
     "typescript": "^5.7.2",
     "vitest": "^3.0.0"
